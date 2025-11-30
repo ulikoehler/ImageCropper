@@ -1,8 +1,28 @@
 use std::path::PathBuf;
 
 use anyhow::Result;
+use clap::ValueEnum;
 use eframe::egui;
 use image::{DynamicImage, GenericImage, RgbaImage};
+
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum, Debug)]
+pub enum OutputFormat {
+    Jpg,
+    Png,
+    Webp,
+    Avif,
+}
+
+impl OutputFormat {
+    pub fn extension(&self) -> &'static str {
+        match self {
+            OutputFormat::Jpg => "jpg",
+            OutputFormat::Png => "png",
+            OutputFormat::Webp => "webp",
+            OutputFormat::Avif => "avif",
+        }
+    }
+}
 
 pub struct PreloadedImage {
     pub path: PathBuf,
@@ -15,6 +35,7 @@ pub struct SaveRequest {
     pub path: PathBuf,
     pub original_path: PathBuf,
     pub quality: u8,
+    pub format: OutputFormat,
 }
 
 pub struct SaveStatus {

@@ -15,7 +15,9 @@ use image::{codecs::avif::AvifEncoder, DynamicImage};
 
 use crate::{
     fs_utils::{backup_original, move_with_unique_name, prepare_dir, TEMP_DIR, TRASH_DIR},
-    image_utils::{combine_crops, to_color_image, PreloadedImage, SaveRequest, SaveStatus},
+    image_utils::{
+        combine_crops, to_color_image, OutputFormat, PreloadedImage, SaveRequest, SaveStatus,
+    },
     selection::{selection_color, HandleDrag, Selection, SelectionHandle},
     ui::{ImageMetrics, KeyboardState, ARROW_MOVE_STEP},
 };
@@ -26,8 +28,10 @@ pub struct ImageCropperApp {
     pub dry_run: bool,
     pub quality: u8,
     pub resave: bool,
+    pub format: OutputFormat,
     pub image: Option<DynamicImage>,
     pub texture: Option<egui::TextureHandle>,
+    pub preview_texture: Option<egui::TextureHandle>,
     pub image_size: egui::Vec2,
     pub selections: Vec<Selection>,
     pub selection_anchor: Option<egui::Pos2>,
@@ -43,6 +47,8 @@ pub struct ImageCropperApp {
     pub loading_active: bool,
     pub is_exiting: bool,
     pub exit_attempt_count: usize,
+    pub list_completed: bool,
+    pub windowed_mode_set: bool,
 }
 
 impl ImageCropperApp {
@@ -52,6 +58,7 @@ impl ImageCropperApp {
         dry_run: bool,
         quality: u8,
         resave: bool,
+        format: OutputFormat,
     ) -> Result<Self> {
         let preload_rx = Self::spawn_preloader(files.clone());
         let (save_tx, save_rx) = mpsc::channel();
@@ -65,8 +72,10 @@ impl ImageCropperApp {
             dry_run,
             quality,
             resave,
+            format,
             image: None,
             texture: None,
+            preview_texture: None,
             image_size: egui::Vec2::new(1.0, 1.0),
             selections: Vec::new(),
             selection_anchor: None,
@@ -75,13 +84,15 @@ impl ImageCropperApp {
             finished: false,
             preload_rx,
             preload_cache: HashMap::new(),
-            past_images: VecDeque::with_capacity(5),
+            past_images: VecDeque::with_capacity(10),
             save_tx,
             save_status_rx,
             pending_saves: Vec::new(),
             loading_active: false,
             is_exiting: false,
             exit_attempt_count: 0,
+            list_completed: false,
+            windowed_mode_set: false,
         };
         app.ensure_initial_preload();
         app.load_current_image(&cc.egui_ctx)?;
@@ -105,8 +116,26 @@ impl ImageCropperApp {
                     {
                         let file = std::fs::File::create(&temp_path)?;
                         let writer = std::io::BufWriter::new(file);
-                        let encoder = AvifEncoder::new_with_speed_quality(writer, 4, req.quality);
-                        req.image.write_with_encoder(encoder)?;
+                        match req.format {
+                            OutputFormat::Jpg => {
+                                let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(writer, req.quality);
+                                req.image.write_with_encoder(encoder)?;
+                            }
+                            OutputFormat::Png => {
+                                let encoder = image::codecs::png::PngEncoder::new(writer);
+                                req.image.write_with_encoder(encoder)?;
+                            }
+                            OutputFormat::Webp => {
+                                // WebP encoder in image crate is currently lossless only or limited?
+                                // Using new_lossless for now.
+                                let encoder = image::codecs::webp::WebPEncoder::new_lossless(writer);
+                                req.image.write_with_encoder(encoder)?;
+                            }
+                            OutputFormat::Avif => {
+                                let encoder = AvifEncoder::new_with_speed_quality(writer, 4, req.quality);
+                                req.image.write_with_encoder(encoder)?;
+                            }
+                        }
                     } // Close file
 
                     // Move to final destination
@@ -179,7 +208,9 @@ impl ImageCropperApp {
 
     fn request_shutdown(&mut self, ctx: &egui::Context) {
         self.finished = true;
-        ctx.send_viewport_cmd(ViewportCommand::Close);
+        if self.pending_saves.is_empty() {
+            ctx.send_viewport_cmd(ViewportCommand::Close);
+        }
     }
 
     fn spawn_preloader(paths: Vec<PathBuf>) -> Receiver<PreloadedImage> {
@@ -270,6 +301,7 @@ impl ImageCropperApp {
             move_down: input.key_down(egui::Key::ArrowDown),
             move_left: input.key_down(egui::Key::ArrowLeft),
             move_right: input.key_down(egui::Key::ArrowRight),
+            preview: input.key_down(egui::Key::P),
         })
     }
 
@@ -284,15 +316,16 @@ impl ImageCropperApp {
             if let Some(path) = self.current_path().map(Path::to_path_buf) {
                 if path
                     .extension()
-                    .map_or(false, |e| e.to_ascii_lowercase() != "avif")
+                    .map_or(false, |e| e.to_ascii_lowercase() != self.format.extension())
                 {
                     if let Some(image) = self.image.clone() {
-                        let output_path = path.with_extension("avif");
+                        let output_path = path.with_extension(self.format.extension());
                         let request = SaveRequest {
                             image,
                             path: output_path.clone(),
                             original_path: path.clone(),
                             quality: self.quality,
+                            format: self.format,
                         };
 
                         if let Ok(_) = self.save_tx.send(request) {
@@ -301,7 +334,7 @@ impl ImageCropperApp {
                                 *p = output_path.clone();
                             }
                             self.status =
-                                format!("Converting {} to AVIF...", output_path.display());
+                                format!("Converting {} to {}...", output_path.display(), self.format.extension().to_uppercase());
                         }
                     }
                 }
@@ -317,7 +350,7 @@ impl ImageCropperApp {
             // We need the ColorImage for the cache, but we only have the texture.
             // Re-generating ColorImage from DynamicImage is fast enough.
             let color_image = to_color_image(&image);
-            if self.past_images.len() >= 5 {
+            if self.past_images.len() >= 10 {
                 self.past_images.pop_front();
             }
             self.past_images.push_back(PreloadedImage {
@@ -327,7 +360,13 @@ impl ImageCropperApp {
             });
         }
 
-        self.current_index = (self.current_index + 1) % self.files.len();
+        if self.current_index + 1 >= self.files.len() {
+            self.list_completed = true;
+            self.status = "All images processed".into();
+            return;
+        }
+
+        self.current_index += 1;
         if let Err(err) = self.load_current_image(ctx) {
             self.status = format!("{err:#}");
         }
@@ -412,11 +451,14 @@ impl ImageCropperApp {
         self.preload_cache.remove(&path);
         self.files.remove(self.current_index);
         if self.files.is_empty() {
-            self.request_shutdown(ctx);
+            self.list_completed = true;
+            self.status = "No images remaining".into();
             return;
         }
         if self.current_index >= self.files.len() {
-            self.current_index = 0;
+            self.list_completed = true;
+            self.status = "All images processed".into();
+            return;
         }
         if let Err(err) = self.load_current_image(ctx) {
             self.status = format!("{err:#}");
@@ -457,7 +499,7 @@ impl ImageCropperApp {
             combine_crops(crops)
         };
 
-        let output_path = path.with_extension("avif");
+        let output_path = path.with_extension(self.format.extension());
 
         // Send to background saver
         let request = SaveRequest {
@@ -465,6 +507,7 @@ impl ImageCropperApp {
             path: output_path.clone(),
             original_path: path.clone(),
             quality: self.quality,
+            format: self.format,
         };
 
         if let Err(err) = self.save_tx.send(request) {
@@ -484,6 +527,36 @@ impl ImageCropperApp {
 
         self.status = format!("Saving {} in background...", output_path.display());
         true
+    }
+
+    fn generate_preview(&mut self, ctx: &egui::Context) {
+        let Some(image) = self.image.clone() else { return };
+
+        let mut crops = Vec::new();
+        for selection in &self.selections {
+            if let Some((x, y, w, h)) = selection.to_u32_bounds() {
+                if w > 0 && h > 0 {
+                    crops.push(image.crop_imm(x, y, w, h));
+                }
+            }
+        }
+
+        if crops.is_empty() {
+            return;
+        }
+
+        let final_image = if crops.len() == 1 {
+            crops[0].clone()
+        } else {
+            combine_crops(crops)
+        };
+
+        let color_image = to_color_image(&final_image);
+        self.preview_texture = Some(ctx.load_texture(
+            "preview-texture",
+            color_image,
+            egui::TextureOptions::LINEAR,
+        ));
     }
 
     fn handle_arrow_movement(&mut self, keys: &KeyboardState) {
@@ -655,8 +728,13 @@ impl App for ImageCropperApp {
 
         if self.is_exiting {
             if self.pending_saves.is_empty() {
-                self.request_shutdown(ctx);
+                ctx.send_viewport_cmd(ViewportCommand::Close);
             } else {
+                if !self.windowed_mode_set {
+                    ctx.send_viewport_cmd(ViewportCommand::Fullscreen(false));
+                    ctx.send_viewport_cmd(ViewportCommand::InnerSize(egui::vec2(400.0, 200.0)));
+                    self.windowed_mode_set = true;
+                }
                 egui::CentralPanel::default().show(ctx, |ui| {
                     ui.centered_and_justified(|ui| {
                         ui.heading(format!(
@@ -667,6 +745,29 @@ impl App for ImageCropperApp {
                 });
                 ctx.request_repaint();
             }
+            return;
+        }
+
+        if self.list_completed {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.centered_and_justified(|ui| {
+                    ui.vertical_centered(|ui| {
+                        ui.heading("All images processed!");
+                        ui.add_space(20.0);
+                        if ui.button("Start Over").clicked() {
+                            self.list_completed = false;
+                            self.current_index = 0;
+                            if let Err(err) = self.load_current_image(ctx) {
+                                self.status = format!("{err:#}");
+                            }
+                        }
+                        ui.add_space(10.0);
+                        if ui.button("Quit").clicked() {
+                            self.finished = true;
+                        }
+                    });
+                });
+            });
             return;
         }
 
@@ -726,31 +827,57 @@ impl App for ImageCropperApp {
                 ui.allocate_painter(ui.available_size(), egui::Sense::hover());
             painter.rect_filled(response.rect, 0.0, Color32::BLACK);
 
-            if let Some(texture) = &self.texture {
-                let metrics = ImageMetrics::new(response.rect, self.image_size);
-                painter.image(
-                    texture.id(),
-                    metrics.image_rect,
-                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                    Color32::WHITE,
-                );
+            if keys.preview && !self.selections.is_empty() {
+                if self.preview_texture.is_none() {
+                    self.generate_preview(ctx);
+                }
 
-                let image_response = ui.interact(
-                    metrics.image_rect,
-                    ui.id().with("image"),
-                    egui::Sense::click_and_drag(),
-                );
-                self.handle_pointer(&image_response, &metrics, ctx);
-                self.draw_selection(&painter, &metrics);
-                self.draw_handles(ui, &painter, &metrics);
+                if let Some(texture) = &self.preview_texture {
+                    let metrics = ImageMetrics::new(response.rect, texture.size_vec2());
+                    painter.image(
+                        texture.id(),
+                        metrics.image_rect,
+                        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                        Color32::WHITE,
+                    );
+
+                    painter.text(
+                        response.rect.left_top() + egui::vec2(10.0, 10.0),
+                        egui::Align2::LEFT_TOP,
+                        "PREVIEW MODE",
+                        egui::FontId::proportional(20.0),
+                        Color32::YELLOW,
+                    );
+                }
             } else {
-                painter.text(
-                    response.rect.center(),
-                    egui::Align2::CENTER_CENTER,
-                    "Loading...",
-                    egui::FontId::proportional(24.0),
-                    Color32::WHITE,
-                );
+                self.preview_texture = None;
+
+                if let Some(texture) = &self.texture {
+                    let metrics = ImageMetrics::new(response.rect, self.image_size);
+                    painter.image(
+                        texture.id(),
+                        metrics.image_rect,
+                        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                        Color32::WHITE,
+                    );
+
+                    let image_response = ui.interact(
+                        metrics.image_rect,
+                        ui.id().with("image"),
+                        egui::Sense::click_and_drag(),
+                    );
+                    self.handle_pointer(&image_response, &metrics, ctx);
+                    self.draw_selection(&painter, &metrics);
+                    self.draw_handles(ui, &painter, &metrics);
+                } else {
+                    painter.text(
+                        response.rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "Loading...",
+                        egui::FontId::proportional(24.0),
+                        Color32::WHITE,
+                    );
+                }
             }
 
             // Draw spinner if saving
@@ -784,7 +911,7 @@ impl App for ImageCropperApp {
             painter.text(
                 response.rect.right_bottom() + egui::vec2(-12.0, -12.0),
                 egui::Align2::RIGHT_BOTTOM,
-                "Enter: Save | Space: Next | Backspace: Prev | Delete: Trash | Esc: Clear/Quit",
+                "Enter: Save | Space: Next | Backspace: Prev | Delete: Trash | P: Preview | Esc: Clear/Quit",
                 egui::FontId::monospace(16.0),
                 Color32::from_gray(200),
             );

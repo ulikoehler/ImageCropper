@@ -61,4 +61,5 @@ pub struct KeyboardState {
     pub move_down: bool,
     pub move_left: bool,
     pub move_right: bool,
+    pub preview: bool,
 }

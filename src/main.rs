@@ -13,6 +13,7 @@ mod ui;
 
 use app::ImageCropperApp;
 use fs_utils::collect_images;
+use image_utils::OutputFormat;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -29,12 +30,16 @@ struct Args {
     #[arg(short, long, default_value_t = 60)]
     quality: u8,
 
-    /// Automatically resave images to AVIF when navigating away
-    #[arg(long, default_value_t = false)]
+    /// Output format for saved images
+    #[arg(short, long, value_enum, default_value_t = OutputFormat::Avif)]
+    format: OutputFormat,
+
+    /// Automatically resave images to the selected format when navigating away
+    #[arg(short, long, default_value_t = false)]
     resave: bool,
 
     /// Skip destructive operations and just print what would happen
-    #[arg(long, default_value_t = false)]
+    #[arg(short = 'd', long, default_value_t = false)]
     dry_run: bool,
 }
 
@@ -51,6 +56,7 @@ fn main() -> Result<()> {
     let dry_run = args.dry_run;
     let quality = args.quality;
     let resave = args.resave;
+    let format = args.format;
     let files_for_app = files.clone();
 
     let native_options = eframe::NativeOptions {
@@ -62,7 +68,7 @@ fn main() -> Result<()> {
         "ImageCropper",
         native_options,
         Box::new(
-            move |cc| match ImageCropperApp::new(cc, files_for_app.clone(), dry_run, quality, resave) {
+            move |cc| match ImageCropperApp::new(cc, files_for_app.clone(), dry_run, quality, resave, format) {
                 Ok(app) => Box::new(app) as Box<dyn eframe::App>,
                 Err(err) => {
                     eprintln!("{err:#}");
