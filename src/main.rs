@@ -5,15 +5,9 @@ use clap::Parser;
 use eframe::egui;
 use rand::seq::SliceRandom;
 
-mod app;
-mod fs_utils;
-mod image_utils;
-mod selection;
-mod ui;
-
-use app::ImageCropperApp;
-use fs_utils::collect_images;
-use image_utils::OutputFormat;
+use imagecropper::app::ImageCropperApp;
+use imagecropper::fs_utils::collect_images;
+use imagecropper::image_utils::OutputFormat;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -80,3 +74,4 @@ fn main() -> Result<()> {
 
     Ok(())
 }
+

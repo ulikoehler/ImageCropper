@@ -65,7 +65,7 @@ pub fn move_with_unique_name(source: &Path, target_dir: &Path) -> Result<()> {
     })
 }
 
-fn unique_destination(dir: &Path, file_name: &OsStr) -> PathBuf {
+pub fn unique_destination(dir: &Path, file_name: &OsStr) -> PathBuf {
     let mut candidate = dir.join(file_name);
     if !candidate.exists() {
         return candidate;
@@ -85,7 +85,7 @@ fn unique_destination(dir: &Path, file_name: &OsStr) -> PathBuf {
     candidate
 }
 
-fn split_name(file_name: &OsStr) -> (String, Option<String>) {
+pub fn split_name(file_name: &OsStr) -> (String, Option<String>) {
     let name = file_name.to_string_lossy();
     if let Some((stem, ext)) = name.rsplit_once('.') {
         (stem.to_string(), Some(ext.to_string()))
@@ -98,3 +98,4 @@ pub fn backup_original(path: &Path) -> Result<()> {
     let dir = prepare_dir(ORIGINALS_DIR)?;
     move_with_unique_name(path, &dir)
 }
+

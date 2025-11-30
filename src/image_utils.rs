@@ -108,3 +108,4 @@ pub fn combine_crops(mut crops: Vec<DynamicImage>) -> DynamicImage {
 
     DynamicImage::ImageRgba8(final_image)
 }
+

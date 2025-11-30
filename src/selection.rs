@@ -190,3 +190,4 @@ pub fn selection_color(index: usize) -> Color32 {
     let [r, g, b] = egui::ecolor::Hsva::new(h, 0.8, 1.0, 1.0).to_rgb();
     Color32::from_rgb((r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8)
 }
+

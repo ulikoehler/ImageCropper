@@ -10,3 +10,7 @@ eframe = { version = "0.27", default-features = false, features = ["wgpu", "defa
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "bmp", "gif", "ico", "tiff", "webp", "avif"] }
 rand = "0.8"
 walkdir = "2.5"
+
+[dev-dependencies]
+once_cell = "1"
+tempfile = "3"
