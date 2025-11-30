@@ -1,0 +1,12 @@
+[package]
+name = "imagecropper"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+eframe = { version = "0.27", default-features = false, features = ["wgpu", "default_fonts", "wayland", "x11"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "bmp", "gif", "ico", "tiff", "webp", "avif"] }
+rand = "0.8"
+walkdir = "2.5"
