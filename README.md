@@ -96,7 +96,7 @@ imagecropper [OPTIONS] <DIRECTORY>
 
 ### Options
 
-*   `-q, --quality <QUALITY>`: Set the output AVIF quality (1-100). Default is **60**.
+*   `-q, --quality <QUALITY>`: Set the output AVIF quality (1-100). Default is **70** which is a conservative choice. Most photos will do fine with q=30 even if you are watching them on a TV. Checkout [MisterAVIF](https://github.com/ulikoehler/MisterAVIF) for a tool to determine the correct quality level for *your* images.
 *   `-r, --recursive`: Recursively scan subdirectories for images. Disabled by default.
 *   `--resave`: Automatically convert images to AVIF when navigating away from them, even if no crop was performed. Useful for batch converting a folder.
 *   `--dry-run`: Simulate operations without moving or writing files.

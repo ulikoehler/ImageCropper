@@ -28,7 +28,7 @@ struct Args {
     directory: PathBuf,
 
     /// Quality of the output image (1-100)
-    #[arg(short, long, default_value_t = 60)]
+    #[arg(short, long, default_value_t = 70)]
     quality: u8,
 
     /// Output format for saved images
