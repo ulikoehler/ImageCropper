@@ -1,7 +1,7 @@
 [package]
 name = "imagecropper"
 version = "0.2.0"
-edition = "2024"
+edition = "2021"
 homepage = "https://github.com/ulikoehler/ImageCropper"
 repository = "https://github.com/ulikoehler/ImageCropper"
 description = "Batch interactive image cropper with multicrop support"
