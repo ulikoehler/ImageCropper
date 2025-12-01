@@ -69,7 +69,7 @@ pub fn prepare_dir(base: &Path, name: &str) -> Result<PathBuf> {
     Ok(dir)
 }
 
-pub fn move_with_unique_name(source: &Path, target_dir: &Path) -> Result<()> {
+pub fn move_with_unique_name(source: &Path, target_dir: &Path) -> Result<PathBuf> {
     let file_name = source
         .file_name()
         .ok_or_else(|| anyhow!("{} has no file name", source.display()))?;
@@ -80,7 +80,8 @@ pub fn move_with_unique_name(source: &Path, target_dir: &Path) -> Result<()> {
             source.display(),
             destination.display()
         )
-    })
+    })?;
+    Ok(destination)
 }
 
 pub fn unique_destination(dir: &Path, file_name: &OsStr) -> PathBuf {
@@ -112,7 +113,7 @@ pub fn split_name(file_name: &OsStr) -> (String, Option<String>) {
     }
 }
 
-pub fn backup_original(path: &Path) -> Result<()> {
+pub fn backup_original(path: &Path) -> Result<PathBuf> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let dir = prepare_dir(parent, ORIGINALS_DIR)?;
     move_with_unique_name(path, &dir)

@@ -64,7 +64,7 @@ impl Saver {
                         original_size = Some(meta.len());
                     }
 
-                    backup_original(&req.original_path)?;
+                    let backed_up_path = backup_original(&req.original_path)?;
 
                     // Save to temp file first
                     let parent = req.path.parent().unwrap_or_else(|| std::path::Path::new("."));
@@ -110,7 +110,7 @@ impl Saver {
                     // If injection fails, we just move the temp file.
                     
                     let copy_metadata = || -> Result<()> {
-                        let input_data = std::fs::read(&req.original_path)?;
+                        let input_data = std::fs::read(&backed_up_path)?;
                         let temp_data = std::fs::read(&temp_path)?;
                         
                         // Detect input format and extract metadata

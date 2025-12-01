@@ -76,7 +76,12 @@ impl Loader {
                             .unwrap_or(false);
 
                         let img_result = if is_jpeg {
+                            // Allow incomplete JPEGs to still be rendered
+                            let options = zune_jpeg::zune_core::options::DecoderOptions::default()
+                                .set_strict_mode(false);
                             let mut decoder = JpegDecoder::new(Cursor::new(&bytes));
+                            decoder.set_options(options);
+
                             match decoder.decode() {
                                 Ok(pixels) => {
                                     let info = decoder.info().unwrap();
@@ -145,16 +150,25 @@ impl Loader {
                                     };
 
                                     if let Some(src_image) = src_image {
-                                        let mut dst_image = Image::new(new_w, new_h, PixelType::U8x4);
+                                        let mut dst_image = Image::new(new_w, new_h, src_image.pixel_type());
                                         let mut resizer = Resizer::new();
                                         resizer
                                             .resize(&src_image, &mut dst_image, &ResizeOptions::default())
                                             .unwrap();
 
-                                        image = image::DynamicImage::ImageRgba8(
-                                            image::RgbaImage::from_raw(new_w, new_h, dst_image.into_vec())
-                                                .unwrap(),
-                                        );
+                                        image = match src_image.pixel_type() {
+                                            PixelType::U8x3 => {
+                                                image::DynamicImage::ImageRgb8(
+                                                    image::RgbImage::from_raw(new_w, new_h, dst_image.into_vec()).unwrap()
+                                                )
+                                            }
+                                            PixelType::U8x4 => {
+                                                image::DynamicImage::ImageRgba8(
+                                                    image::RgbaImage::from_raw(new_w, new_h, dst_image.into_vec()).unwrap()
+                                                )
+                                            }
+                                            _ => unreachable!("We only created U8x3 or U8x4 images"),
+                                        };
                                     }
                                 }
                                 let resize_duration = resize_start.elapsed();

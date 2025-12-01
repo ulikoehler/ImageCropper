@@ -113,6 +113,10 @@ imagecropper [OPTIONS] <DIRECTORY>
 *   **Backspace**: Go to the previous image.
 *   **Delete**: Move the current image to the trash folder (`.imagecropper-trash`).
 *   **Esc**: Clear current selection. If no selection, exit the application.
+*   **R**: Rotate the current image 90° clockwise.
+*   **Shift + R**: Rotate the current image 90° counter-clockwise.
+
+    Note: rotating the image clears any existing selections because selection coordinates are image-space specific.
 
 ## Workflow
 

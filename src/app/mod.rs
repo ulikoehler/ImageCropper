@@ -194,6 +194,8 @@ impl ImageCropperApp {
             move_left: input.key_down(egui::Key::ArrowLeft),
             move_right: input.key_down(egui::Key::ArrowRight),
             preview: input.key_down(egui::Key::P),
+            rotate_cw: input.key_pressed(egui::Key::R) && !input.modifiers.shift,
+            rotate_ccw: input.key_pressed(egui::Key::R) && input.modifiers.shift,
         })
     }
 
@@ -449,6 +451,77 @@ impl ImageCropperApp {
         true
     }
 
+    fn rotate_current_image(&mut self, _ctx: &egui::Context, render_state: Option<&RenderState>, cw: bool) {
+        if let Some(image) = &self.image {
+            let start = std::time::Instant::now();
+            let new_image = if cw {
+                image.rotate90()
+            } else {
+                image.rotate270()
+            };
+
+            self.image_size = egui::Vec2::new(new_image.width() as f32, new_image.height() as f32);
+            
+            // Free previous texture
+            if let Some((id, _)) = self.texture.take() {
+                if let Some(rs) = render_state {
+                    rs.renderer.write().free_texture(&id);
+                }
+            }
+
+            // Create new texture
+            if let Some(rs) = render_state {
+                let rgba = new_image.to_rgba8();
+                let width = rgba.width();
+                let height = rgba.height();
+                
+                let texture_size = wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                };
+
+                let texture = rs.device.create_texture(&wgpu::TextureDescriptor {
+                    size: texture_size,
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: wgpu::TextureFormat::Rgba8Unorm,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                    label: Some("rotated_image_texture"),
+                    view_formats: &[],
+                });
+
+                rs.queue.write_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    &rgba,
+                    wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(4 * width),
+                        rows_per_image: Some(height),
+                    },
+                    texture_size,
+                );
+
+                let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+                let id = rs.renderer.write().register_native_texture(&rs.device, &view, wgpu::FilterMode::Linear);
+                self.texture = Some((id, texture));
+            }
+
+            self.image = Some(new_image);
+            self.canvas.clear(); // Clear selections as they are now invalid
+            
+            if self.benchmark {
+                println!("[Benchmark] Rotation took {:?}", start.elapsed());
+            }
+        }
+    }
+
     fn generate_preview(&mut self, ctx: &egui::Context) {
         let Some(image) = self.image.clone() else { return };
 
@@ -651,6 +724,15 @@ impl App for ImageCropperApp {
             self.exit_attempt_count = 0;
             self.delete_current(ctx, render_state);
         }
+
+        if keys.rotate_cw {
+            self.rotate_current_image(ctx, render_state, true);
+        }
+
+        if keys.rotate_ccw {
+            self.rotate_current_image(ctx, render_state, false);
+        }
+
         self.canvas.handle_arrow_movement(&keys, self.image_size);
 
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -748,7 +830,7 @@ impl App for ImageCropperApp {
             draw_text_with_bg(
                 response.rect.right_bottom() + egui::vec2(-12.0, -12.0),
                 egui::Align2::RIGHT_BOTTOM,
-                "Enter: Save | Space: Next | Backspace: Prev | Delete: Trash | P: Preview | Esc: Clear/Quit".to_string(),
+                "Enter: Save | Space: Next | Backspace: Prev | Delete: Trash | R: Rotate | P: Preview | Esc: Clear/Quit".to_string(),
                 egui::FontId::monospace(16.0),
                 Color32::from_gray(200),
             );

@@ -62,5 +62,7 @@ pub struct KeyboardState {
     pub move_left: bool,
     pub move_right: bool,
     pub preview: bool,
+    pub rotate_cw: bool,
+    pub rotate_ccw: bool,
 }
 
