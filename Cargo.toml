@@ -2,6 +2,10 @@
 name = "imagecropper"
 version = "0.1.0"
 edition = "2024"
+homepage = "https://github.com/ulikoehler/ImageCropper"
+repository = "https://github.com/ulikoehler/ImageCropper"
+description = "Batch interactive image cropper with multicrop support"
+license = "Apache-2.0"
 
 [dependencies]
 anyhow = "1.0"
