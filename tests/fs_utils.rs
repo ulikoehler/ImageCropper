@@ -20,7 +20,7 @@ fn collect_images_includes_supported_extensions() {
         fs::write(root.join(name), []).unwrap();
     }
 
-    let mut files = collect_images(root, false).unwrap();
+    let mut files = collect_images(&[root.to_path_buf()], false).unwrap();
     files.sort();
 
     let mut expected: Vec<_> = supported.iter().map(|n| root.join(n)).collect();
@@ -37,12 +37,12 @@ fn collect_images_respects_recursive_flag() {
     fs::write(root.join("subdir/image.png"), []).unwrap();
 
     // non-recursive should not find the nested file
-    let mut nonrec = collect_images(root, false).unwrap();
+    let mut nonrec = collect_images(&[root.to_path_buf()], false).unwrap();
     nonrec.sort();
     assert!(nonrec.is_empty());
 
     // recursive should find it
-    let mut rec = collect_images(root, true).unwrap();
+    let mut rec = collect_images(&[root.to_path_buf()], true).unwrap();
     rec.sort();
     assert_eq!(rec, vec![root.join("subdir/image.png")]);
 }
@@ -50,7 +50,7 @@ fn collect_images_respects_recursive_flag() {
 #[test]
 fn collect_images_errors_for_missing_directory() {
     let missing = Path::new("/does/not/exist");
-    let err = collect_images(missing, false).unwrap_err();
+    let err = collect_images(&[missing.to_path_buf()], false).unwrap_err();
     assert!(err.to_string().contains("does not exist"));
 }
 
@@ -119,4 +119,47 @@ fn backup_original_moves_file_to_originals_dir() {
         assert!(originals.exists());
         assert_eq!(fs::read_dir(&originals).unwrap().count(), 1);
     });
+}
+
+#[test]
+fn collect_images_handles_multiple_paths_and_mixed_inputs() {
+    let tmp = tempdir().unwrap();
+    let root = tmp.path();
+    
+    // Create structure:
+    // root/
+    //   dir1/
+    //     img1.png
+    //   dir2/
+    //     img2.jpg
+    //   img3.avif
+    
+    let dir1 = root.join("dir1");
+    fs::create_dir(&dir1).unwrap();
+    fs::write(dir1.join("img1.png"), []).unwrap();
+    
+    let dir2 = root.join("dir2");
+    fs::create_dir(&dir2).unwrap();
+    fs::write(dir2.join("img2.jpg"), []).unwrap();
+    
+    let img3 = root.join("img3.avif");
+    fs::write(&img3, []).unwrap();
+    
+    // Test 1: Multiple directories
+    let paths = vec![dir1.clone(), dir2.clone()];
+    let mut files = collect_images(&paths, false).unwrap();
+    files.sort();
+    assert_eq!(files, vec![dir1.join("img1.png"), dir2.join("img2.jpg")]);
+    
+    // Test 2: Mixed directory and file
+    let paths = vec![dir1.clone(), img3.clone()];
+    let mut files = collect_images(&paths, false).unwrap();
+    files.sort();
+    assert_eq!(files, vec![dir1.join("img1.png"), img3.clone()]);
+    
+    // Test 3: Just files
+    let paths = vec![dir1.join("img1.png"), img3.clone()];
+    let mut files = collect_images(&paths, false).unwrap();
+    files.sort();
+    assert_eq!(files, vec![dir1.join("img1.png"), img3.clone()]);
 }

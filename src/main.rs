@@ -23,9 +23,9 @@ enum SortOrder {
     about = "Fullscreen image cropper with deletion workflow"
 )]
 struct Args {
-    /// Directory that contains images to process
-    #[arg(value_name = "DIRECTORY")]
-    directory: PathBuf,
+    /// Directories or files to process
+    #[arg(value_name = "PATHS", required = true)]
+    paths: Vec<PathBuf>,
 
     /// Quality of the output image (1-100)
     #[arg(short, long, default_value_t = 70)]
@@ -36,7 +36,7 @@ struct Args {
     format: OutputFormat,
 
     /// Automatically resave images to the selected format when navigating away
-    #[arg(short, long, default_value_t = false)]
+    #[arg(long, default_value_t = false)]
     resave: bool,
 
     /// Skip destructive operations and just print what would happen
@@ -62,11 +62,10 @@ struct Args {
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    let mut files = collect_images(&args.directory, args.recursive)?;
+    let mut files = collect_images(&args.paths, args.recursive)?;
     if files.is_empty() {
         return Err(anyhow!(
-            "No supported image files found in {}. Supported formats are: {}",
-            args.directory.display(),
+            "No supported image files found in the provided paths. Supported formats are: {}",
             imagecropper::fs_utils::SUPPORTED_EXTENSIONS.join(", ")
         ));
     }

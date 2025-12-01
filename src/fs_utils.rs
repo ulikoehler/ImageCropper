@@ -15,31 +15,39 @@ pub const SUPPORTED_EXTENSIONS: &[&str] = &[
     "png", "jpg", "jpeg", "bmp", "gif", "webp", "tiff", "tif", "ico", "avif",
 ];
 
-pub fn collect_images(root: &Path, recursive: bool) -> Result<Vec<PathBuf>> {
-    if !root.exists() {
-        return Err(anyhow!("{} does not exist", root.display()));
-    }
-    if !root.is_dir() {
-        return Err(anyhow!("{} is not a directory", root.display()));
-    }
-
+pub fn collect_images(paths: &[PathBuf], recursive: bool) -> Result<Vec<PathBuf>> {
     let mut files = Vec::new();
-    if recursive {
-        for entry in WalkDir::new(root)
-            .follow_links(false)
-            .into_iter()
-            .filter_map(|e| e.ok())
-        {
-            if entry.file_type().is_file() && is_supported_image(entry.path()) {
-                files.push(entry.path().to_path_buf());
-            }
+    for path in paths {
+        if !path.exists() {
+            return Err(anyhow!("{} does not exist", path.display()));
         }
-    } else {
-        for entry in fs::read_dir(root).with_context(|| format!("Unable to read directory {}", root.display()))? {
-            let entry = entry.with_context(|| format!("Unable to read entry in {}", root.display()))?;
-            let path = entry.path();
-            if path.is_file() && is_supported_image(&path) {
-                files.push(path);
+
+        if path.is_file() {
+            if is_supported_image(path) {
+                files.push(path.to_path_buf());
+            }
+        } else if path.is_dir() {
+            if recursive {
+                for entry in WalkDir::new(path)
+                    .follow_links(false)
+                    .into_iter()
+                    .filter_map(|e| e.ok())
+                {
+                    if entry.file_type().is_file() && is_supported_image(entry.path()) {
+                        files.push(entry.path().to_path_buf());
+                    }
+                }
+            } else {
+                for entry in fs::read_dir(path)
+                    .with_context(|| format!("Unable to read directory {}", path.display()))?
+                {
+                    let entry = entry
+                        .with_context(|| format!("Unable to read entry in {}", path.display()))?;
+                    let p = entry.path();
+                    if p.is_file() && is_supported_image(&p) {
+                        files.push(p);
+                    }
+                }
             }
         }
     }
