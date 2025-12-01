@@ -9,13 +9,13 @@ A fast, fullscreen image cropping tool written in Rust using `egui` and `wgpu`. 
 Global installation:
 
 ```sh
-cargo install image-cropper
+cargo install imagecropper
 ```
 
 ### Simple cropping
 
 ```sh
-cargo run test-images
+imagecropper test-images
 ```
 
 Drag with your mouse to select the crop area, then press **Enter** to save the cropped image and move to the next one. Use **Space** to skip images and **Delete** to move bad images to trash.
@@ -41,7 +41,7 @@ results in
 By default, cropped images are saved as AVIF files for high efficiency - **Saving AVIF files takes a LONG time (minutes!) but the TINY filesize despite HIGH QUALITY is impressive**. You can adjust the quality using the `-q` option, or choose a different output format using `-f/--format`.
 
 ```sh
-image-cropper -f png test-images
+imagecropper -f png test-images
 ```
 
 
@@ -52,13 +52,13 @@ You can control the order in which images are processed using the `-o/--order` o
 To select images in filename order:
 
 ```sh
-image-cropper -o randomize test-images
+imagecropper -o randomize test-images
 ```
 
 or by last modified time:
 
 ```sh
-image-cropper -o modified test-images
+imagecropper -o modified test-images
 ```
 
 ### Resave unchanged images?
@@ -66,7 +66,7 @@ image-cropper -o modified test-images
 You can use the `--resave` option to automatically convert images to AVIF when navigating away from them, even if no crop was performed. This is useful for batch converting a folder of images.
 
 ```sh
-image-cropper --resave test-images
+imagecropper --resave test-images
 ```
 
 ## Features
