@@ -101,7 +101,7 @@ fn main() -> Result<()> {
         native_options,
         Box::new(
             move |cc| match ImageCropperApp::new(cc, files_for_app.clone(), dry_run, quality, resave, format, parallel) {
-                Ok(app) => Box::new(app) as Box<dyn eframe::App>,
+                Ok(app) => Ok(Box::new(app) as Box<dyn eframe::App>),
                 Err(err) => {
                     eprintln!("{err:#}");
                     std::process::exit(1);

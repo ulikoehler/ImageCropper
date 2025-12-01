@@ -541,7 +541,7 @@ impl App for ImageCropperApp {
             painter.rect_filled(response.rect, 0.0, Color32::BLACK);
 
             let draw_text_with_bg = |pos: egui::Pos2, align: egui::Align2, text: String, font: egui::FontId, color: Color32| {
-                let galley = ctx.fonts(|fonts| fonts.layout_no_wrap(text, font, color));
+                let galley = ctx.fonts_mut(|fonts| fonts.layout_no_wrap(text, font, color));
                 let rect = align.anchor_size(pos, galley.size());
                 painter.rect_filled(rect.expand(4.0), 4.0, Color32::from_black_alpha(178));
                 painter.galley(rect.min, galley, Color32::WHITE);

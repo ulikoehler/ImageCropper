@@ -107,7 +107,7 @@ impl Canvas {
                 0.0,
                 Color32::from_rgba_unmultiplied(255, 255, 255, 24),
             );
-            painter.rect_stroke(rect, 0.0, (2.0, color));
+            painter.rect_stroke(rect, 0.0, egui::Stroke::new(2.0, color), egui::StrokeKind::Middle);
         }
     }
 
