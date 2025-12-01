@@ -15,7 +15,7 @@ pub const SUPPORTED_EXTENSIONS: &[&str] = &[
     "png", "jpg", "jpeg", "bmp", "gif", "webp", "tiff", "tif", "ico", "avif",
 ];
 
-pub fn collect_images(root: &Path) -> Result<Vec<PathBuf>> {
+pub fn collect_images(root: &Path, recursive: bool) -> Result<Vec<PathBuf>> {
     if !root.exists() {
         return Err(anyhow!("{} does not exist", root.display()));
     }
@@ -24,13 +24,23 @@ pub fn collect_images(root: &Path) -> Result<Vec<PathBuf>> {
     }
 
     let mut files = Vec::new();
-    for entry in WalkDir::new(root)
-        .follow_links(false)
-        .into_iter()
-        .filter_map(|e| e.ok())
-    {
-        if entry.file_type().is_file() && is_supported_image(entry.path()) {
-            files.push(entry.path().to_path_buf());
+    if recursive {
+        for entry in WalkDir::new(root)
+            .follow_links(false)
+            .into_iter()
+            .filter_map(|e| e.ok())
+        {
+            if entry.file_type().is_file() && is_supported_image(entry.path()) {
+                files.push(entry.path().to_path_buf());
+            }
+        }
+    } else {
+        for entry in fs::read_dir(root).with_context(|| format!("Unable to read directory {}", root.display()))? {
+            let entry = entry.with_context(|| format!("Unable to read entry in {}", root.display()))?;
+            let path = entry.path();
+            if path.is_file() && is_supported_image(&path) {
+                files.push(path);
+            }
         }
     }
     Ok(files)

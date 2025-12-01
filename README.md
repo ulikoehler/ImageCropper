@@ -12,6 +12,12 @@ Global installation:
 cargo install imagecropper
 ```
 
+and ensure `~/.cargo/bin` is in your `PATH`. Then, you can just run
+
+```sh
+imagecropper <DIRECTORY>
+```
+
 ### Simple cropping
 
 ```sh
@@ -44,6 +50,9 @@ By default, cropped images are saved as AVIF files for high efficiency - **Savin
 imagecropper -f png test-images
 ```
 
+### Recursive directory scanning
+
+By default, ImageCropper scans only the files in the top-level directory you provide. If you want to include images inside subdirectories as well, use `-r/--recursive` to enable recursive scanning.
 
 ### Image processing order
 
@@ -79,14 +88,6 @@ imagecropper --resave test-images
 *   **Background Processing**: Saving and conversion happens in the background to keep the UI responsive.
 *   **Preloading**: Preloads next/previous images for instant navigation.
 
-## Installation
-
-Ensure you have [Rust installed](https://rustup.rs/).
-
-```bash
-cargo install --path .
-```
-
 ## Usage
 
 ```bash
@@ -96,6 +97,7 @@ imagecropper [OPTIONS] <DIRECTORY>
 ### Options
 
 *   `-q, --quality <QUALITY>`: Set the output AVIF quality (1-100). Default is **60**.
+*   `-r, --recursive`: Recursively scan subdirectories for images. Disabled by default.
 *   `--resave`: Automatically convert images to AVIF when navigating away from them, even if no crop was performed. Useful for batch converting a folder.
 *   `--dry-run`: Simulate operations without moving or writing files.
 

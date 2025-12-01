@@ -47,6 +47,10 @@ struct Args {
     #[arg(short = 'j', long = "parallel", default_value_t = 16)]
     parallel: usize,
 
+    /// Recurse into subdirectories to find images (disabled by default)
+    #[arg(short = 'r', long = "recursive", default_value_t = false)]
+    recursive: bool,
+
     /// Invert order of processed images (ignored for randomize)
     #[arg(short = 'i', long = "inverse-order", default_value_t = false)]
     inverse: bool,
@@ -58,7 +62,7 @@ struct Args {
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    let mut files = collect_images(&args.directory)?;
+    let mut files = collect_images(&args.directory, args.recursive)?;
     if files.is_empty() {
         return Err(anyhow!(
             "No supported image files found in {}. Supported formats are: {}",

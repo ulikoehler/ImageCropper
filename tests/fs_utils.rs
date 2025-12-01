@@ -20,7 +20,7 @@ fn collect_images_includes_supported_extensions() {
         fs::write(root.join(name), []).unwrap();
     }
 
-    let mut files = collect_images(root).unwrap();
+    let mut files = collect_images(root, false).unwrap();
     files.sort();
 
     let mut expected: Vec<_> = supported.iter().map(|n| root.join(n)).collect();
@@ -28,10 +28,29 @@ fn collect_images_includes_supported_extensions() {
     assert_eq!(files, expected);
 }
 
+
+#[test]
+fn collect_images_respects_recursive_flag() {
+    let tmp = tempdir().unwrap();
+    let root = tmp.path();
+    fs::create_dir(root.join("subdir")).unwrap();
+    fs::write(root.join("subdir/image.png"), []).unwrap();
+
+    // non-recursive should not find the nested file
+    let mut nonrec = collect_images(root, false).unwrap();
+    nonrec.sort();
+    assert!(nonrec.is_empty());
+
+    // recursive should find it
+    let mut rec = collect_images(root, true).unwrap();
+    rec.sort();
+    assert_eq!(rec, vec![root.join("subdir/image.png")]);
+}
+
 #[test]
 fn collect_images_errors_for_missing_directory() {
     let missing = Path::new("/does/not/exist");
-    let err = collect_images(missing).unwrap_err();
+    let err = collect_images(missing, false).unwrap_err();
     assert!(err.to_string().contains("does not exist"));
 }
 
