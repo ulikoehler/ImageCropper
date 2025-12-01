@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, VecDeque},
+    io::Cursor,
     path::PathBuf,
     sync::mpsc::{self, Receiver, Sender},
     thread,
@@ -8,6 +9,7 @@ use std::{
 
 use fast_image_resize::images::Image;
 use fast_image_resize::{PixelType, ResizeOptions, Resizer};
+use zune_jpeg::JpegDecoder;
 
 use crate::image_utils::{to_color_image, PreloadedImage};
 
@@ -33,7 +35,7 @@ impl Loader {
 
     fn spawn_preloader() -> (Receiver<PreloadedImage>, Sender<PathBuf>) {
         let (preload_tx, preload_rx) = mpsc::channel();
-        let (path_tx, path_rx) = mpsc::channel();
+        let (path_tx, path_rx) = mpsc::channel::<PathBuf>();
         
         thread::spawn(move || {
             while let Ok(path) = path_rx.recv() {
@@ -46,7 +48,32 @@ impl Loader {
                 match file_bytes {
                     Ok(bytes) => {
                         let decode_start = Instant::now();
-                        let img_result = image::load_from_memory(&bytes);
+                        
+                        // Try zune-jpeg first for JPEGs
+                        let is_jpeg = path.extension()
+                            .and_then(|e| e.to_str())
+                            .map(|s| s.eq_ignore_ascii_case("jpg") || s.eq_ignore_ascii_case("jpeg"))
+                            .unwrap_or(false);
+
+                        let img_result = if is_jpeg {
+                            let mut decoder = JpegDecoder::new(Cursor::new(&bytes));
+                            match decoder.decode() {
+                                Ok(pixels) => {
+                                    let info = decoder.info().unwrap();
+                                    // zune-jpeg usually returns RGB8
+                                    image::RgbImage::from_raw(info.width as u32, info.height as u32, pixels)
+                                        .map(image::DynamicImage::ImageRgb8)
+                                        .ok_or_else(|| image::ImageError::Decoding(image::error::DecodingError::new(image::error::ImageFormatHint::Exact(image::ImageFormat::Jpeg), "Failed to create buffer")))
+                                }
+                                Err(e) => {
+                                    // Fallback to standard loader if zune fails
+                                    image::load_from_memory(&bytes)
+                                }
+                            }
+                        } else {
+                            image::load_from_memory(&bytes)
+                        };
+
                         let decode_duration = decode_start.elapsed();
                         drop(bytes); // Free memory early
 

@@ -16,6 +16,7 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png",
 rand = "0.8"
 walkdir = "2.5"
 wgpu = { version = "27.0.1", features = ["vulkan", "gles"] }
+zune-jpeg = "0.5.5"
 
 [dev-dependencies]
 once_cell = "1"
