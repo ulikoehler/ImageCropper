@@ -103,10 +103,11 @@ impl ImageCropperApp {
         if let Some(preloaded) = self.loader.get_from_cache(&path) {
             if self.benchmark {
                 println!(
-                    "[Benchmark] Cache HIT for {} (Total: {:?}, IO: {:?}, Resize: {:?}, TextureGen: {:?})",
+                    "[Benchmark] Cache HIT for {} (Total: {:?}, Read: {:?}, Decode: {:?}, Resize: {:?}, TextureGen: {:?})",
                     path.display(),
                     preloaded.load_duration,
-                    preloaded.io_duration,
+                    preloaded.read_duration,
+                    preloaded.decode_duration,
                     preloaded.resize_duration,
                     preloaded.texture_gen_duration
                 );
@@ -248,7 +249,8 @@ impl ImageCropperApp {
                 image,
                 color_image,
                 load_duration: std::time::Duration::default(),
-                io_duration: std::time::Duration::default(),
+                read_duration: std::time::Duration::default(),
+                decode_duration: std::time::Duration::default(),
                 resize_duration: std::time::Duration::default(),
                 texture_gen_duration: std::time::Duration::default(),
             });

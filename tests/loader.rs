@@ -39,7 +39,8 @@ fn history_keeps_only_ten_entries() {
             image,
             color_image,
             load_duration: Duration::default(),
-            io_duration: Duration::default(),
+            read_duration: Duration::default(),
+            decode_duration: Duration::default(),
             resize_duration: Duration::default(),
             texture_gen_duration: Duration::default(),
         });

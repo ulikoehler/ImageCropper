@@ -7,7 +7,7 @@ use std::{
 };
 
 use fast_image_resize::images::Image;
-use fast_image_resize::{ResizeOptions, Resizer};
+use fast_image_resize::{PixelType, ResizeOptions, Resizer};
 
 use crate::image_utils::{to_color_image, PreloadedImage};
 
@@ -39,82 +39,107 @@ impl Loader {
             while let Ok(path) = path_rx.recv() {
                 let start = Instant::now();
                 
-                let io_start = Instant::now();
-                let img_result = image::open(&path);
-                let io_duration = io_start.elapsed();
+                let read_start = Instant::now();
+                let file_bytes = std::fs::read(&path);
+                let read_duration = read_start.elapsed();
 
-                match img_result {
-                    Ok(mut image) => {
-                        let resize_start = Instant::now();
-                        // Resize if too large to speed up texture upload and save memory
-                        // Assuming 4K max dimension is enough for cropping
-                        if image.width() > 3840 || image.height() > 2160 {
-                            let (nwidth, nheight) = (3840, 2160);
-                            let ratio = image.width() as f64 / image.height() as f64;
-                            let (new_w, new_h) = if ratio > nwidth as f64 / nheight as f64 {
-                                (nwidth, (nwidth as f64 / ratio) as u32)
-                            } else {
-                                ((nheight as f64 * ratio) as u32, nheight)
-                            };
+                match file_bytes {
+                    Ok(bytes) => {
+                        let decode_start = Instant::now();
+                        let img_result = image::load_from_memory(&bytes);
+                        let decode_duration = decode_start.elapsed();
+                        drop(bytes); // Free memory early
 
-                            let src_image = Image::from_vec_u8(
-                                image.width(),
-                                image.height(),
-                                image.to_rgba8().into_raw(),
-                                fast_image_resize::PixelType::U8x4,
-                            )
-                            .unwrap();
+                        match img_result {
+                            Ok(mut image) => {
+                                let resize_start = Instant::now();
+                                // Resize if too large to speed up texture upload and save memory
+                                // Assuming 4K max dimension is enough for cropping
+                                if image.width() > 3840 || image.height() > 2160 {
+                                    let (nwidth, nheight) = (3840, 2160);
+                                    let ratio = image.width() as f64 / image.height() as f64;
+                                    let (new_w, new_h) = if ratio > nwidth as f64 / nheight as f64 {
+                                        (nwidth, (nwidth as f64 / ratio) as u32)
+                                    } else {
+                                        ((nheight as f64 * ratio) as u32, nheight)
+                                    };
 
-                            let mut dst_image = Image::new(new_w, new_h, src_image.pixel_type());
+                                    // Use fast_image_resize to convert to RGBA8 and resize in one go if possible
+                                    // or just resize.
+                                    // We want the result to be RGBA8 for egui.
+                                    
+                                    let src_image = match image {
+                                        image::DynamicImage::ImageRgb8(ref rgb) => {
+                                            Image::from_vec_u8(
+                                                rgb.width(),
+                                                rgb.height(),
+                                                rgb.as_raw().clone(),
+                                                PixelType::U8x3,
+                                            ).ok()
+                                        }
+                                        image::DynamicImage::ImageRgba8(ref rgba) => {
+                                            Image::from_vec_u8(
+                                                rgba.width(),
+                                                rgba.height(),
+                                                rgba.as_raw().clone(),
+                                                PixelType::U8x4,
+                                            ).ok()
+                                        }
+                                        _ => {
+                                            // Fallback for other types
+                                            let rgba = image.to_rgba8();
+                                            Image::from_vec_u8(
+                                                rgba.width(),
+                                                rgba.height(),
+                                                rgba.into_raw(),
+                                                PixelType::U8x4,
+                                            ).ok()
+                                        }
+                                    };
 
-                            let mut resizer = Resizer::new();
-                            resizer
-                                .resize(&src_image, &mut dst_image, &ResizeOptions::default())
-                                .unwrap();
+                                    if let Some(src_image) = src_image {
+                                        let mut dst_image = Image::new(new_w, new_h, PixelType::U8x4);
+                                        let mut resizer = Resizer::new();
+                                        resizer
+                                            .resize(&src_image, &mut dst_image, &ResizeOptions::default())
+                                            .unwrap();
 
-                            image = image::DynamicImage::ImageRgba8(
-                                image::RgbaImage::from_raw(new_w, new_h, dst_image.into_vec())
-                                    .unwrap(),
-                            );
-                        }
-                        let resize_duration = resize_start.elapsed();
+                                        image = image::DynamicImage::ImageRgba8(
+                                            image::RgbaImage::from_raw(new_w, new_h, dst_image.into_vec())
+                                                .unwrap(),
+                                        );
+                                    }
+                                }
+                                let resize_duration = resize_start.elapsed();
 
-                        let texture_gen_start = Instant::now();
-                        let color_image = to_color_image(&image);
-                        let texture_gen_duration = texture_gen_start.elapsed();
+                                let texture_gen_start = Instant::now();
+                                let color_image = to_color_image(&image);
+                                let texture_gen_duration = texture_gen_start.elapsed();
 
-                        let load_duration = start.elapsed();
-                        if preload_tx
-                            .send(PreloadedImage {
-                                path,
-                                image,
-                                color_image,
-                                load_duration,
-                                io_duration,
-                                resize_duration,
-                                texture_gen_duration,
-                            })
-                            .is_err()
-                        {
-                            break;
+                                let load_duration = start.elapsed();
+                                if preload_tx
+                                    .send(PreloadedImage {
+                                        path,
+                                        image,
+                                        color_image,
+                                        load_duration,
+                                        read_duration,
+                                        decode_duration,
+                                        resize_duration,
+                                        texture_gen_duration,
+                                    })
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                            }
+                            Err(err) => {
+                                eprintln!("Failed to decode {}: {err:#}", path.display());
+                            }
                         }
                     }
                     Err(err) => {
-                        // Give a clearer hint when AVIF decoding isn't available in the build
-                        if path
-                            .extension()
-                            .and_then(|e| e.to_str())
-                            .map(|s| s.eq_ignore_ascii_case("avif"))
-                            .unwrap_or(false)
-                            && err.to_string().contains("Avif")
-                        {
-                            eprintln!(
-                                "Failed to preload {}: AVIF decoding not available in this build.\n\tHint: build with image crate's `avif-native` feature (enables dav1d/mp4parse) to decode AVIF files.",
-                                path.display()
-                            );
-                        } else {
-                            eprintln!("Failed to preload {}: {err:#}", path.display());
-                        }
+                        eprintln!("Failed to read {}: {err:#}", path.display());
                     }
                 }
             }
