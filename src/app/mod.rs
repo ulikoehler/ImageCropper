@@ -12,7 +12,7 @@ use eframe::{
 use image::DynamicImage;
 
 use crate::{
-    fs_utils::{move_with_unique_name, prepare_dir, TRASH_DIR},
+    fs_utils::{format_size, move_with_unique_name, prepare_dir, TRASH_DIR},
     image_utils::{combine_crops, to_color_image, OutputFormat, PreloadedImage, SaveRequest},
     ui::{ImageMetrics, KeyboardState},
 };
@@ -33,6 +33,8 @@ pub struct ImageCropperApp {
     pub canvas: Canvas,
     pub loader: Loader,
     pub saver: Saver,
+    pub report_sizes: bool,
+    pub benchmark: bool,
     pub status: String,
     pub finished: bool,
     pub is_exiting: bool,
@@ -48,8 +50,10 @@ impl ImageCropperApp {
         dry_run: bool,
         quality: u8,
         resave: bool,
+        report_sizes: bool,
         format: OutputFormat,
         parallel: usize,
+        benchmark: bool,
     ) -> Result<Self> {
         let loader = Loader::new(files.clone());
         let saver = Saver::new(parallel);
@@ -61,6 +65,8 @@ impl ImageCropperApp {
             dry_run,
             quality,
             resave,
+            report_sizes,
+            benchmark,
             format,
             image: None,
             texture: None,
@@ -85,6 +91,7 @@ impl ImageCropperApp {
     }
 
     fn load_current_image(&mut self, ctx: &egui::Context) -> Result<()> {
+        let start = std::time::Instant::now();
         self.loader.update();
         let path = self
             .current_path()
@@ -92,9 +99,14 @@ impl ImageCropperApp {
             .to_path_buf();
 
         if let Some(preloaded) = self.loader.get_from_cache(&path) {
+            if self.benchmark {
+                println!("[Benchmark] Cache HIT for {} (loaded in {:?})", path.display(), preloaded.load_duration);
+            }
             self.image_size =
                 egui::Vec2::new(preloaded.image.width() as f32, preloaded.image.height() as f32);
             self.canvas.clear();
+            
+            let texture_start = std::time::Instant::now();
             if let Some(texture) = self.texture.as_mut() {
                 texture.set(preloaded.color_image, egui::TextureOptions::LINEAR);
             } else {
@@ -104,6 +116,10 @@ impl ImageCropperApp {
                     egui::TextureOptions::LINEAR,
                 ));
             }
+            if self.benchmark {
+                println!("[Benchmark] Texture upload took {:?}", texture_start.elapsed());
+            }
+
             self.image = Some(preloaded.image);
             self.status = format!(
                 "Loaded {} ({}/{})",
@@ -113,6 +129,9 @@ impl ImageCropperApp {
             );
             self.loader.loading_active = false;
         } else {
+            if self.benchmark {
+                println!("[Benchmark] Cache MISS for {}", path.display());
+            }
             // Not in cache, start loading if not already
             self.image = None;
             self.texture = None;
@@ -126,6 +145,10 @@ impl ImageCropperApp {
             if !self.loader.loading_active {
                 self.loader.loading_active = true;
             }
+        }
+        
+        if self.benchmark {
+            println!("[Benchmark] load_current_image took {:?}", start.elapsed());
         }
         Ok(())
     }
@@ -153,6 +176,7 @@ impl ImageCropperApp {
     }
 
     fn advance(&mut self, ctx: &egui::Context) {
+        let start = std::time::Instant::now();
         if self.files.is_empty() {
             self.request_shutdown(ctx);
             return;
@@ -175,15 +199,22 @@ impl ImageCropperApp {
                             format: self.format,
                         };
 
-                        if let Ok(_) = self.saver.queue_save(request) {
-                            if let Some(p) = self.files.get_mut(self.current_index) {
-                                *p = output_path.clone();
+                        match self.saver.queue_save(request) {
+                            Ok(_) => {
+                                if let Some(p) = self.files.get_mut(self.current_index) {
+                                    *p = output_path.clone();
+                                }
+                                self.status = format!(
+                                    "Converting {} to {}...",
+                                    output_path.display(),
+                                    self.format.extension().to_uppercase()
+                                );
                             }
-                            self.status = format!(
-                                "Converting {} to {}...",
-                                output_path.display(),
-                                self.format.extension().to_uppercase()
-                            );
+                            Err(err) => {
+                                let msg = format!("Failed to queue save: {err:#}");
+                                eprintln!("{}", msg);
+                                self.status = msg;
+                            }
                         }
                     }
                 }
@@ -203,6 +234,7 @@ impl ImageCropperApp {
                 path,
                 image,
                 color_image,
+                load_duration: std::time::Duration::default(),
             });
         }
 
@@ -215,6 +247,9 @@ impl ImageCropperApp {
         self.current_index += 1;
         if let Err(err) = self.load_current_image(ctx) {
             self.status = format!("{err:#}");
+        }
+        if self.benchmark {
+            println!("[Benchmark] advance took {:?}", start.elapsed());
         }
     }
 
@@ -233,6 +268,9 @@ impl ImageCropperApp {
             };
 
             if entry.path == self.files[prev_index] {
+                if self.benchmark {
+                    println!("[Benchmark] History HIT for {}", entry.path.display());
+                }
                 self.current_index = prev_index;
                 self.image_size =
                     egui::Vec2::new(entry.image.width() as f32, entry.image.height() as f32);
@@ -283,7 +321,8 @@ impl ImageCropperApp {
             return;
         }
 
-        let Ok(target_dir) = prepare_dir(TRASH_DIR) else {
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        let Ok(target_dir) = prepare_dir(parent, TRASH_DIR) else {
             self.status = "Unable to prepare trash directory".into();
             return;
         };
@@ -357,7 +396,9 @@ impl ImageCropperApp {
         };
 
         if let Err(err) = self.saver.queue_save(request) {
-            self.status = format!("Failed to queue save: {err:#}");
+            let msg = format!("Failed to queue save: {err:#}");
+            eprintln!("{}", msg);
+            self.status = msg;
             return false;
         }
 
@@ -411,9 +452,40 @@ impl App for ImageCropperApp {
         self.loader.update();
 
         // Check for save completions
-        for (path, result) in self.saver.check_completions() {
-            if let Err(err) = result {
-                self.status = format!("Error saving {}: {err:#}", path.display());
+        for (path, result, sizes) in self.saver.check_completions() {
+            match result {
+                Err(err) => {
+                    let msg = format!("Error saving {}: {err:#}", path.display());
+                    eprintln!("{}", msg);
+                    self.status = msg;
+                }
+                Ok(()) => {
+                    if self.report_sizes {
+                        if let Some((original, new)) = sizes {
+                            // Avoid division by zero
+                            let pct = if original == 0 {
+                                0.0
+                            } else {
+                                (new as f64) / (original as f64) * 100.0
+                            };
+                            let msg = format!(
+                                "Saved {} — original: {}, new: {} ({:.1}% of original)",
+                                path.display(),
+                                format_size(original),
+                                format_size(new),
+                                pct
+                            );
+                            // Update UI status and also print to stdout so CLI users see it
+                            println!("{}", msg);
+                            self.status = msg;
+                        } else {
+                            // No size info available — fall back to a generic saved message
+                            let msg = format!("Saved {}", path.display());
+                            println!("{}", msg);
+                            self.status = msg;
+                        }
+                    }
+                }
             }
         }
 

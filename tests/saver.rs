@@ -31,22 +31,25 @@ fn run_save_test(format: OutputFormat, extension: &str, quality: u8) {
         };
 
         saver.queue_save(request).unwrap();
-        wait_for_save(&mut saver, &target_path);
+        let sizes = wait_for_save(&mut saver, &target_path).unwrap();
 
         assert!(target_path.exists());
         assert_decodable(format, &target_path, image.dimensions());
         assert!(cwd.join(ORIGINALS_DIR).exists());
+        // size reporting must yield positive values
+        assert!(sizes.0 > 0);
+        assert!(sizes.1 > 0);
         assert!(saver.pending_saves.is_empty());
     });
 }
 
-fn wait_for_save(saver: &mut Saver, expected_path: &Path) {
+fn wait_for_save(saver: &mut Saver, expected_path: &Path) -> Option<(u64, u64)> {
     let start = Instant::now();
     loop {
-        for (path, result) in saver.check_completions() {
+        for (path, result, sizes) in saver.check_completions() {
             if &path == expected_path {
                 result.unwrap();
-                return;
+                return sizes;
             }
         }
         if start.elapsed() > Duration::from_secs(5) {

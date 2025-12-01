@@ -29,6 +29,7 @@ impl Loader {
         let (tx, rx) = mpsc::channel();
         thread::spawn(move || {
             for path in paths {
+                let start = std::time::Instant::now();
                 match image::open(&path) {
                     Ok(mut image) => {
                         // Resize if too large to speed up texture upload and save memory
@@ -38,11 +39,13 @@ impl Loader {
                                 image.resize(3840, 2160, image::imageops::FilterType::Lanczos3);
                         }
                         let color_image = to_color_image(&image);
+                        let load_duration = start.elapsed();
                         if tx
                             .send(PreloadedImage {
                                 path,
                                 image,
                                 color_image,
+                                load_duration,
                             })
                             .is_err()
                         {

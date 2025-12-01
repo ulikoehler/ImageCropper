@@ -50,11 +50,20 @@ impl Saver {
                     }
                 };
 
+                let mut original_size: Option<u64> = None;
+                let mut new_size: Option<u64> = None;
+
                 let result = (|| -> Result<()> {
+                    // capture original size if possible before backup moves the file
+                    if let Ok(meta) = std::fs::metadata(&req.original_path) {
+                        original_size = Some(meta.len());
+                    }
+
                     backup_original(&req.original_path)?;
 
                     // Save to temp file first
-                    let temp_dir = prepare_dir(TEMP_DIR)?;
+                    let parent = req.path.parent().unwrap_or_else(|| std::path::Path::new("."));
+                    let temp_dir = prepare_dir(parent, TEMP_DIR)?;
                     let file_name = req
                         .path
                         .file_name()
@@ -90,11 +99,18 @@ impl Saver {
 
                     // Move to final destination
                     std::fs::rename(&temp_path, &req.path)?;
+
+                    // capture new file size if possible
+                    if let Ok(meta) = std::fs::metadata(&req.path) {
+                        new_size = Some(meta.len());
+                    }
                     Ok(())
                 })();
                 let _ = tx.send(SaveStatus {
                     path: req.path,
                     result,
+                    original_size,
+                    new_size,
                 });
             }
         });
@@ -107,13 +123,17 @@ impl Saver {
             .map_err(|e| anyhow!("Failed to send save request: {}", e))
     }
 
-    pub fn check_completions(&mut self) -> Vec<(PathBuf, Result<()>)> {
+    pub fn check_completions(&mut self) -> Vec<(PathBuf, Result<()>, Option<(u64, u64)>)> {
         let mut completed = Vec::new();
         while let Ok(status) = self.save_status_rx.try_recv() {
             if let Some(idx) = self.pending_saves.iter().position(|p| *p == status.path) {
                 self.pending_saves.remove(idx);
             }
-            completed.push((status.path, status.result));
+            let sizes = match (status.original_size, status.new_size) {
+                (Some(original), Some(new)) => Some((original, new)),
+                _ => None,
+            };
+            completed.push((status.path, status.result, sizes));
         }
         completed
     }

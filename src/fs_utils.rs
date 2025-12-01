@@ -63,9 +63,9 @@ fn is_supported_image(path: &Path) -> bool {
     )
 }
 
-pub fn prepare_dir(name: &str) -> Result<PathBuf> {
-    let dir = PathBuf::from(name);
-    fs::create_dir_all(&dir).with_context(|| format!("Unable to create {name}"))?;
+pub fn prepare_dir(base: &Path, name: &str) -> Result<PathBuf> {
+    let dir = base.join(name);
+    fs::create_dir_all(&dir).with_context(|| format!("Unable to create {}", dir.display()))?;
     Ok(dir)
 }
 
@@ -113,7 +113,32 @@ pub fn split_name(file_name: &OsStr) -> (String, Option<String>) {
 }
 
 pub fn backup_original(path: &Path) -> Result<()> {
-    let dir = prepare_dir(ORIGINALS_DIR)?;
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let dir = prepare_dir(parent, ORIGINALS_DIR)?;
     move_with_unique_name(path, &dir)
+}
+
+/// Format bytes into a short human readable string using 1024-based units.
+///
+/// Examples: 0 -> "0 B", 512 -> "512 B", 2048 -> "2.0 KB", 1_500_000 -> "1.4 MB"
+pub fn format_size(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = KB * 1024.0;
+    const GB: f64 = MB * 1024.0;
+
+    let b = bytes as f64;
+    if bytes == 0 {
+        return "0 B".to_string();
+    }
+
+    if b < KB {
+        format!("{} B", bytes)
+    } else if b < MB {
+        format!("{:.1} KB", b / KB)
+    } else if b < GB {
+        format!("{:.1} MB", b / MB)
+    } else {
+        format!("{:.2} GB", b / GB)
+    }
 }
 

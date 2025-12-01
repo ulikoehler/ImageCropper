@@ -28,6 +28,7 @@ pub struct PreloadedImage {
     pub path: PathBuf,
     pub image: DynamicImage,
     pub color_image: egui::ColorImage,
+    pub load_duration: std::time::Duration,
 }
 
 pub struct SaveRequest {
@@ -41,6 +42,10 @@ pub struct SaveRequest {
 pub struct SaveStatus {
     pub path: PathBuf,
     pub result: Result<()>,
+    /// Size of the original file (in bytes) before moving/backup, if available
+    pub original_size: Option<u64>,
+    /// Size of the newly-written file (in bytes), if available
+    pub new_size: Option<u64>,
 }
 
 pub fn to_color_image(img: &DynamicImage) -> egui::ColorImage {

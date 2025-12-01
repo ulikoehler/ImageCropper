@@ -39,6 +39,10 @@ struct Args {
     #[arg(long, default_value_t = false)]
     resave: bool,
 
+    /// Report original/new file sizes (bytes) and percentage when saving/moving finishes
+    #[arg(long, default_value_t = false)]
+    report_sizes: bool,
+
     /// Skip destructive operations and just print what would happen
     #[arg(short = 'd', long, default_value_t = false)]
     dry_run: bool,
@@ -56,8 +60,12 @@ struct Args {
     inverse: bool,
 
     /// Order in which images are processed
-    #[arg(short = 'o', long, value_enum, default_value_t = SortOrder::Filename)]
+    #[arg(short, long, value_enum, default_value_t = SortOrder::Filename)]
     order: SortOrder,
+
+    /// Show performance diagnostics
+    #[arg(long, default_value_t = false)]
+    benchmark: bool,
 }
 
 fn main() -> Result<()> {
@@ -88,6 +96,7 @@ fn main() -> Result<()> {
     let resave = args.resave;
     let format = args.format;
     let parallel = args.parallel;
+    let benchmark = args.benchmark;
     let files_for_app = files.clone();
 
     let native_options = eframe::NativeOptions {
@@ -99,7 +108,7 @@ fn main() -> Result<()> {
         "ImageCropper",
         native_options,
         Box::new(
-            move |cc| match ImageCropperApp::new(cc, files_for_app.clone(), dry_run, quality, resave, format, parallel) {
+            move |cc| match ImageCropperApp::new(cc, files_for_app.clone(), dry_run, quality, resave, args.report_sizes, format, parallel, benchmark) {
                 Ok(app) => Ok(Box::new(app) as Box<dyn eframe::App>),
                 Err(err) => {
                     eprintln!("{err:#}");
