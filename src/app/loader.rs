@@ -50,7 +50,21 @@ impl Loader {
                         }
                     }
                     Err(err) => {
-                        eprintln!("Failed to preload {}: {err:#}", path.display());
+                        // Give a clearer hint when AVIF decoding isn't available in the build
+                        if path
+                            .extension()
+                            .and_then(|e| e.to_str())
+                            .map(|s| s.eq_ignore_ascii_case("avif"))
+                            .unwrap_or(false)
+                            && err.to_string().contains("Avif")
+                        {
+                            eprintln!(
+                                "Failed to preload {}: AVIF decoding not available in this build.\n\tHint: build with image crate's `avif-native` feature (enables dav1d/mp4parse) to decode AVIF files.",
+                                path.display()
+                            );
+                        } else {
+                            eprintln!("Failed to preload {}: {err:#}", path.display());
+                        }
                     }
                 }
             }

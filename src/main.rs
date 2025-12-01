@@ -9,6 +9,13 @@ use imagecropper::app::ImageCropperApp;
 use imagecropper::fs_utils::collect_images;
 use imagecropper::image_utils::OutputFormat;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum SortOrder {
+    Filename,
+    Randomize,
+    Modified,
+}
+
 #[derive(Parser, Debug)]
 #[command(
     author,
@@ -35,6 +42,18 @@ struct Args {
     /// Skip destructive operations and just print what would happen
     #[arg(short = 'd', long, default_value_t = false)]
     dry_run: bool,
+
+    /// Number of parallel image processing threads
+    #[arg(short = 'j', long = "parallel", default_value_t = 16)]
+    parallel: usize,
+
+    /// Invert order of processed images (ignored for randomize)
+    #[arg(short = 'i', long = "inverse", default_value_t = false)]
+    inverse: bool,
+
+    /// Order in which images are processed
+    #[arg(short = 'o', long, value_enum, default_value_t = SortOrder::Filename)]
+    order: SortOrder,
 }
 
 fn main() -> Result<()> {
@@ -42,15 +61,30 @@ fn main() -> Result<()> {
     let mut files = collect_images(&args.directory)?;
     if files.is_empty() {
         return Err(anyhow!(
-            "No supported image files found in {}",
-            args.directory.display()
+            "No supported image files found in {}. Supported formats are: {}",
+            args.directory.display(),
+            imagecropper::fs_utils::SUPPORTED_EXTENSIONS.join(", ")
         ));
     }
-    files.shuffle(&mut rand::thread_rng());
+    match args.order {
+        SortOrder::Filename => files.sort(),
+        SortOrder::Randomize => files.shuffle(&mut rand::thread_rng()),
+        SortOrder::Modified => files.sort_by_key(|path| {
+            std::fs::metadata(path)
+                .and_then(|m| m.modified())
+                .ok()
+        }),
+    }
+
+    // If the inverse flag is set and ordering isn't randomized, invert the order
+    if args.inverse && args.order != SortOrder::Randomize {
+        files.reverse();
+    }
     let dry_run = args.dry_run;
     let quality = args.quality;
     let resave = args.resave;
     let format = args.format;
+    let parallel = args.parallel;
     let files_for_app = files.clone();
 
     let native_options = eframe::NativeOptions {
@@ -62,7 +96,7 @@ fn main() -> Result<()> {
         "ImageCropper",
         native_options,
         Box::new(
-            move |cc| match ImageCropperApp::new(cc, files_for_app.clone(), dry_run, quality, resave, format) {
+            move |cc| match ImageCropperApp::new(cc, files_for_app.clone(), dry_run, quality, resave, format, parallel) {
                 Ok(app) => Box::new(app) as Box<dyn eframe::App>,
                 Err(err) => {
                     eprintln!("{err:#}");

@@ -2,6 +2,73 @@
 
 A fast, fullscreen image cropping tool written in Rust using `egui` and `wgpu`. Designed for efficient workflows involving large datasets of images.
 
+## Quick overview
+
+## Installation
+
+Global installation:
+
+```sh
+cargo install image-cropper
+```
+
+### Simple cropping
+
+```sh
+cargo run test-images
+```
+
+Drag with your mouse to select the crop area, then press **Enter** to save the cropped image and move to the next one. Use **Space** to skip images and **Delete** to move bad images to trash.
+
+![ImageCropper screenshot](docs/Imagecropper%20Screenshot.avif)
+
+when pressing **Enter**, it will save this image:
+
+![Cropped image example](docs/Cropped%20Image%20Example.avif)
+
+### Multi-selection cropping (Multicropping)
+
+You can create multiple selections by holding **Ctrl** while dragging. Press **Enter** to crop all selected areas from the current image and assemble them into a single image.
+
+![Multicrop selection](docs/Imagecropper%20Multicrop.avif)
+
+results in
+
+![Multicrop result](docs/Multicrop%20Result.avif)
+
+### Output format
+
+By default, cropped images are saved as AVIF files for high efficiency - **Saving AVIF files takes a LONG time (minutes!) but the TINY filesize despite HIGH QUALITY is impressive**. You can adjust the quality using the `-q` option, or choose a different output format using `-f/--format`.
+
+```sh
+image-cropper -f png test-images
+```
+
+
+### Image processing order
+
+You can control the order in which images are processed using the `-o/--order` option. By default, images are processed in filename order. You can invert the sorting using `-i/--inverse-order
+
+To select images in filename order:
+
+```sh
+image-cropper -o randomize test-images
+```
+
+or by last modified time:
+
+```sh
+image-cropper -o modified test-images
+```
+
+### Resave unchanged images?
+
+You can use the `--resave` option to automatically convert images to AVIF when navigating away from them, even if no crop was performed. This is useful for batch converting a folder of images.
+
+```sh
+image-cropper --resave test-images
+```
+
 ## Features
 
 *   **Fullscreen Interface**: Maximizes screen real estate for image viewing.
@@ -60,3 +127,9 @@ imagecropper [OPTIONS] <DIRECTORY>
 *   **Cropped Images**: Saved in the same directory with the `.avif` extension.
 *   **Originals**: Moved to `.imagecropper-originals/` in the working directory.
 *   **Trash**: Moved to `.imagecropper-trash/` in the working directory.
+
+## License
+
+Apache-2.0 License. See [`LICENSE`](LICENSE) file for details.
+
+The test images are [Uli Köhler's](https://github.com/ulikoehler) work and are hereby released into the public domain (CC0 1.0 Universal).

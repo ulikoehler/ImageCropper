@@ -49,9 +49,10 @@ impl ImageCropperApp {
         quality: u8,
         resave: bool,
         format: OutputFormat,
+        parallel: usize,
     ) -> Result<Self> {
         let loader = Loader::new(files.clone());
-        let saver = Saver::new();
+        let saver = Saver::new(parallel);
         let canvas = Canvas::new();
 
         let mut app = Self {
@@ -461,6 +462,10 @@ impl App for ImageCropperApp {
                 ui.centered_and_justified(|ui| {
                     ui.vertical_centered(|ui| {
                         ui.heading("All images processed!");
+                        if !self.saver.pending_saves.is_empty() {
+                            ui.add_space(10.0);
+                            ui.label(format!("Processing {} images...", self.saver.pending_saves.len()));
+                        }
                         ui.add_space(20.0);
                         if ui.button("Start Over").clicked() {
                             self.list_completed = false;

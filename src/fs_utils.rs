@@ -11,6 +11,10 @@ pub const TRASH_DIR: &str = ".imagecropper-trash";
 pub const ORIGINALS_DIR: &str = ".imagecropper-originals";
 pub const TEMP_DIR: &str = ".imagecropper-tmp";
 
+pub const SUPPORTED_EXTENSIONS: &[&str] = &[
+    "png", "jpg", "jpeg", "bmp", "gif", "webp", "tiff", "tif", "ico", "avif",
+];
+
 pub fn collect_images(root: &Path) -> Result<Vec<PathBuf>> {
     if !root.exists() {
         return Err(anyhow!("{} does not exist", root.display()));
@@ -37,11 +41,7 @@ fn is_supported_image(path: &Path) -> bool {
         path.extension()
             .and_then(|ext| ext.to_str())
             .map(|s| s.to_ascii_lowercase()),
-        Some(ref ext)
-            if matches!(
-                ext.as_str(),
-                "png" | "jpg" | "jpeg" | "bmp" | "gif" | "webp" | "tiff" | "tif" | "ico"
-            )
+        Some(ref ext) if SUPPORTED_EXTENSIONS.contains(&ext.as_str())
     )
 }
 

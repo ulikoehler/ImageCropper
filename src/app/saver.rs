@@ -1,6 +1,9 @@
 use std::{
     path::PathBuf,
-    sync::mpsc::{self, Receiver, Sender},
+    sync::{
+        mpsc::{self, Receiver, Sender},
+        Arc, Mutex,
+    },
     thread,
 };
 
@@ -19,11 +22,15 @@ pub struct Saver {
 }
 
 impl Saver {
-    pub fn new() -> Self {
+    pub fn new(concurrency: usize) -> Self {
         let (save_tx, save_rx) = mpsc::channel();
         let (save_status_tx, save_status_rx) = mpsc::channel();
 
-        Self::spawn_saver_thread(save_rx, save_status_tx);
+        let rx = Arc::new(Mutex::new(save_rx));
+
+        for _ in 0..concurrency {
+            Self::spawn_saver_thread(rx.clone(), save_status_tx.clone());
+        }
 
         Self {
             save_tx,
@@ -32,9 +39,17 @@ impl Saver {
         }
     }
 
-    fn spawn_saver_thread(rx: Receiver<SaveRequest>, tx: Sender<SaveStatus>) {
+    fn spawn_saver_thread(rx: Arc<Mutex<Receiver<SaveRequest>>>, tx: Sender<SaveStatus>) {
         thread::spawn(move || {
-            while let Ok(req) = rx.recv() {
+            loop {
+                let req = {
+                    let Ok(lock) = rx.lock() else { break };
+                    match lock.recv() {
+                        Ok(req) => req,
+                        Err(_) => break,
+                    }
+                };
+
                 let result = (|| -> Result<()> {
                     backup_original(&req.original_path)?;
 
