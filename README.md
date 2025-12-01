@@ -30,7 +30,7 @@ Drag with your mouse to select the crop area, then press **Enter** to save the c
 
 when pressing **Enter**, it will save this image:
 
-![Cropped image example](docs/Cropped%20Testimage.avif
+![Cropped image example](docs/Cropped%20Testimage.avif)
 
 ### Multi-selection cropping (Multicropping)
 
