@@ -41,6 +41,7 @@ pub struct ImageCropperApp {
     pub exit_attempt_count: usize,
     pub list_completed: bool,
     pub windowed_mode_set: bool,
+    pub preloading_started: bool,
 }
 
 impl ImageCropperApp {
@@ -55,7 +56,7 @@ impl ImageCropperApp {
         parallel: usize,
         benchmark: bool,
     ) -> Result<Self> {
-        let loader = Loader::new(files.clone());
+        let loader = Loader::new();
         let saver = Saver::new(parallel);
         let canvas = Canvas::new();
 
@@ -81,6 +82,7 @@ impl ImageCropperApp {
             exit_attempt_count: 0,
             list_completed: false,
             windowed_mode_set: false,
+            preloading_started: false,
         };
         app.load_current_image(&cc.egui_ctx)?;
         Ok(app)
@@ -100,7 +102,14 @@ impl ImageCropperApp {
 
         if let Some(preloaded) = self.loader.get_from_cache(&path) {
             if self.benchmark {
-                println!("[Benchmark] Cache HIT for {} (loaded in {:?})", path.display(), preloaded.load_duration);
+                println!(
+                    "[Benchmark] Cache HIT for {} (Total: {:?}, IO: {:?}, Resize: {:?}, TextureGen: {:?})",
+                    path.display(),
+                    preloaded.load_duration,
+                    preloaded.io_duration,
+                    preloaded.resize_duration,
+                    preloaded.texture_gen_duration
+                );
             }
             self.image_size =
                 egui::Vec2::new(preloaded.image.width() as f32, preloaded.image.height() as f32);
@@ -144,6 +153,10 @@ impl ImageCropperApp {
 
             if !self.loader.loading_active {
                 self.loader.loading_active = true;
+            }
+
+            if !self.preloading_started {
+                self.loader.load_image(path.clone());
             }
         }
         
@@ -235,6 +248,9 @@ impl ImageCropperApp {
                 image,
                 color_image,
                 load_duration: std::time::Duration::default(),
+                io_duration: std::time::Duration::default(),
+                resize_duration: std::time::Duration::default(),
+                texture_gen_duration: std::time::Duration::default(),
             });
         }
 
@@ -450,6 +466,16 @@ impl App for ImageCropperApp {
         let _ = frame;
 
         self.loader.update();
+
+        // Start preloading other images once the first one is loaded
+        if !self.preloading_started && self.image.is_some() {
+            for (i, path) in self.files.iter().enumerate() {
+                if i != self.current_index {
+                    self.loader.load_image(path.clone());
+                }
+            }
+            self.preloading_started = true;
+        }
 
         // Check for save completions
         for (path, result, sizes) in self.saver.check_completions() {

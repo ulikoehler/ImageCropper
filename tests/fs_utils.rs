@@ -57,8 +57,7 @@ fn collect_images_errors_for_missing_directory() {
 #[test]
 fn prepare_dir_creates_nested_directories() {
     let tmp = tempdir().unwrap();
-    let target = tmp.path().join("nested/a/b");
-    let created = prepare_dir(target.to_str().unwrap()).unwrap();
+    let created = prepare_dir(tmp.path(), "nested/a/b").unwrap();
     assert!(created.exists());
     assert!(created.is_dir());
 }

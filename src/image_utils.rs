@@ -29,6 +29,9 @@ pub struct PreloadedImage {
     pub image: DynamicImage,
     pub color_image: egui::ColorImage,
     pub load_duration: std::time::Duration,
+    pub io_duration: std::time::Duration,
+    pub resize_duration: std::time::Duration,
+    pub texture_gen_duration: std::time::Duration,
 }
 
 pub struct SaveRequest {
