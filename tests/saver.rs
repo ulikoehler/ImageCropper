@@ -15,7 +15,8 @@ use common::{solid_image, with_temp_workdir};
 
 fn run_save_test(format: OutputFormat, extension: &str, quality: u8) {
     with_temp_workdir(|cwd| {
-        let mut saver = Saver::new();
+        // Use a single saver thread for test determinism
+        let mut saver = Saver::new(1);
         let image = solid_image(2, 2, [20, 30, 40, 255]);
         let original_path = cwd.join(format!("source.{extension}"));
         fs::write(&original_path, b"original").unwrap();

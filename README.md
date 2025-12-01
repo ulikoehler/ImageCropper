@@ -47,7 +47,7 @@ image-cropper -f png test-images
 
 ### Image processing order
 
-You can control the order in which images are processed using the `-o/--order` option. By default, images are processed in filename order. You can invert the sorting using `-i/--inverse-order
+You can control the order in which images are processed using the `-o/--order` option. By default, images are processed in filename order. You can invert the sorting using `-i/--inverse-order`.
 
 To select images in filename order:
 

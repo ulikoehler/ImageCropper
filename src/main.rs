@@ -48,7 +48,7 @@ struct Args {
     parallel: usize,
 
     /// Invert order of processed images (ignored for randomize)
-    #[arg(short = 'i', long = "inverse", default_value_t = false)]
+    #[arg(short = 'i', long = "inverse-order", default_value_t = false)]
     inverse: bool,
 
     /// Order in which images are processed
