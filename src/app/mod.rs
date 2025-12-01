@@ -7,9 +7,11 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, Result};
 use eframe::{
     egui::{self, Color32, ViewportCommand},
+    egui_wgpu::RenderState,
     App, Frame,
 };
 use image::DynamicImage;
+use wgpu;
 
 use crate::{
     fs_utils::{format_size, move_with_unique_name, prepare_dir, TRASH_DIR},
@@ -27,7 +29,7 @@ pub struct ImageCropperApp {
     pub resave: bool,
     pub format: OutputFormat,
     pub image: Option<DynamicImage>,
-    pub texture: Option<egui::TextureHandle>,
+    pub texture: Option<(egui::TextureId, wgpu::Texture)>,
     pub preview_texture: Option<egui::TextureHandle>,
     pub image_size: egui::Vec2,
     pub canvas: Canvas,
@@ -56,7 +58,10 @@ impl ImageCropperApp {
         parallel: usize,
         benchmark: bool,
     ) -> Result<Self> {
-        let loader = Loader::new();
+        let wgpu_render_state = cc.wgpu_render_state.as_ref().expect("WGPU enabled");
+        let device = wgpu_render_state.device.clone();
+        let queue = wgpu_render_state.queue.clone();
+        let loader = Loader::new(device, queue);
         let saver = Saver::new(parallel);
         let canvas = Canvas::new();
 
@@ -84,7 +89,7 @@ impl ImageCropperApp {
             windowed_mode_set: false,
             preloading_started: false,
         };
-        app.load_current_image(&cc.egui_ctx)?;
+        app.load_current_image(&cc.egui_ctx, Some(wgpu_render_state))?;
         Ok(app)
     }
 
@@ -92,7 +97,7 @@ impl ImageCropperApp {
         self.files.get(self.current_index).map(|p| p.as_path())
     }
 
-    fn load_current_image(&mut self, ctx: &egui::Context) -> Result<()> {
+    fn load_current_image(&mut self, _ctx: &egui::Context, render_state: Option<&RenderState>) -> Result<()> {
         let start = std::time::Instant::now();
         self.loader.update();
         let path = self
@@ -117,15 +122,22 @@ impl ImageCropperApp {
             self.canvas.clear();
             
             let texture_start = std::time::Instant::now();
-            if let Some(texture) = self.texture.as_mut() {
-                texture.set(preloaded.color_image, egui::TextureOptions::LINEAR);
-            } else {
-                self.texture = Some(ctx.load_texture(
-                    "imagecropper-current",
-                    preloaded.color_image,
-                    egui::TextureOptions::LINEAR,
-                ));
+            
+            // Free previous texture
+            if let Some((id, _)) = self.texture.take() {
+                if let Some(rs) = render_state {
+                    rs.renderer.write().free_texture(&id);
+                }
             }
+
+            if let Some(texture) = preloaded.texture {
+                if let Some(rs) = render_state {
+                    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+                    let id = rs.renderer.write().register_native_texture(&rs.device, &view, wgpu::FilterMode::Linear);
+                    self.texture = Some((id, texture));
+                }
+            }
+
             if self.benchmark {
                 println!("[Benchmark] Texture upload took {:?}", texture_start.elapsed());
             }
@@ -189,7 +201,7 @@ impl ImageCropperApp {
         })
     }
 
-    fn advance(&mut self, ctx: &egui::Context) {
+    fn advance(&mut self, ctx: &egui::Context, render_state: Option<&RenderState>) {
         let start = std::time::Instant::now();
         if self.files.is_empty() {
             self.request_shutdown(ctx);
@@ -236,18 +248,20 @@ impl ImageCropperApp {
         }
 
         // Cache current image before moving
-        if let (Some(path), Some(image), Some(_texture)) = (
+        if let (Some(path), Some(image), Some((_id, texture))) = (
             self.current_path().map(Path::to_path_buf),
             self.image.clone(),
-            self.texture.clone(),
+            self.texture.as_ref(),
         ) {
             // We need the ColorImage for the cache, but we only have the texture.
             // Re-generating ColorImage from DynamicImage is fast enough.
-            let color_image = to_color_image(&image);
+            // let color_image = to_color_image(&image);
+            let texture = texture.clone();
             self.loader.push_history(PreloadedImage {
                 path,
                 image,
-                color_image,
+                color_image: None,
+                texture: Some(texture),
                 load_duration: std::time::Duration::default(),
                 read_duration: std::time::Duration::default(),
                 decode_duration: std::time::Duration::default(),
@@ -263,7 +277,7 @@ impl ImageCropperApp {
         }
 
         self.current_index += 1;
-        if let Err(err) = self.load_current_image(ctx) {
+        if let Err(err) = self.load_current_image(ctx, render_state) {
             self.status = format!("{err:#}");
         }
         if self.benchmark {
@@ -271,7 +285,7 @@ impl ImageCropperApp {
         }
     }
 
-    fn go_back(&mut self, ctx: &egui::Context) {
+    fn go_back(&mut self, ctx: &egui::Context, render_state: Option<&RenderState>) {
         if self.files.is_empty() {
             return;
         }
@@ -293,15 +307,22 @@ impl ImageCropperApp {
                 self.image_size =
                     egui::Vec2::new(entry.image.width() as f32, entry.image.height() as f32);
                 self.canvas.clear();
-                if let Some(texture) = self.texture.as_mut() {
-                    texture.set(entry.color_image, egui::TextureOptions::LINEAR);
-                } else {
-                    self.texture = Some(ctx.load_texture(
-                        "imagecropper-current",
-                        entry.color_image,
-                        egui::TextureOptions::LINEAR,
-                    ));
+                
+                // Free previous texture
+                if let Some((id, _)) = self.texture.take() {
+                    if let Some(rs) = render_state {
+                        rs.renderer.write().free_texture(&id);
+                    }
                 }
+
+                if let Some(texture) = entry.texture {
+                    if let Some(rs) = render_state {
+                        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+                        let id = rs.renderer.write().register_native_texture(&rs.device, &view, wgpu::FilterMode::Linear);
+                        self.texture = Some((id, texture));
+                    }
+                }
+
                 self.image = Some(entry.image);
                 self.status = format!(
                     "Loaded {} ({}/{})",
@@ -321,12 +342,12 @@ impl ImageCropperApp {
         } else {
             self.current_index -= 1;
         }
-        if let Err(err) = self.load_current_image(ctx) {
+        if let Err(err) = self.load_current_image(ctx, render_state) {
             self.status = format!("{err:#}");
         }
     }
 
-    fn delete_current(&mut self, ctx: &egui::Context) {
+    fn delete_current(&mut self, ctx: &egui::Context, render_state: Option<&RenderState>) {
         let Some(path) = self.current_path().map(Path::to_path_buf) else {
             self.status = "No image selected".into();
             return;
@@ -335,7 +356,7 @@ impl ImageCropperApp {
         if self.dry_run {
             println!("Dry run: would move {} to {}", path.display(), TRASH_DIR);
             self.status = format!("Dry run: skipped deleting {}", path.display());
-            self.advance(ctx);
+            self.advance(ctx, render_state);
             return;
         }
 
@@ -363,12 +384,12 @@ impl ImageCropperApp {
             self.status = "All images processed".into();
             return;
         }
-        if let Err(err) = self.load_current_image(ctx) {
+        if let Err(err) = self.load_current_image(ctx, render_state) {
             self.status = format!("{err:#}");
         }
     }
 
-    fn crop_selections(&mut self, ctx: &egui::Context) -> bool {
+    fn crop_selections(&mut self, ctx: &egui::Context, render_state: Option<&RenderState>) -> bool {
         if self.canvas.selections.is_empty() {
             self.status = "No selection to crop".into();
             return false;
@@ -426,7 +447,7 @@ impl ImageCropperApp {
         }
 
         // Skip to next image immediately
-        self.advance(ctx);
+        self.advance(ctx, render_state);
 
         self.status = format!("Saving {} in background...", output_path.display());
         true
@@ -465,7 +486,7 @@ impl ImageCropperApp {
 
 impl App for ImageCropperApp {
     fn update(&mut self, ctx: &egui::Context, frame: &mut Frame) {
-        let _ = frame;
+        let render_state = frame.wgpu_render_state();
 
         self.loader.update();
 
@@ -526,7 +547,7 @@ impl App for ImageCropperApp {
         if self.image.is_none() {
             if let Some(path) = self.current_path().map(Path::to_path_buf) {
                 if self.loader.cache.contains_key(&path) {
-                    let _ = self.load_current_image(ctx);
+                    let _ = self.load_current_image(ctx, render_state);
                 }
             }
         }
@@ -570,7 +591,7 @@ impl App for ImageCropperApp {
                         if ui.button("Start Over").clicked() {
                             self.list_completed = false;
                             self.current_index = 0;
-                            if let Err(err) = self.load_current_image(ctx) {
+                            if let Err(err) = self.load_current_image(ctx, render_state) {
                                 self.status = format!("{err:#}");
                             }
                         }
@@ -613,7 +634,7 @@ impl App for ImageCropperApp {
 
         if keys.save_selection {
             self.exit_attempt_count = 0;
-            if self.crop_selections(ctx) {
+            if self.crop_selections(ctx, render_state) {
                 // crop_selections now advances automatically
                 self.canvas.clear();
             }
@@ -621,17 +642,17 @@ impl App for ImageCropperApp {
 
         if keys.next_image {
             self.exit_attempt_count = 0;
-            self.advance(ctx);
+            self.advance(ctx, render_state);
         }
 
         if keys.prev_image {
             self.exit_attempt_count = 0;
-            self.go_back(ctx);
+            self.go_back(ctx, render_state);
         }
 
         if keys.delete {
             self.exit_attempt_count = 0;
-            self.delete_current(ctx);
+            self.delete_current(ctx, render_state);
         }
         self.canvas.handle_arrow_movement(&keys, self.image_size);
 
@@ -672,10 +693,10 @@ impl App for ImageCropperApp {
             } else {
                 self.preview_texture = None;
 
-                if let Some(texture) = &self.texture {
+                if let Some((id, _)) = &self.texture {
                     let metrics = ImageMetrics::new(response.rect, self.image_size);
                     painter.image(
-                        texture.id(),
+                        *id,
                         metrics.image_rect,
                         egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
                         Color32::WHITE,

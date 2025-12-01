@@ -11,7 +11,7 @@ use fast_image_resize::images::Image;
 use fast_image_resize::{PixelType, ResizeOptions, Resizer};
 use zune_jpeg::JpegDecoder;
 
-use crate::image_utils::{to_color_image, PreloadedImage};
+use crate::image_utils::PreloadedImage;
 
 pub struct Loader {
     preload_rx: Receiver<PreloadedImage>,
@@ -22,8 +22,8 @@ pub struct Loader {
 }
 
 impl Loader {
-    pub fn new() -> Self {
-        let (preload_rx, path_tx) = Self::spawn_preloader();
+    pub fn new(device: wgpu::Device, queue: wgpu::Queue) -> Self {
+        let (preload_rx, path_tx) = Self::spawn_preloader(device, queue);
         Self {
             preload_rx,
             path_tx,
@@ -33,7 +33,7 @@ impl Loader {
         }
     }
 
-    fn spawn_preloader() -> (Receiver<PreloadedImage>, Sender<PathBuf>) {
+    fn spawn_preloader(device: wgpu::Device, queue: wgpu::Queue) -> (Receiver<PreloadedImage>, Sender<PathBuf>) {
         let (preload_tx, preload_rx) = mpsc::channel();
         let (path_tx, path_rx) = mpsc::channel::<PathBuf>();
         
@@ -65,7 +65,7 @@ impl Loader {
                                         .map(image::DynamicImage::ImageRgb8)
                                         .ok_or_else(|| image::ImageError::Decoding(image::error::DecodingError::new(image::error::ImageFormatHint::Exact(image::ImageFormat::Jpeg), "Failed to create buffer")))
                                 }
-                                Err(e) => {
+                                Err(_e) => {
                                     // Fallback to standard loader if zune fails
                                     image::load_from_memory(&bytes)
                                 }
@@ -140,7 +140,44 @@ impl Loader {
                                 let resize_duration = resize_start.elapsed();
 
                                 let texture_gen_start = Instant::now();
-                                let color_image = to_color_image(&image);
+                                
+                                let rgba = image.to_rgba8();
+                                let width = rgba.width();
+                                let height = rgba.height();
+                                
+                                let texture_size = wgpu::Extent3d {
+                                    width,
+                                    height,
+                                    depth_or_array_layers: 1,
+                                };
+                                
+                                let texture = device.create_texture(&wgpu::TextureDescriptor {
+                                    size: texture_size,
+                                    mip_level_count: 1,
+                                    sample_count: 1,
+                                    dimension: wgpu::TextureDimension::D2,
+                                    format: wgpu::TextureFormat::Rgba8Unorm,
+                                    usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                                    label: Some("image_texture"),
+                                    view_formats: &[],
+                                });
+                                
+                                queue.write_texture(
+                                    wgpu::TexelCopyTextureInfo {
+                                        texture: &texture,
+                                        mip_level: 0,
+                                        origin: wgpu::Origin3d::ZERO,
+                                        aspect: wgpu::TextureAspect::All,
+                                    },
+                                    &rgba,
+                                    wgpu::TexelCopyBufferLayout {
+                                        offset: 0,
+                                        bytes_per_row: Some(4 * width),
+                                        rows_per_image: Some(height),
+                                    },
+                                    texture_size,
+                                );
+
                                 let texture_gen_duration = texture_gen_start.elapsed();
 
                                 let load_duration = start.elapsed();
@@ -148,7 +185,8 @@ impl Loader {
                                     .send(PreloadedImage {
                                         path,
                                         image,
-                                        color_image,
+                                        color_image: None,
+                                        texture: Some(texture),
                                         load_duration,
                                         read_duration,
                                         decode_duration,

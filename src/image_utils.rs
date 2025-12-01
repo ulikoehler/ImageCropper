@@ -27,7 +27,8 @@ impl OutputFormat {
 pub struct PreloadedImage {
     pub path: PathBuf,
     pub image: DynamicImage,
-    pub color_image: egui::ColorImage,
+    pub color_image: Option<egui::ColorImage>,
+    pub texture: Option<wgpu::Texture>,
     pub load_duration: std::time::Duration,
     pub read_duration: std::time::Duration,
     pub decode_duration: std::time::Duration,
