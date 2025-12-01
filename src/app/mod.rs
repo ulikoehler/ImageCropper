@@ -43,7 +43,6 @@ pub struct ImageCropperApp {
     pub exit_attempt_count: usize,
     pub list_completed: bool,
     pub windowed_mode_set: bool,
-    pub preloading_started: bool,
 }
 
 impl ImageCropperApp {
@@ -87,7 +86,6 @@ impl ImageCropperApp {
             exit_attempt_count: 0,
             list_completed: false,
             windowed_mode_set: false,
-            preloading_started: false,
         };
         app.load_current_image(&cc.egui_ctx, Some(wgpu_render_state))?;
         Ok(app)
@@ -168,9 +166,7 @@ impl ImageCropperApp {
                 self.loader.loading_active = true;
             }
 
-            if !self.preloading_started {
-                self.loader.load_image(path.clone());
-            }
+            self.loader.load_image(path.clone());
         }
         
         if self.benchmark {
@@ -490,14 +486,15 @@ impl App for ImageCropperApp {
 
         self.loader.update();
 
-        // Start preloading other images once the first one is loaded
-        if !self.preloading_started && self.image.is_some() {
-            for (i, path) in self.files.iter().enumerate() {
-                if i != self.current_index {
+        // Preload next 64 images
+        if self.image.is_some() {
+            let start = self.current_index + 1;
+            let end = (start + 64).min(self.files.len());
+            for i in start..end {
+                if let Some(path) = self.files.get(i) {
                     self.loader.load_image(path.clone());
                 }
             }
-            self.preloading_started = true;
         }
 
         // Check for save completions

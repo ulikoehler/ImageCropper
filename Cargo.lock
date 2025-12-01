@@ -1490,12 +1490,24 @@ dependencies = [
  "eframe",
  "fast_image_resize",
  "image",
+ "img-parts",
  "once_cell",
  "rand 0.8.5",
  "tempfile",
  "walkdir",
  "wgpu",
  "zune-jpeg 0.5.5",
+]
+
+[[package]]
+name = "img-parts"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "19734e3c43b2a850f5889c077056e47c874095f2d87e853c7c41214ae67375f0"
+dependencies = [
+ "bytes",
+ "crc32fast",
+ "miniz_oxide",
 ]
 
 [[package]]

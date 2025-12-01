@@ -14,6 +14,7 @@ enum SortOrder {
     Filename,
     Randomize,
     Modified,
+    Size,
 }
 
 #[derive(Parser, Debug)]
@@ -84,6 +85,11 @@ fn main() -> Result<()> {
             std::fs::metadata(path)
                 .and_then(|m| m.modified())
                 .ok()
+        }),
+        SortOrder::Size => files.sort_by_key(|path| {
+            std::fs::metadata(path)
+                .map(|m| m.len())
+                .unwrap_or(0)
         }),
     }
 

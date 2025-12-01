@@ -10,6 +10,11 @@ use std::{
 use anyhow::{anyhow, Result};
 use image::codecs::avif::AvifEncoder;
 
+use img_parts::{ImageEXIF, ImageICC};
+use img_parts::jpeg::Jpeg;
+use img_parts::png::Png;
+use img_parts::webp::WebP;
+
 use crate::{
     fs_utils::{backup_original, prepare_dir, TEMP_DIR},
     image_utils::{OutputFormat, SaveRequest, SaveStatus},
@@ -98,7 +103,89 @@ impl Saver {
                     } // Close file
 
                     // Move to final destination
-                    std::fs::rename(&temp_path, &req.path)?;
+                    // std::fs::rename(&temp_path, &req.path)?; // We do this later now
+
+                    // Try to copy EXIF/ICC from original to new file
+                    // We read the temp file, inject metadata, and write to final path.
+                    // If injection fails, we just move the temp file.
+                    
+                    let copy_metadata = || -> Result<()> {
+                        let input_data = std::fs::read(&req.original_path)?;
+                        let temp_data = std::fs::read(&temp_path)?;
+                        
+                        // Detect input format and extract metadata
+                        let (exif, icc) = if let Ok(input_jpeg) = Jpeg::from_bytes(input_data.clone().into()) {
+                            (input_jpeg.exif(), input_jpeg.icc_profile())
+                        } else if let Ok(input_png) = Png::from_bytes(input_data.clone().into()) {
+                            (input_png.exif(), input_png.icc_profile())
+                        } else if let Ok(input_webp) = WebP::from_bytes(input_data.clone().into()) {
+                            (input_webp.exif(), input_webp.icc_profile())
+                        } else {
+                            (None, None)
+                        };
+
+                        if exif.is_none() && icc.is_none() {
+                            // No metadata to copy, just move file
+                            std::fs::rename(&temp_path, &req.path)?;
+                            return Ok(());
+                        }
+
+                        // Inject into output
+                        let output_bytes = match req.format {
+                            OutputFormat::Jpg => {
+                                if let Ok(mut out_jpeg) = Jpeg::from_bytes(temp_data.into()) {
+                                    if let Some(exif) = exif { out_jpeg.set_exif(Some(exif)); }
+                                    if let Some(icc) = icc { out_jpeg.set_icc_profile(Some(icc)); }
+                                    let mut out = Vec::new();
+                                    out_jpeg.encoder().write_to(&mut out)?;
+                                    Some(out)
+                                } else { None }
+                            }
+                            OutputFormat::Png => {
+                                if let Ok(mut out_png) = Png::from_bytes(temp_data.into()) {
+                                    if let Some(exif) = exif { out_png.set_exif(Some(exif)); }
+                                    if let Some(icc) = icc { out_png.set_icc_profile(Some(icc)); }
+                                    let mut out = Vec::new();
+                                    out_png.encoder().write_to(&mut out)?;
+                                    Some(out)
+                                } else { None }
+                            }
+                            OutputFormat::Webp => {
+                                if let Ok(mut out_webp) = WebP::from_bytes(temp_data.into()) {
+                                    if let Some(exif) = exif { out_webp.set_exif(Some(exif)); }
+                                    if let Some(icc) = icc { out_webp.set_icc_profile(Some(icc)); }
+                                    let mut out = Vec::new();
+                                    out_webp.encoder().write_to(&mut out)?;
+                                    Some(out)
+                                } else { None }
+                            }
+                            OutputFormat::Avif => {
+                                // img-parts doesn't support AVIF yet?
+                                // AVIF is based on ISOBMFF (HEIF). img-parts has some support?
+                                // It seems img-parts 0.3 doesn't have explicit AVIF support.
+                                // So we skip AVIF metadata copy for now.
+                                None
+                            }
+                        };
+
+                        if let Some(bytes) = output_bytes {
+                            std::fs::write(&req.path, bytes)?;
+                            std::fs::remove_file(&temp_path)?;
+                        } else {
+                            std::fs::rename(&temp_path, &req.path)?;
+                        }
+                        Ok(())
+                    };
+
+                    if let Err(e) = copy_metadata() {
+                        eprintln!("Failed to copy metadata: {}", e);
+                        // Fallback: just move the file if it hasn't been moved yet
+                        if temp_path.exists() {
+                            std::fs::rename(&temp_path, &req.path)?;
+                        }
+                    }
+
+                    // capture new file size if possible
 
                     // capture new file size if possible
                     if let Ok(meta) = std::fs::metadata(&req.path) {

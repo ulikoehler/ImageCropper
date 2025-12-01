@@ -1,8 +1,8 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     io::Cursor,
     path::PathBuf,
-    sync::mpsc::{self, Receiver, Sender},
+    sync::{mpsc::{self, Receiver, Sender}, Arc, Mutex},
     thread,
     time::Instant,
 };
@@ -19,6 +19,7 @@ pub struct Loader {
     pub cache: HashMap<PathBuf, PreloadedImage>,
     pub history: VecDeque<PreloadedImage>,
     pub loading_active: bool,
+    pub pending: HashSet<PathBuf>,
 }
 
 impl Loader {
@@ -30,6 +31,7 @@ impl Loader {
             cache: HashMap::new(),
             history: VecDeque::with_capacity(10),
             loading_active: false,
+            pending: HashSet::new(),
         }
     }
 
@@ -37,9 +39,27 @@ impl Loader {
         let (preload_tx, preload_rx) = mpsc::channel();
         let (path_tx, path_rx) = mpsc::channel::<PathBuf>();
         
-        thread::spawn(move || {
-            while let Ok(path) = path_rx.recv() {
-                let start = Instant::now();
+        let path_rx = Arc::new(Mutex::new(path_rx));
+        let device = Arc::new(device);
+        let queue = Arc::new(queue);
+
+        for _ in 0..16 {
+            let path_rx = path_rx.clone();
+            let preload_tx = preload_tx.clone();
+            let device = device.clone();
+            let queue = queue.clone();
+
+            thread::spawn(move || {
+                loop {
+                    let path = {
+                        let Ok(rx) = path_rx.lock() else { break };
+                        match rx.recv() {
+                            Ok(p) => p,
+                            Err(_) => break,
+                        }
+                    };
+
+                    let start = Instant::now();
                 
                 let read_start = Instant::now();
                 let file_bytes = std::fs::read(&path);
@@ -207,17 +227,23 @@ impl Loader {
                         eprintln!("Failed to read {}: {err:#}", path.display());
                     }
                 }
-            }
-        });
+                }
+            });
+        }
         (preload_rx, path_tx)
     }
 
-    pub fn load_image(&self, path: PathBuf) {
+    pub fn load_image(&mut self, path: PathBuf) {
+        if self.cache.contains_key(&path) || self.pending.contains(&path) {
+            return;
+        }
+        self.pending.insert(path.clone());
         let _ = self.path_tx.send(path);
     }
 
     pub fn update(&mut self) {
         while let Ok(entry) = self.preload_rx.try_recv() {
+            self.pending.remove(&entry.path);
             self.cache.insert(entry.path.clone(), entry);
         }
     }
