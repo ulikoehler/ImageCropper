@@ -212,3 +212,18 @@ fn format_savings_summary_reports_savings_and_growth() {
         "Total conversion size increase: 3.0 KB (1.0 KB -> 4.0 KB)"
     );
 }
+
+#[test]
+fn format_deletion_summary_reports_deleted_bytes() {
+    assert_eq!(format_deletion_summary(0), "Total deleted file size: 0 B");
+    assert_eq!(format_deletion_summary(2048), "Total deleted file size: 2.0 KB");
+}
+
+#[test]
+fn format_overall_summary_combines_both() {
+    let s = format_overall_summary(4096, 1024, 512);
+    assert!(s.contains("Total conversion savings"));
+    assert!(s.contains("Total deleted file size"));
+    let none = format_overall_summary(0, 0, 0);
+    assert_eq!(none, "No operations performed");
+}

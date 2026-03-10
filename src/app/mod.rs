@@ -14,8 +14,8 @@ use image::DynamicImage;
 use wgpu;
 
 use crate::{
-    fs_utils::{format_savings_summary, format_size, move_with_unique_name, prepare_dir, TRASH_DIR},
-    image_utils::{combine_crops, to_color_image, OutputFormat, PreloadedImage, SaveRequest},
+    fs_utils::{format_savings_summary, format_deletion_summary, format_overall_summary, format_size, move_with_unique_name, prepare_dir, TRASH_DIR},
+    image_utils::{build_output_image, combine_crops, to_color_image, OutputFormat, PreloadedImage, SaveRequest},
     ui::{ImageMetrics, KeyboardState},
 };
 
@@ -46,6 +46,8 @@ pub struct ImageCropperApp {
     pub completed_conversions: usize,
     pub total_original_bytes: u64,
     pub total_new_bytes: u64,
+    pub deleted_files: usize,
+    pub total_deleted_bytes: u64,
     pub exit_summary_printed: bool,
 }
 
@@ -93,18 +95,36 @@ impl ImageCropperApp {
             completed_conversions: 0,
             total_original_bytes: 0,
             total_new_bytes: 0,
+            deleted_files: 0,
+            total_deleted_bytes: 0,
             exit_summary_printed: false,
         };
         app.load_current_image(&cc.egui_ctx, Some(wgpu_render_state))?;
         Ok(app)
     }
 
-    fn savings_summary(&self) -> String {
-        if self.completed_conversions == 0 {
-            "Total conversion savings: 0 B".to_string()
+fn conversion_summary(&self) -> String {
+         if self.completed_conversions == 0 {
+             "Total conversion savings: 0 B".to_string()
+         } else {
+             format_savings_summary(self.total_original_bytes, self.total_new_bytes)
+         }
+     }
+
+    fn deletion_summary(&self) -> String {
+        if self.deleted_files == 0 {
+            "Total deleted file size: 0 B".to_string()
         } else {
-            format_savings_summary(self.total_original_bytes, self.total_new_bytes)
+            format_deletion_summary(self.total_deleted_bytes)
         }
+    }
+
+    fn exit_summary(&self) -> String {
+        format_overall_summary(
+            self.total_original_bytes,
+            self.total_new_bytes,
+            self.total_deleted_bytes,
+        )
     }
 
     fn print_exit_summary(&mut self) {
@@ -112,7 +132,7 @@ impl ImageCropperApp {
             return;
         }
 
-        println!("{}", self.savings_summary());
+        println!("{}", self.exit_summary());
         self.exit_summary_printed = true;
     }
 
@@ -388,6 +408,21 @@ impl ImageCropperApp {
             return;
         }
 
+        // record deletion statistics
+        if let Ok(meta) = std::fs::metadata(&path) {
+            self.deleted_files += 1;
+            self.total_deleted_bytes = self.total_deleted_bytes.saturating_add(meta.len());
+            if self.report_sizes {
+                let msg = format!(
+                    "Deleted {} ({})",
+                    path.display(),
+                    format_size(meta.len())
+                );
+                println!("{}", msg);
+                self.status = msg.clone();
+            }
+        }
+
         let parent = path.parent().unwrap_or_else(|| Path::new("."));
         let Ok(target_dir) = prepare_dir(parent, TRASH_DIR) else {
             self.status = "Unable to prepare trash directory".into();
@@ -418,10 +453,6 @@ impl ImageCropperApp {
     }
 
     fn crop_selections(&mut self, ctx: &egui::Context, render_state: Option<&RenderState>) -> bool {
-        if self.canvas.selections.is_empty() {
-            self.status = "No selection to crop".into();
-            return false;
-        }
         let Some(image) = self.image.clone() else {
             self.status = "Image not loaded".into();
             return false;
@@ -431,24 +462,9 @@ impl ImageCropperApp {
             return false;
         };
 
-        let mut crops = Vec::new();
-        for selection in &self.canvas.selections {
-            if let Some((x, y, w, h)) = selection.to_u32_bounds() {
-                if w > 0 && h > 0 {
-                    crops.push(image.crop_imm(x, y, w, h));
-                }
-            }
-        }
-
-        if crops.is_empty() {
+        let Some(final_image) = build_output_image(&image, &self.canvas.selections) else {
             self.status = "Selections too small".into();
             return false;
-        }
-
-        let final_image = if crops.len() == 1 {
-            crops[0].clone()
-        } else {
-            combine_crops(crops)
         };
 
         let output_path = path.with_extension(self.format.extension());
@@ -679,7 +695,8 @@ impl App for ImageCropperApp {
                                 self.saver.pending_saves.len()
                             ));
                             ui.add_space(8.0);
-                            ui.label(self.savings_summary());
+                            ui.label(self.conversion_summary());
+                            ui.label(self.deletion_summary());
                         });
                     });
                 });
@@ -698,7 +715,8 @@ impl App for ImageCropperApp {
                             ui.label(format!("Processing {} images...", self.saver.pending_saves.len()));
                         }
                         ui.add_space(10.0);
-                        ui.label(self.savings_summary());
+                        ui.label(self.conversion_summary());
+                        ui.label(self.deletion_summary());
                         ui.add_space(20.0);
                         if ui.button("Start Over").clicked() {
                             self.list_completed = false;

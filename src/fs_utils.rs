@@ -260,3 +260,24 @@ pub fn format_savings_summary(original_bytes: u64, new_bytes: u64) -> String {
     }
 }
 
+/// Format a summary of bytes deleted (i.e. moved to trash).
+pub fn format_deletion_summary(deleted_bytes: u64) -> String {
+    format!("Total deleted file size: {}", format_size(deleted_bytes))
+}
+
+/// Combined summary string suitable for printing at exit.
+pub fn format_overall_summary(original_bytes: u64, new_bytes: u64, deleted_bytes: u64) -> String {
+    let mut parts = Vec::new();
+    if original_bytes > 0 || new_bytes > 0 {
+        parts.push(format_savings_summary(original_bytes, new_bytes));
+    }
+    if deleted_bytes > 0 {
+        parts.push(format_deletion_summary(deleted_bytes));
+    }
+    if parts.is_empty() {
+        "No operations performed".to_string()
+    } else {
+        parts.join(" | ")
+    }
+}
+

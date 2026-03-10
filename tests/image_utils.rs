@@ -1,4 +1,6 @@
 use imagecropper::image_utils::*;
+use imagecropper::selection::Selection;
+use eframe::egui::Rect;
 
 mod common;
 use common::solid_image;
@@ -38,4 +40,30 @@ fn combine_crops_keeps_all_pixels() {
     }
     assert_eq!(red_count, (red.width() * red.height()) as usize);
     assert_eq!(blue_count, (blue.width() * blue.height()) as usize);
+}
+
+#[test]
+fn build_output_image_returns_entire_image_for_empty_selection_list() {
+    let image = solid_image(4, 3, [10, 20, 30, 255]);
+
+    let output = build_output_image(&image, &[]).unwrap().to_rgba8();
+
+    assert_eq!(output.width(), 4);
+    assert_eq!(output.height(), 3);
+    assert!(output
+        .chunks_exact(4)
+        .all(|chunk| chunk == [10, 20, 30, 255]));
+}
+
+#[test]
+fn build_output_image_crops_selected_region() {
+    let image = solid_image(5, 4, [0, 0, 0, 255]);
+    let selection = Selection {
+        rect: Rect::from_min_max(eframe::egui::pos2(1.0, 1.0), eframe::egui::pos2(4.0, 3.0)),
+    };
+
+    let output = build_output_image(&image, &[selection]).unwrap();
+
+    assert_eq!(output.width(), 3);
+    assert_eq!(output.height(), 2);
 }

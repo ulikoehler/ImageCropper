@@ -135,7 +135,7 @@ imagecropper [OPTIONS] <DIRECTORY>
     *   The original is backed up.
     *   The crop is saved as an AVIF.
     *   The tool advances to the next image.
-4.  If an image is bad, press **Delete** to move it to trash.
+4.  If an image is bad, press **Delete** to move it to trash. Deleted file sizes are tallied separately and shown in the exit summary.
 5.  If `--resave` is on, simply pressing **Space** on a non-AVIF image will convert it to AVIF in the background.
 
 ## Output

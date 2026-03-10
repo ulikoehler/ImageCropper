@@ -5,6 +5,8 @@ use clap::ValueEnum;
 use eframe::egui;
 use image::{DynamicImage, GenericImage, RgbaImage};
 
+use crate::selection::Selection;
+
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum, Debug)]
 pub enum OutputFormat {
     Jpg,
@@ -117,5 +119,28 @@ pub fn combine_crops(mut crops: Vec<DynamicImage>) -> DynamicImage {
     }
 
     DynamicImage::ImageRgba8(final_image)
+}
+
+pub fn build_output_image(image: &DynamicImage, selections: &[Selection]) -> Option<DynamicImage> {
+    if selections.is_empty() {
+        return Some(image.clone());
+    }
+
+    let mut crops = Vec::new();
+    for selection in selections {
+        if let Some((x, y, w, h)) = selection.to_u32_bounds() {
+            if w > 0 && h > 0 {
+                crops.push(image.crop_imm(x, y, w, h));
+            }
+        }
+    }
+
+    if crops.is_empty() {
+        None
+    } else if crops.len() == 1 {
+        Some(crops.remove(0))
+    } else {
+        Some(combine_crops(crops))
+    }
 }
 
