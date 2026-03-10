@@ -88,6 +88,15 @@ imagecropper --resave test-images
 *   **Background Processing**: Saving and conversion happens in the background to keep the UI responsive.
 *   **Preloading**: Preloads next/previous images for instant navigation.
 
+## Continuous Integration
+
+GitHub Actions builds release binaries for Linux and Windows on every push to `master`, on pull requests, and on manual workflow runs.
+
+When you push a version tag like `v0.3.1`, the workflow also attaches packaged binaries to the corresponding GitHub release:
+
+*   `imagecropper-linux-x86_64.tar.gz`
+*   `imagecropper-windows-x86_64.zip`
+
 ## Usage
 
 ```bash

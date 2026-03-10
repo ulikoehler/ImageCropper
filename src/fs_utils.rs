@@ -5,6 +5,9 @@ use std::{
 };
 
 use anyhow::{anyhow, Context, Result};
+use clap::ValueEnum;
+use globset::{Glob, GlobSet, GlobSetBuilder};
+use regex::RegexSet;
 use walkdir::WalkDir;
 
 pub const TRASH_DIR: &str = ".imagecropper-trash";
@@ -15,7 +18,97 @@ pub const SUPPORTED_EXTENSIONS: &[&str] = &[
     "png", "jpg", "jpeg", "bmp", "gif", "webp", "tiff", "tif", "ico", "avif",
 ];
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum FilterSyntax {
+    Glob,
+    Regex,
+}
+
+enum PatternMatcher {
+    None,
+    Glob(GlobSet),
+    Regex(RegexSet),
+}
+
+impl PatternMatcher {
+    fn compile(syntax: FilterSyntax, patterns: &[String]) -> Result<Self> {
+        if patterns.is_empty() {
+            return Ok(Self::None);
+        }
+
+        match syntax {
+            FilterSyntax::Glob => {
+                let mut builder = GlobSetBuilder::new();
+                for pattern in patterns {
+                    let glob = Glob::new(pattern)
+                        .with_context(|| format!("Invalid glob pattern: {pattern}"))?;
+                    builder.add(glob);
+                }
+                Ok(Self::Glob(
+                    builder
+                        .build()
+                        .context("Failed to compile glob filter patterns")?,
+                ))
+            }
+            FilterSyntax::Regex => Ok(Self::Regex(
+                RegexSet::new(patterns).context("Failed to compile regex filter patterns")?,
+            )),
+        }
+    }
+
+    fn matches(&self, path: &Path) -> bool {
+        let candidate = normalize_filter_path(path);
+        match self {
+            Self::None => false,
+            Self::Glob(set) => set.is_match(&candidate),
+            Self::Regex(set) => set.is_match(&candidate),
+        }
+    }
+}
+
+pub struct PathFilter {
+    whitelist: PatternMatcher,
+    blacklist: PatternMatcher,
+}
+
+impl PathFilter {
+    pub fn compile(
+        syntax: FilterSyntax,
+        whitelist_patterns: &[String],
+        blacklist_patterns: &[String],
+    ) -> Result<Option<Self>> {
+        if whitelist_patterns.is_empty() && blacklist_patterns.is_empty() {
+            return Ok(None);
+        }
+
+        Ok(Some(Self {
+            whitelist: PatternMatcher::compile(syntax, whitelist_patterns)?,
+            blacklist: PatternMatcher::compile(syntax, blacklist_patterns)?,
+        }))
+    }
+
+    pub fn matches(&self, path: &Path) -> bool {
+        if self.whitelist.matches(path) {
+            return true;
+        }
+
+        !self.blacklist.matches(path)
+    }
+}
+
+fn normalize_filter_path(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
 pub fn collect_images(paths: &[PathBuf], recursive: bool) -> Result<Vec<PathBuf>> {
+    collect_images_with_filter(paths, recursive, None)
+}
+
+pub fn collect_images_with_filter(
+    paths: &[PathBuf],
+    recursive: bool,
+    filter: Option<&PathFilter>,
+) -> Result<Vec<PathBuf>> {
     let mut files = Vec::new();
     for path in paths {
         if !path.exists() {
@@ -23,7 +116,7 @@ pub fn collect_images(paths: &[PathBuf], recursive: bool) -> Result<Vec<PathBuf>
         }
 
         if path.is_file() {
-            if is_supported_image(path) {
+            if is_supported_image(path) && filter.map_or(true, |f| f.matches(path)) {
                 files.push(path.to_path_buf());
             }
         } else if path.is_dir() {
@@ -33,7 +126,10 @@ pub fn collect_images(paths: &[PathBuf], recursive: bool) -> Result<Vec<PathBuf>
                     .into_iter()
                     .filter_map(|e| e.ok())
                 {
-                    if entry.file_type().is_file() && is_supported_image(entry.path()) {
+                    if entry.file_type().is_file()
+                        && is_supported_image(entry.path())
+                        && filter.map_or(true, |f| f.matches(entry.path()))
+                    {
                         files.push(entry.path().to_path_buf());
                     }
                 }
@@ -44,7 +140,10 @@ pub fn collect_images(paths: &[PathBuf], recursive: bool) -> Result<Vec<PathBuf>
                     let entry = entry
                         .with_context(|| format!("Unable to read entry in {}", path.display()))?;
                     let p = entry.path();
-                    if p.is_file() && is_supported_image(&p) {
+                    if p.is_file()
+                        && is_supported_image(&p)
+                        && filter.map_or(true, |f| f.matches(&p))
+                    {
                         files.push(p);
                     }
                 }
@@ -140,6 +239,24 @@ pub fn format_size(bytes: u64) -> String {
         format!("{:.1} MB", b / MB)
     } else {
         format!("{:.2} GB", b / GB)
+    }
+}
+
+pub fn format_savings_summary(original_bytes: u64, new_bytes: u64) -> String {
+    if original_bytes >= new_bytes {
+        format!(
+            "Total conversion savings: {} ({} -> {})",
+            format_size(original_bytes - new_bytes),
+            format_size(original_bytes),
+            format_size(new_bytes)
+        )
+    } else {
+        format!(
+            "Total conversion size increase: {} ({} -> {})",
+            format_size(new_bytes - original_bytes),
+            format_size(original_bytes),
+            format_size(new_bytes)
+        )
     }
 }
 

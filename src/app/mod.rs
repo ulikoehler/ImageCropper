@@ -14,7 +14,7 @@ use image::DynamicImage;
 use wgpu;
 
 use crate::{
-    fs_utils::{format_size, move_with_unique_name, prepare_dir, TRASH_DIR},
+    fs_utils::{format_savings_summary, format_size, move_with_unique_name, prepare_dir, TRASH_DIR},
     image_utils::{combine_crops, to_color_image, OutputFormat, PreloadedImage, SaveRequest},
     ui::{ImageMetrics, KeyboardState},
 };
@@ -43,6 +43,10 @@ pub struct ImageCropperApp {
     pub exit_attempt_count: usize,
     pub list_completed: bool,
     pub windowed_mode_set: bool,
+    pub completed_conversions: usize,
+    pub total_original_bytes: u64,
+    pub total_new_bytes: u64,
+    pub exit_summary_printed: bool,
 }
 
 impl ImageCropperApp {
@@ -86,9 +90,35 @@ impl ImageCropperApp {
             exit_attempt_count: 0,
             list_completed: false,
             windowed_mode_set: false,
+            completed_conversions: 0,
+            total_original_bytes: 0,
+            total_new_bytes: 0,
+            exit_summary_printed: false,
         };
         app.load_current_image(&cc.egui_ctx, Some(wgpu_render_state))?;
         Ok(app)
+    }
+
+    fn savings_summary(&self) -> String {
+        if self.completed_conversions == 0 {
+            "Total conversion savings: 0 B".to_string()
+        } else {
+            format_savings_summary(self.total_original_bytes, self.total_new_bytes)
+        }
+    }
+
+    fn print_exit_summary(&mut self) {
+        if self.exit_summary_printed {
+            return;
+        }
+
+        println!("{}", self.savings_summary());
+        self.exit_summary_printed = true;
+    }
+
+    fn finalize_shutdown(&mut self, ctx: &egui::Context) {
+        self.print_exit_summary();
+        ctx.send_viewport_cmd(ViewportCommand::Close);
     }
 
     fn current_path(&self) -> Option<&Path> {
@@ -178,7 +208,7 @@ impl ImageCropperApp {
     fn request_shutdown(&mut self, ctx: &egui::Context) {
         self.finished = true;
         if self.saver.pending_saves.is_empty() {
-            ctx.send_viewport_cmd(ViewportCommand::Close);
+            self.finalize_shutdown(ctx);
         }
     }
 
@@ -579,6 +609,12 @@ impl App for ImageCropperApp {
                     self.status = msg;
                 }
                 Ok(()) => {
+                    if let Some((original, new)) = sizes {
+                        self.completed_conversions += 1;
+                        self.total_original_bytes = self.total_original_bytes.saturating_add(original);
+                        self.total_new_bytes = self.total_new_bytes.saturating_add(new);
+                    }
+
                     if self.report_sizes {
                         if let Some((original, new)) = sizes {
                             // Avoid division by zero
@@ -628,7 +664,7 @@ impl App for ImageCropperApp {
 
         if self.is_exiting {
             if self.saver.pending_saves.is_empty() {
-                ctx.send_viewport_cmd(ViewportCommand::Close);
+                self.finalize_shutdown(ctx);
             } else {
                 if !self.windowed_mode_set {
                     ctx.send_viewport_cmd(ViewportCommand::Fullscreen(false));
@@ -637,10 +673,14 @@ impl App for ImageCropperApp {
                 }
                 egui::CentralPanel::default().show(ctx, |ui| {
                     ui.centered_and_justified(|ui| {
-                        ui.heading(format!(
-                            "Finishing background tasks... ({} remaining)",
-                            self.saver.pending_saves.len()
-                        ));
+                        ui.vertical_centered(|ui| {
+                            ui.heading(format!(
+                                "Finishing background tasks... ({} remaining)",
+                                self.saver.pending_saves.len()
+                            ));
+                            ui.add_space(8.0);
+                            ui.label(self.savings_summary());
+                        });
                     });
                 });
                 ctx.request_repaint();
@@ -657,6 +697,8 @@ impl App for ImageCropperApp {
                             ui.add_space(10.0);
                             ui.label(format!("Processing {} images...", self.saver.pending_saves.len()));
                         }
+                        ui.add_space(10.0);
+                        ui.label(self.savings_summary());
                         ui.add_space(20.0);
                         if ui.button("Start Over").clicked() {
                             self.list_completed = false;

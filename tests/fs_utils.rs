@@ -162,3 +162,53 @@ fn collect_images_handles_multiple_paths_and_mixed_inputs() {
     files.sort();
     assert_eq!(files, vec![dir1.join("img1.png"), img3.clone()]);
 }
+
+#[test]
+fn collect_images_with_glob_filters_applies_blacklist_and_whitelist_precedence() {
+    let tmp = tempdir().unwrap();
+    let root = tmp.path();
+    fs::write(root.join("keep-me.png"), []).unwrap();
+    fs::write(root.join("skip-me.png"), []).unwrap();
+    fs::write(root.join("other.jpg"), []).unwrap();
+
+    let whitelist = vec!["**/keep-me.png".to_string()];
+    let blacklist = vec!["**/*.png".to_string()];
+    let filter = PathFilter::compile(FilterSyntax::Glob, &whitelist, &blacklist)
+        .unwrap()
+        .unwrap();
+
+    let mut files = collect_images_with_filter(&[root.to_path_buf()], false, Some(&filter)).unwrap();
+    files.sort();
+
+    assert_eq!(files, vec![root.join("keep-me.png"), root.join("other.jpg")]);
+}
+
+#[test]
+fn collect_images_with_regex_blacklist_excludes_matching_paths() {
+    let tmp = tempdir().unwrap();
+    let root = tmp.path();
+    fs::create_dir(root.join("nested")).unwrap();
+    fs::write(root.join("nested/skip.png"), []).unwrap();
+    fs::write(root.join("nested/keep.jpg"), []).unwrap();
+
+    let blacklist = vec![r".*/skip\.(png|jpg)$".to_string()];
+    let filter = PathFilter::compile(FilterSyntax::Regex, &[], &blacklist)
+        .unwrap()
+        .unwrap();
+
+    let files = collect_images_with_filter(&[root.to_path_buf()], true, Some(&filter)).unwrap();
+
+    assert_eq!(files, vec![root.join("nested/keep.jpg")]);
+}
+
+#[test]
+fn format_savings_summary_reports_savings_and_growth() {
+    assert_eq!(
+        format_savings_summary(4096, 1024),
+        "Total conversion savings: 3.0 KB (4.0 KB -> 1.0 KB)"
+    );
+    assert_eq!(
+        format_savings_summary(1024, 4096),
+        "Total conversion size increase: 3.0 KB (1.0 KB -> 4.0 KB)"
+    );
+}

@@ -6,7 +6,7 @@ use eframe::egui;
 use rand::seq::SliceRandom;
 
 use imagecropper::app::ImageCropperApp;
-use imagecropper::fs_utils::collect_images;
+use imagecropper::fs_utils::{collect_images_with_filter, FilterSyntax, PathFilter};
 use imagecropper::image_utils::OutputFormat;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -56,6 +56,18 @@ struct Args {
     #[arg(short = 'r', long = "recursive", default_value_t = false)]
     recursive: bool,
 
+    /// Pattern syntax for whitelist and blacklist filters
+    #[arg(long, value_enum, default_value_t = FilterSyntax::Glob)]
+    filter_syntax: FilterSyntax,
+
+    /// Include paths matching this filter even if they also match a blacklist
+    #[arg(long, value_name = "PATTERN")]
+    whitelist: Vec<String>,
+
+    /// Exclude paths matching this filter unless they also match a whitelist
+    #[arg(long, value_name = "PATTERN")]
+    blacklist: Vec<String>,
+
     /// Invert order of processed images (ignored for randomize)
     #[arg(short = 'i', long = "inverse-order", default_value_t = false)]
     inverse: bool,
@@ -71,7 +83,12 @@ struct Args {
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    let mut files = collect_images(&args.paths, args.recursive)?;
+    let file_filter = PathFilter::compile(
+        args.filter_syntax,
+        &args.whitelist,
+        &args.blacklist,
+    )?;
+    let mut files = collect_images_with_filter(&args.paths, args.recursive, file_filter.as_ref())?;
     if files.is_empty() {
         return Err(anyhow!(
             "No supported image files found in the provided paths. Supported formats are: {}",
