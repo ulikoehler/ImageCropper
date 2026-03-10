@@ -23,8 +23,8 @@ pub struct Loader {
 }
 
 impl Loader {
-    pub fn new(device: wgpu::Device, queue: wgpu::Queue) -> Self {
-        let (preload_rx, path_tx) = Self::spawn_preloader(device, queue);
+    pub fn new() -> Self {
+        let (preload_rx, path_tx) = Self::spawn_preloader(None, None);
         Self {
             preload_rx,
             path_tx,
@@ -35,13 +35,28 @@ impl Loader {
         }
     }
 
-    fn spawn_preloader(device: wgpu::Device, queue: wgpu::Queue) -> (Receiver<PreloadedImage>, Sender<PathBuf>) {
+    pub fn with_wgpu(device: wgpu::Device, queue: wgpu::Queue) -> Self {
+        let (preload_rx, path_tx) = Self::spawn_preloader(Some(device), Some(queue));
+        Self {
+            preload_rx,
+            path_tx,
+            cache: HashMap::new(),
+            history: VecDeque::with_capacity(10),
+            loading_active: false,
+            pending: HashSet::new(),
+        }
+    }
+
+    fn spawn_preloader(
+        device: Option<wgpu::Device>,
+        queue: Option<wgpu::Queue>,
+    ) -> (Receiver<PreloadedImage>, Sender<PathBuf>) {
         let (preload_tx, preload_rx) = mpsc::channel();
         let (path_tx, path_rx) = mpsc::channel::<PathBuf>();
         
         let path_rx = Arc::new(Mutex::new(path_rx));
-        let device = Arc::new(device);
-        let queue = Arc::new(queue);
+        let device = device.map(Arc::new);
+        let queue = queue.map(Arc::new);
 
         for _ in 0..16 {
             let path_rx = path_rx.clone();
@@ -173,46 +188,50 @@ impl Loader {
                                 }
                                 let resize_duration = resize_start.elapsed();
 
-                                let texture_gen_start = Instant::now();
-                                
-                                let rgba = image.to_rgba8();
-                                let width = rgba.width();
-                                let height = rgba.height();
-                                
-                                let texture_size = wgpu::Extent3d {
-                                    width,
-                                    height,
-                                    depth_or_array_layers: 1,
-                                };
-                                
-                                let texture = device.create_texture(&wgpu::TextureDescriptor {
-                                    size: texture_size,
-                                    mip_level_count: 1,
-                                    sample_count: 1,
-                                    dimension: wgpu::TextureDimension::D2,
-                                    format: wgpu::TextureFormat::Rgba8Unorm,
-                                    usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-                                    label: Some("image_texture"),
-                                    view_formats: &[],
-                                });
-                                
-                                queue.write_texture(
-                                    wgpu::TexelCopyTextureInfo {
-                                        texture: &texture,
-                                        mip_level: 0,
-                                        origin: wgpu::Origin3d::ZERO,
-                                        aspect: wgpu::TextureAspect::All,
-                                    },
-                                    &rgba,
-                                    wgpu::TexelCopyBufferLayout {
-                                        offset: 0,
-                                        bytes_per_row: Some(4 * width),
-                                        rows_per_image: Some(height),
-                                    },
-                                    texture_size,
-                                );
+                                let (texture, texture_gen_duration) =
+                                    if let (Some(device), Some(queue)) = (&device, &queue) {
+                                        let texture_gen_start = Instant::now();
+                                        let rgba = image.to_rgba8();
+                                        let width = rgba.width();
+                                        let height = rgba.height();
 
-                                let texture_gen_duration = texture_gen_start.elapsed();
+                                        let texture_size = wgpu::Extent3d {
+                                            width,
+                                            height,
+                                            depth_or_array_layers: 1,
+                                        };
+
+                                        let texture = device.create_texture(&wgpu::TextureDescriptor {
+                                            size: texture_size,
+                                            mip_level_count: 1,
+                                            sample_count: 1,
+                                            dimension: wgpu::TextureDimension::D2,
+                                            format: wgpu::TextureFormat::Rgba8Unorm,
+                                            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                                            label: Some("image_texture"),
+                                            view_formats: &[],
+                                        });
+
+                                        queue.write_texture(
+                                            wgpu::TexelCopyTextureInfo {
+                                                texture: &texture,
+                                                mip_level: 0,
+                                                origin: wgpu::Origin3d::ZERO,
+                                                aspect: wgpu::TextureAspect::All,
+                                            },
+                                            &rgba,
+                                            wgpu::TexelCopyBufferLayout {
+                                                offset: 0,
+                                                bytes_per_row: Some(4 * width),
+                                                rows_per_image: Some(height),
+                                            },
+                                            texture_size,
+                                        );
+
+                                        (Some(texture), texture_gen_start.elapsed())
+                                    } else {
+                                        (None, std::time::Duration::default())
+                                    };
 
                                 let load_duration = start.elapsed();
                                 if preload_tx
@@ -220,7 +239,7 @@ impl Loader {
                                         path,
                                         image,
                                         color_image: None,
-                                        texture: Some(texture),
+                                        texture,
                                         load_duration,
                                         read_duration,
                                         decode_duration,

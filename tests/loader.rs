@@ -37,7 +37,8 @@ fn history_keeps_only_ten_entries() {
         loader.push_history(PreloadedImage {
             path: PathBuf::from(format!("{idx}.png")),
             image,
-            color_image,
+            color_image: Some(color_image),
+            texture: None,
             load_duration: Duration::default(),
             read_duration: Duration::default(),
             decode_duration: Duration::default(),

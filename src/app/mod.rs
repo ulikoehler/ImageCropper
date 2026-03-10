@@ -66,7 +66,7 @@ impl ImageCropperApp {
         let wgpu_render_state = cc.wgpu_render_state.as_ref().expect("WGPU enabled");
         let device = wgpu_render_state.device.clone();
         let queue = wgpu_render_state.queue.clone();
-        let loader = Loader::new(device, queue);
+        let loader = Loader::with_wgpu(device, queue);
         let saver = Saver::new(parallel);
         let canvas = Canvas::new();
 
@@ -842,8 +842,8 @@ impl App for ImageCropperApp {
                     );
 
                     let image_response = ui.interact(
-                        metrics.image_rect,
-                        ui.id().with("image"),
+                        response.rect,
+                        ui.id().with("image_drag_area"),
                         egui::Sense::click_and_drag(),
                     );
                     self.canvas.handle_pointer(&image_response, &metrics, self.image_size, ctx);

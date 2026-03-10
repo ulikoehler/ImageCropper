@@ -37,34 +37,61 @@ impl Canvas {
 
         if response.drag_started() {
             if let Some(pointer) = response.interact_pointer_pos() {
-                let image_pos = metrics.screen_to_image(pointer);
-                self.selection_anchor = Some(image_pos);
-
-                if !ctrl_down {
-                    // If not holding ctrl, clear existing unless we clicked inside one?
-                    // For now, simple behavior: No ctrl = clear and start new.
-                    self.selections.clear();
-                }
-
-                self.selections.push(Selection::from_points(
-                    image_pos,
-                    image_pos,
-                    image_size,
-                ));
+                self.begin_selection(pointer, metrics, image_size, ctrl_down);
             }
         } else if response.dragged() {
             if let (Some(anchor), Some(pointer)) =
                 (self.selection_anchor, response.interact_pointer_pos())
             {
-                let image_pos = metrics.screen_to_image(pointer);
-                // Update the last selection (the one currently being created)
-                if let Some(last) = self.selections.last_mut() {
-                    *last = Selection::from_points(anchor, image_pos, image_size);
-                }
+                self.update_drag(anchor, pointer, metrics, image_size);
             }
         } else if response.drag_stopped() {
             self.selection_anchor = None;
         }
+    }
+
+    pub fn begin_selection(
+        &mut self,
+        pointer: egui::Pos2,
+        metrics: &ImageMetrics,
+        image_size: egui::Vec2,
+        keep_existing: bool,
+    ) {
+        if self.active_handle.is_some() || self.pointer_over_handle(pointer, metrics) {
+            return;
+        }
+
+        let image_pos = metrics.screen_to_image(pointer);
+        self.selection_anchor = Some(image_pos);
+
+        if !keep_existing {
+            self.selections.clear();
+        }
+
+        self.selections
+            .push(Selection::from_points(image_pos, image_pos, image_size));
+    }
+
+    fn update_drag(
+        &mut self,
+        anchor: egui::Pos2,
+        pointer: egui::Pos2,
+        metrics: &ImageMetrics,
+        image_size: egui::Vec2,
+    ) {
+        let image_pos = metrics.screen_to_image(pointer);
+        if let Some(last) = self.selections.last_mut() {
+            *last = Selection::from_points(anchor, image_pos, image_size);
+        }
+    }
+
+    fn pointer_over_handle(&self, pointer: egui::Pos2, metrics: &ImageMetrics) -> bool {
+        self.selections.iter().any(|selection| {
+            let screen_rect = metrics.selection_rect(selection);
+            SelectionHandle::ALL
+                .iter()
+                .any(|handle| handle.handle_rect(screen_rect).contains(pointer))
+        })
     }
 
     pub fn handle_arrow_movement(&mut self, keys: &KeyboardState, image_size: egui::Vec2) {
