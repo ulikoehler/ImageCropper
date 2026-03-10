@@ -61,7 +61,8 @@ jobs:
             libxinerama-dev \
             libxkbcommon-dev \
             libxrandr-dev \
-            libgl1-mesa-dev
+            libgl1-mesa-dev \
+            libdav1d-dev  # provide dav1d.pc for dav1d-sys
 
       - name: Build release binary
         env:
