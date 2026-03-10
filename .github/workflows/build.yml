@@ -19,18 +19,18 @@ env:
 jobs:
   build:
     name: Build ${{ matrix.label }}
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
-            label: linux-x86_64
-            binary_path: target/release/imagecropper
+          - label: linux-x86_64
+            target: x86_64-unknown-linux-gnu
+            binary_path: target/x86_64-unknown-linux-gnu/release/imagecropper
             archive_name: imagecropper-linux-x86_64.tar.gz
-          - os: windows-latest
-            label: windows-x86_64
-            binary_path: target/release/imagecropper.exe
+          - label: windows-x86_64
+            target: x86_64-pc-windows-gnu
+            binary_path: target/x86_64-pc-windows-gnu/release/imagecropper.exe
             archive_name: imagecropper-windows-x86_64.zip
 
     steps:
@@ -39,18 +39,20 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
 
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@v2
 
-      - name: Install Linux build dependencies
-        if: runner.os == 'Linux'
+      - name: Install build dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y \
+            gcc-mingw-w64-x86-64 \
             pkg-config \
+            zip \
             libasound2-dev \
-            libdav1d-dev \
             libudev-dev \
             libwayland-dev \
             libx11-dev \
@@ -62,10 +64,12 @@ jobs:
             libgl1-mesa-dev
 
       - name: Build release binary
-        run: cargo build --release --locked
+        env:
+          CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER: x86_64-w64-mingw32-gcc
+        run: cargo build --release --locked --target "${{ matrix.target }}"
 
       - name: Package Linux binary
-        if: runner.os == 'Linux'
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
         shell: bash
         run: |
           mkdir -p dist
@@ -73,12 +77,13 @@ jobs:
           tar -C dist -czf "${{ matrix.archive_name }}" "${{ env.BINARY_NAME }}"
 
       - name: Package Windows binary
-        if: runner.os == 'Windows'
-        shell: pwsh
+        if: matrix.target == 'x86_64-pc-windows-gnu'
+        shell: bash
         run: |
-          New-Item -ItemType Directory -Path dist -Force | Out-Null
-          Copy-Item "${{ matrix.binary_path }}" "dist/${{ env.BINARY_NAME }}.exe"
-          Compress-Archive -Path "dist/${{ env.BINARY_NAME }}.exe" -DestinationPath "${{ matrix.archive_name }}" -Force
+          mkdir -p dist
+          cp "${{ matrix.binary_path }}" "dist/${{ env.BINARY_NAME }}.exe"
+          cd dist
+          zip -9 "../${{ matrix.archive_name }}" "${{ env.BINARY_NAME }}.exe"
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
