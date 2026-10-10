@@ -895,11 +895,30 @@ impl App for ImageCropperApp {
                 Color32::from_gray(200),
             );
 
-            // Image X of Y indicator
+            // Top line: file name, file size, and position indicator
+            let top_line = match self.current_path() {
+                Some(path) => {
+                    let name = path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| path.display().to_string());
+                    let size = std::fs::metadata(path)
+                        .map(|m| format_size(m.len()))
+                        .unwrap_or_else(|_| "?".to_string());
+                    format!(
+                        "{} ({}) — Image {} of {}",
+                        name,
+                        size,
+                        self.current_index + 1,
+                        self.files.len()
+                    )
+                }
+                None => "No image".to_string(),
+            };
             draw_text_with_bg(
                 response.rect.left_top() + egui::vec2(12.0, 12.0),
                 egui::Align2::LEFT_TOP,
-                format!("Image {} of {}", self.current_index + 1, self.files.len()),
+                top_line,
                 egui::FontId::proportional(20.0),
                 Color32::WHITE,
             );
