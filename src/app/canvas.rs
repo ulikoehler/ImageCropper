@@ -11,6 +11,12 @@ pub struct Canvas {
     pub active_handle: Option<HandleDrag>,
 }
 
+impl Default for Canvas {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Canvas {
     pub fn new() -> Self {
         Self {

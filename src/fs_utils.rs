@@ -116,7 +116,7 @@ pub fn collect_images_with_filter(
         }
 
         if path.is_file() {
-            if is_supported_image(path) && filter.map_or(true, |f| f.matches(path)) {
+            if is_supported_image(path) && filter.is_none_or(|f| f.matches(path)) {
                 files.push(path.to_path_buf());
             }
         } else if path.is_dir() {
@@ -128,7 +128,7 @@ pub fn collect_images_with_filter(
                 {
                     if entry.file_type().is_file()
                         && is_supported_image(entry.path())
-                        && filter.map_or(true, |f| f.matches(entry.path()))
+                        && filter.is_none_or(|f| f.matches(entry.path()))
                     {
                         files.push(entry.path().to_path_buf());
                     }
@@ -142,7 +142,7 @@ pub fn collect_images_with_filter(
                     let p = entry.path();
                     if p.is_file()
                         && is_supported_image(&p)
-                        && filter.map_or(true, |f| f.matches(&p))
+                        && filter.is_none_or(|f| f.matches(&p))
                     {
                         files.push(p);
                     }

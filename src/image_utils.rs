@@ -66,7 +66,7 @@ pub fn combine_crops(mut crops: Vec<DynamicImage>) -> DynamicImage {
     // Simple shelf packing or just horizontal stacking if few?
     // User wants to "minimize empty space".
     // Let's sort by height descending.
-    crops.sort_by(|a, b| b.height().cmp(&a.height()));
+    crops.sort_by_key(|i| std::cmp::Reverse(i.height()));
 
     // Calculate total area to estimate canvas size
     let total_area: u64 = crops.iter().map(|i| i.width() as u64 * i.height() as u64).sum();

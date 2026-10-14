@@ -22,6 +22,12 @@ pub struct Loader {
     pub pending: HashSet<PathBuf>,
 }
 
+impl Default for Loader {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Loader {
     pub fn new() -> Self {
         let (preload_rx, path_tx) = Self::spawn_preloader(None, None);

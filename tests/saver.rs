@@ -47,7 +47,7 @@ fn wait_for_save(saver: &mut Saver, expected_path: &Path) -> Option<(u64, u64)> 
     let start = Instant::now();
     loop {
         for (path, result, sizes) in saver.check_completions() {
-            if &path == expected_path {
+            if path == expected_path {
                 result.unwrap();
                 return sizes;
             }

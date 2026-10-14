@@ -31,7 +31,7 @@ fn combine_crops_keeps_all_pixels() {
     let combined = combine_crops(vec![red.clone(), blue.clone()]).to_rgba8();
     let mut red_count = 0;
     let mut blue_count = 0;
-    for chunk in combined.chunks_exact(4) {
+    for chunk in combined.as_chunks::<4>().0 {
         match chunk {
             [255, 0, 0, 255] => red_count += 1,
             [0, 0, 255, 255] => blue_count += 1,
@@ -51,8 +51,9 @@ fn build_output_image_returns_entire_image_for_empty_selection_list() {
     assert_eq!(output.width(), 4);
     assert_eq!(output.height(), 3);
     assert!(output
-        .chunks_exact(4)
-        .all(|chunk| chunk == [10, 20, 30, 255]));
+        .as_chunks::<4>().0
+        .iter()
+        .all(|chunk| *chunk == [10, 20, 30, 255]));
 }
 
 #[test]

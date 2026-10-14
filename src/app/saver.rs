@@ -20,6 +20,9 @@ use crate::{
     image_utils::{OutputFormat, SaveRequest, SaveStatus},
 };
 
+/// (saved path, result, optional (original_size, new_size))
+pub type SaveCompletion = (PathBuf, Result<()>, Option<(u64, u64)>);
+
 pub struct Saver {
     save_tx: Sender<SaveRequest>,
     save_status_rx: Receiver<SaveStatus>,
@@ -210,7 +213,7 @@ impl Saver {
             .map_err(|e| anyhow!("Failed to send save request: {}", e))
     }
 
-    pub fn check_completions(&mut self) -> Vec<(PathBuf, Result<()>, Option<(u64, u64)>)> {
+    pub fn check_completions(&mut self) -> Vec<SaveCompletion> {
         let mut completed = Vec::new();
         while let Ok(status) = self.save_status_rx.try_recv() {
             if let Some(idx) = self.pending_saves.iter().position(|p| *p == status.path) {

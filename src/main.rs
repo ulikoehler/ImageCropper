@@ -97,7 +97,7 @@ fn main() -> Result<()> {
     }
     match args.order {
         SortOrder::Filename => files.sort(),
-        SortOrder::Randomize => files.shuffle(&mut rand::thread_rng()),
+        SortOrder::Randomize => files.shuffle(&mut rand::rng()),
         SortOrder::Modified => files.sort_by_key(|path| {
             std::fs::metadata(path)
                 .and_then(|m| m.modified())
@@ -114,12 +114,15 @@ fn main() -> Result<()> {
     if args.inverse && args.order != SortOrder::Randomize {
         files.reverse();
     }
-    let dry_run = args.dry_run;
-    let quality = args.quality;
-    let resave = args.resave;
-    let format = args.format;
-    let parallel = args.parallel;
-    let benchmark = args.benchmark;
+    let options = imagecropper::app::AppOptions {
+        dry_run: args.dry_run,
+        quality: args.quality,
+        resave: args.resave,
+        report_sizes: args.report_sizes,
+        format: args.format,
+        parallel: args.parallel,
+        benchmark: args.benchmark,
+    };
     let files_for_app = files.clone();
 
     let native_options = eframe::NativeOptions {
@@ -131,7 +134,7 @@ fn main() -> Result<()> {
         "ImageCropper",
         native_options,
         Box::new(
-            move |cc| match ImageCropperApp::new(cc, files_for_app.clone(), dry_run, quality, resave, args.report_sizes, format, parallel, benchmark) {
+            move |cc| match ImageCropperApp::new(cc, files_for_app.clone(), options.clone()) {
                 Ok(app) => Ok(Box::new(app) as Box<dyn eframe::App>),
                 Err(err) => {
                     eprintln!("{err:#}");

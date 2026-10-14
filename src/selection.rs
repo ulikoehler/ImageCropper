@@ -185,7 +185,7 @@ impl SelectionHandle {
 }
 
 pub fn selection_color(index: usize) -> Color32 {
-    let golden_ratio_conjugate = 0.618033988749895;
+    let golden_ratio_conjugate = 0.618_034;
     let h = (index as f32 * golden_ratio_conjugate) % 1.0;
     let [r, g, b] = egui::ecolor::Hsva::new(h, 0.8, 1.0, 1.0).to_rgb();
     Color32::from_rgb((r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8)

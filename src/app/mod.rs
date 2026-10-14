@@ -21,6 +21,17 @@ use crate::{
 
 use self::{canvas::Canvas, loader::Loader, saver::Saver};
 
+#[derive(Debug, Clone)]
+pub struct AppOptions {
+    pub dry_run: bool,
+    pub quality: u8,
+    pub resave: bool,
+    pub report_sizes: bool,
+    pub format: OutputFormat,
+    pub parallel: usize,
+    pub benchmark: bool,
+}
+
 pub struct ImageCropperApp {
     pub files: Vec<PathBuf>,
     pub current_index: usize,
@@ -55,30 +66,24 @@ impl ImageCropperApp {
     pub fn new(
         cc: &eframe::CreationContext<'_>,
         files: Vec<PathBuf>,
-        dry_run: bool,
-        quality: u8,
-        resave: bool,
-        report_sizes: bool,
-        format: OutputFormat,
-        parallel: usize,
-        benchmark: bool,
+        options: AppOptions,
     ) -> Result<Self> {
         let wgpu_render_state = cc.wgpu_render_state.as_ref().expect("WGPU enabled");
         let device = wgpu_render_state.device.clone();
         let queue = wgpu_render_state.queue.clone();
         let loader = Loader::with_wgpu(device, queue);
-        let saver = Saver::new(parallel);
+        let saver = Saver::new(options.parallel);
         let canvas = Canvas::new();
 
         let mut app = Self {
             files,
             current_index: 0,
-            dry_run,
-            quality,
-            resave,
-            report_sizes,
-            benchmark,
-            format,
+            dry_run: options.dry_run,
+            quality: options.quality,
+            resave: options.resave,
+            report_sizes: options.report_sizes,
+            benchmark: options.benchmark,
+            format: options.format,
             image: None,
             texture: None,
             preview_texture: None,
@@ -261,7 +266,7 @@ fn conversion_summary(&self) -> String {
             if let Some(path) = self.current_path().map(Path::to_path_buf) {
                 if path
                     .extension()
-                    .map_or(false, |e| e.to_ascii_lowercase() != self.format.extension())
+                    .is_some_and(|e| e.to_ascii_lowercase() != self.format.extension())
                 {
                     if let Some(image) = self.image.clone() {
                         let output_path = path.with_extension(self.format.extension());
@@ -600,7 +605,8 @@ fn conversion_summary(&self) -> String {
 }
 
 impl App for ImageCropperApp {
-    fn update(&mut self, ctx: &egui::Context, frame: &mut Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut Frame) {
+        let ctx = &ui.ctx().clone();
         let render_state = frame.wgpu_render_state();
 
         self.loader.update();
@@ -687,7 +693,7 @@ impl App for ImageCropperApp {
                     ctx.send_viewport_cmd(ViewportCommand::InnerSize(egui::vec2(400.0, 200.0)));
                     self.windowed_mode_set = true;
                 }
-                egui::CentralPanel::default().show(ctx, |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
                     ui.centered_and_justified(|ui| {
                         ui.vertical_centered(|ui| {
                             ui.heading(format!(
@@ -706,7 +712,7 @@ impl App for ImageCropperApp {
         }
 
         if self.list_completed {
-            egui::CentralPanel::default().show(ctx, |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
                 ui.centered_and_justified(|ui| {
                     ui.vertical_centered(|ui| {
                         ui.heading("All images processed!");
@@ -795,7 +801,7 @@ impl App for ImageCropperApp {
 
         self.canvas.handle_arrow_movement(&keys, self.image_size);
 
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default().show(ui, |ui| {
             let (response, painter) =
                 ui.allocate_painter(ui.available_size(), egui::Sense::hover());
             painter.rect_filled(response.rect, 0.0, Color32::BLACK);
