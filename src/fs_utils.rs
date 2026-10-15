@@ -92,7 +92,13 @@ impl PathFilter {
             return true;
         }
 
-        !self.blacklist.matches(path)
+        if self.blacklist.matches(path) {
+            return false;
+        }
+
+        // A whitelist also restricts the allowed set: if one was provided
+        // and the path didn't match it, the file is excluded.
+        matches!(self.whitelist, PatternMatcher::None)
     }
 }
 
@@ -242,20 +248,79 @@ pub fn format_size(bytes: u64) -> String {
     }
 }
 
-pub fn format_savings_summary(original_bytes: u64, new_bytes: u64) -> String {
-    if original_bytes >= new_bytes {
+/// Like `format_size`, but keeps the sign for deltas (e.g. "-1.0 KB").
+pub fn format_signed_size(bytes: i64) -> String {
+    if bytes < 0 {
+        format!("-{}", format_size(bytes.unsigned_abs()))
+    } else {
+        format_size(bytes as u64)
+    }
+}
+
+/// Running statistics for files that were (re)saved/converted.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ConversionStats {
+    pub files: usize,
+    pub original_bytes: u64,
+    pub new_bytes: u64,
+    min_saving: Option<i64>,
+    max_saving: Option<i64>,
+}
+
+impl ConversionStats {
+    pub fn record(&mut self, original: u64, new: u64) {
+        self.files += 1;
+        self.original_bytes = self.original_bytes.saturating_add(original);
+        self.new_bytes = self.new_bytes.saturating_add(new);
+        let saving = original as i64 - new as i64;
+        self.min_saving = Some(self.min_saving.map_or(saving, |m| m.min(saving)));
+        self.max_saving = Some(self.max_saving.map_or(saving, |m| m.max(saving)));
+    }
+
+    pub fn min_saving(&self) -> i64 {
+        self.min_saving.unwrap_or(0)
+    }
+
+    pub fn max_saving(&self) -> i64 {
+        self.max_saving.unwrap_or(0)
+    }
+
+    pub fn avg_saving(&self) -> i64 {
+        if self.files == 0 {
+            0
+        } else {
+            (self.original_bytes as i64 - self.new_bytes as i64) / self.files as i64
+        }
+    }
+}
+
+pub fn format_savings_summary(stats: &ConversionStats) -> String {
+    let per_file = if stats.files > 0 {
         format!(
-            "Total conversion savings: {} ({} -> {})",
-            format_size(original_bytes - new_bytes),
-            format_size(original_bytes),
-            format_size(new_bytes)
+            " in {} file(s) (re)saved; per file min/avg/max: {} / {} / {}",
+            stats.files,
+            format_signed_size(stats.min_saving()),
+            format_signed_size(stats.avg_saving()),
+            format_signed_size(stats.max_saving())
+        )
+    } else {
+        String::new()
+    };
+    if stats.original_bytes >= stats.new_bytes {
+        format!(
+            "Total conversion savings: {} ({} -> {}){}",
+            format_size(stats.original_bytes - stats.new_bytes),
+            format_size(stats.original_bytes),
+            format_size(stats.new_bytes),
+            per_file
         )
     } else {
         format!(
-            "Total conversion size increase: {} ({} -> {})",
-            format_size(new_bytes - original_bytes),
-            format_size(original_bytes),
-            format_size(new_bytes)
+            "Total conversion size increase: {} ({} -> {}){}",
+            format_size(stats.new_bytes - stats.original_bytes),
+            format_size(stats.original_bytes),
+            format_size(stats.new_bytes),
+            per_file
         )
     }
 }
@@ -266,10 +331,10 @@ pub fn format_deletion_summary(deleted_bytes: u64) -> String {
 }
 
 /// Combined summary string suitable for printing at exit.
-pub fn format_overall_summary(original_bytes: u64, new_bytes: u64, deleted_bytes: u64) -> String {
+pub fn format_overall_summary(stats: &ConversionStats, deleted_bytes: u64) -> String {
     let mut parts = Vec::new();
-    if original_bytes > 0 || new_bytes > 0 {
-        parts.push(format_savings_summary(original_bytes, new_bytes));
+    if stats.files > 0 || stats.original_bytes > 0 || stats.new_bytes > 0 {
+        parts.push(format_savings_summary(stats));
     }
     if deleted_bytes > 0 {
         parts.push(format_deletion_summary(deleted_bytes));

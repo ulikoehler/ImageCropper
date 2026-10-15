@@ -41,8 +41,8 @@ struct Args {
     resave: bool,
 
     /// Report original/new file sizes (bytes) and percentage when saving/moving finishes
-    #[arg(long, default_value_t = false)]
-    report_sizes: bool,
+    #[arg(short = 'v', long, default_value_t = false)]
+    verbose: bool,
 
     /// Skip destructive operations and just print what would happen
     #[arg(short = 'd', long, default_value_t = false)]
@@ -60,7 +60,7 @@ struct Args {
     #[arg(long, value_enum, default_value_t = FilterSyntax::Glob)]
     filter_syntax: FilterSyntax,
 
-    /// Include paths matching this filter even if they also match a blacklist
+    /// Only include paths matching this filter (also overrides the blacklist)
     #[arg(long, value_name = "PATTERN")]
     whitelist: Vec<String>,
 
@@ -118,7 +118,7 @@ fn main() -> Result<()> {
         dry_run: args.dry_run,
         quality: args.quality,
         resave: args.resave,
-        report_sizes: args.report_sizes,
+        verbose: args.verbose,
         format: args.format,
         parallel: args.parallel,
         benchmark: args.benchmark,

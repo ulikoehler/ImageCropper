@@ -180,7 +180,27 @@ fn collect_images_with_glob_filters_applies_blacklist_and_whitelist_precedence()
     let mut files = collect_images_with_filter(&[root.to_path_buf()], false, Some(&filter)).unwrap();
     files.sort();
 
-    assert_eq!(files, vec![root.join("keep-me.png"), root.join("other.jpg")]);
+    // The whitelist overrides the blacklist for keep-me.png and restricts
+    // the allowed set, so other.jpg (not whitelisted) is excluded too.
+    assert_eq!(files, vec![root.join("keep-me.png")]);
+}
+
+#[test]
+fn collect_images_with_whitelist_only_includes_matching_paths() {
+    let tmp = tempdir().unwrap();
+    let root = tmp.path();
+    fs::write(root.join("photo.jpg"), []).unwrap();
+    fs::write(root.join("image.avif"), []).unwrap();
+    fs::write(root.join("pic.png"), []).unwrap();
+
+    let whitelist = vec!["*.jpg".to_string()];
+    let filter = PathFilter::compile(FilterSyntax::Glob, &whitelist, &[])
+        .unwrap()
+        .unwrap();
+
+    let files = collect_images_with_filter(&[root.to_path_buf()], false, Some(&filter)).unwrap();
+
+    assert_eq!(files, vec![root.join("photo.jpg")]);
 }
 
 #[test]
@@ -203,14 +223,30 @@ fn collect_images_with_regex_blacklist_excludes_matching_paths() {
 
 #[test]
 fn format_savings_summary_reports_savings_and_growth() {
+    let mut stats = ConversionStats::default();
+    stats.record(4096, 1024);
     assert_eq!(
-        format_savings_summary(4096, 1024),
-        "Total conversion savings: 3.0 KB (4.0 KB -> 1.0 KB)"
+        format_savings_summary(&stats),
+        "Total conversion savings: 3.0 KB (4.0 KB -> 1.0 KB) in 1 file(s) (re)saved; per file min/avg/max: 3.0 KB / 3.0 KB / 3.0 KB"
     );
+
+    let mut stats = ConversionStats::default();
+    stats.record(1024, 4096);
     assert_eq!(
-        format_savings_summary(1024, 4096),
-        "Total conversion size increase: 3.0 KB (1.0 KB -> 4.0 KB)"
+        format_savings_summary(&stats),
+        "Total conversion size increase: 3.0 KB (1.0 KB -> 4.0 KB) in 1 file(s) (re)saved; per file min/avg/max: -3.0 KB / -3.0 KB / -3.0 KB"
     );
+}
+
+#[test]
+fn format_savings_summary_reports_per_file_min_max() {
+    let mut stats = ConversionStats::default();
+    stats.record(4096, 1024); // saved 3.0 KB
+    stats.record(2048, 2048); // saved 0 B
+    stats.record(1024, 2048); // grew by 1.0 KB
+    let s = format_savings_summary(&stats);
+    assert!(s.contains("in 3 file(s) (re)saved"));
+    assert!(s.contains("per file min/avg/max: -1.0 KB / 682 B / 3.0 KB"), "got: {s}");
 }
 
 #[test]
@@ -221,9 +257,11 @@ fn format_deletion_summary_reports_deleted_bytes() {
 
 #[test]
 fn format_overall_summary_combines_both() {
-    let s = format_overall_summary(4096, 1024, 512);
+    let mut stats = ConversionStats::default();
+    stats.record(4096, 1024);
+    let s = format_overall_summary(&stats, 512);
     assert!(s.contains("Total conversion savings"));
     assert!(s.contains("Total deleted file size"));
-    let none = format_overall_summary(0, 0, 0);
+    let none = format_overall_summary(&ConversionStats::default(), 0);
     assert_eq!(none, "No operations performed");
 }

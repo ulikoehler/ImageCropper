@@ -26,6 +26,10 @@ fn handle_arrow_movement_translates_selection() {
         preview: false,
         rotate_cw: false,
         rotate_ccw: false,
+        full_height: false,
+        full_width: false,
+        select_all: false,
+        skip: false,
     };
     canvas.handle_arrow_movement(&keys, egui::vec2(100.0, 100.0));
     let selection = &canvas.selections[0];

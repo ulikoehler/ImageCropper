@@ -14,7 +14,7 @@ use image::DynamicImage;
 use wgpu;
 
 use crate::{
-    fs_utils::{format_savings_summary, format_deletion_summary, format_overall_summary, format_size, move_with_unique_name, prepare_dir, TRASH_DIR},
+    fs_utils::{format_savings_summary, format_deletion_summary, format_overall_summary, format_size, move_with_unique_name, prepare_dir, ConversionStats, TRASH_DIR},
     image_utils::{build_output_image, combine_crops, to_color_image, OutputFormat, PreloadedImage, SaveRequest},
     ui::{ImageMetrics, KeyboardState},
 };
@@ -26,7 +26,7 @@ pub struct AppOptions {
     pub dry_run: bool,
     pub quality: u8,
     pub resave: bool,
-    pub report_sizes: bool,
+    pub verbose: bool,
     pub format: OutputFormat,
     pub parallel: usize,
     pub benchmark: bool,
@@ -46,7 +46,7 @@ pub struct ImageCropperApp {
     pub canvas: Canvas,
     pub loader: Loader,
     pub saver: Saver,
-    pub report_sizes: bool,
+    pub verbose: bool,
     pub benchmark: bool,
     pub status: String,
     pub finished: bool,
@@ -54,9 +54,7 @@ pub struct ImageCropperApp {
     pub exit_attempt_count: usize,
     pub list_completed: bool,
     pub windowed_mode_set: bool,
-    pub completed_conversions: usize,
-    pub total_original_bytes: u64,
-    pub total_new_bytes: u64,
+    pub conversion_stats: ConversionStats,
     pub deleted_files: usize,
     pub total_deleted_bytes: u64,
     pub exit_summary_printed: bool,
@@ -81,7 +79,7 @@ impl ImageCropperApp {
             dry_run: options.dry_run,
             quality: options.quality,
             resave: options.resave,
-            report_sizes: options.report_sizes,
+            verbose: options.verbose,
             benchmark: options.benchmark,
             format: options.format,
             image: None,
@@ -97,9 +95,7 @@ impl ImageCropperApp {
             exit_attempt_count: 0,
             list_completed: false,
             windowed_mode_set: false,
-            completed_conversions: 0,
-            total_original_bytes: 0,
-            total_new_bytes: 0,
+            conversion_stats: ConversionStats::default(),
             deleted_files: 0,
             total_deleted_bytes: 0,
             exit_summary_printed: false,
@@ -109,10 +105,10 @@ impl ImageCropperApp {
     }
 
 fn conversion_summary(&self) -> String {
-         if self.completed_conversions == 0 {
+         if self.conversion_stats.files == 0 {
              "Total conversion savings: 0 B".to_string()
          } else {
-             format_savings_summary(self.total_original_bytes, self.total_new_bytes)
+             format_savings_summary(&self.conversion_stats)
          }
      }
 
@@ -126,8 +122,7 @@ fn conversion_summary(&self) -> String {
 
     fn exit_summary(&self) -> String {
         format_overall_summary(
-            self.total_original_bytes,
-            self.total_new_bytes,
+            &self.conversion_stats,
             self.total_deleted_bytes,
         )
     }
@@ -251,10 +246,18 @@ fn conversion_summary(&self) -> String {
             preview: input.key_down(egui::Key::P),
             rotate_cw: input.key_pressed(egui::Key::R) && !input.modifiers.shift,
             rotate_ccw: input.key_pressed(egui::Key::R) && input.modifiers.shift,
+            full_height: input.key_pressed(egui::Key::H),
+            full_width: input.key_pressed(egui::Key::W),
+            select_all: input.key_pressed(egui::Key::A),
+            skip: input.key_pressed(egui::Key::S),
         })
     }
 
     fn advance(&mut self, ctx: &egui::Context, render_state: Option<&RenderState>) {
+        self.advance_inner(ctx, render_state, false);
+    }
+
+    fn advance_inner(&mut self, ctx: &egui::Context, render_state: Option<&RenderState>, skip_resave: bool) {
         let start = std::time::Instant::now();
         if self.files.is_empty() {
             self.request_shutdown(ctx);
@@ -262,7 +265,7 @@ fn conversion_summary(&self) -> String {
         }
 
         // Check if we need to resave the current image
-        if self.resave {
+        if self.resave && !skip_resave {
             if let Some(path) = self.current_path().map(Path::to_path_buf) {
                 if path
                     .extension()
@@ -417,7 +420,7 @@ fn conversion_summary(&self) -> String {
         if let Ok(meta) = std::fs::metadata(&path) {
             self.deleted_files += 1;
             self.total_deleted_bytes = self.total_deleted_bytes.saturating_add(meta.len());
-            if self.report_sizes {
+            if self.verbose {
                 let msg = format!(
                     "Deleted {} ({})",
                     path.display(),
@@ -632,12 +635,10 @@ impl App for ImageCropperApp {
                 }
                 Ok(()) => {
                     if let Some((original, new)) = sizes {
-                        self.completed_conversions += 1;
-                        self.total_original_bytes = self.total_original_bytes.saturating_add(original);
-                        self.total_new_bytes = self.total_new_bytes.saturating_add(new);
+                        self.conversion_stats.record(original, new);
                     }
 
-                    if self.report_sizes {
+                    if self.verbose {
                         if let Some((original, new)) = sizes {
                             // Avoid division by zero
                             let pct = if original == 0 {
@@ -781,6 +782,37 @@ impl App for ImageCropperApp {
             self.advance(ctx, render_state);
         }
 
+        if keys.skip {
+            self.exit_attempt_count = 0;
+            if let Some(path) = self.current_path() {
+                self.status = format!("Skipped {}", path.display());
+            }
+            self.advance_inner(ctx, render_state, true);
+        }
+
+        if keys.select_all {
+            self.canvas.selections.push(crate::selection::Selection {
+                rect: egui::Rect::from_min_size(egui::pos2(0.0, 0.0), self.image_size),
+            });
+            self.status = "Selected entire image".into();
+        }
+
+        if keys.full_height {
+            if let Some(sel) = self.canvas.selections.last_mut() {
+                sel.rect.min.y = 0.0;
+                sel.rect.max.y = self.image_size.y;
+                self.status = "Selection expanded to full height".into();
+            }
+        }
+
+        if keys.full_width {
+            if let Some(sel) = self.canvas.selections.last_mut() {
+                sel.rect.min.x = 0.0;
+                sel.rect.max.x = self.image_size.x;
+                self.status = "Selection expanded to full width".into();
+            }
+        }
+
         if keys.prev_image {
             self.exit_attempt_count = 0;
             self.go_back(ctx, render_state);
@@ -896,7 +928,7 @@ impl App for ImageCropperApp {
             draw_text_with_bg(
                 response.rect.right_bottom() + egui::vec2(-12.0, -12.0),
                 egui::Align2::RIGHT_BOTTOM,
-                "Enter: Save | Space: Next | Backspace: Prev | Delete: Trash | R: Rotate | P: Preview | Esc: Clear/Quit".to_string(),
+                "Enter: Save | Space: Next | S: Skip | Backspace: Prev | Delete: Trash | R: Rotate | P: Preview | A: Select All | H/W: Full Height/Width | Esc: Clear/Quit".to_string(),
                 egui::FontId::monospace(16.0),
                 Color32::from_gray(200),
             );
