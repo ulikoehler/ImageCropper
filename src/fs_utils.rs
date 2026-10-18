@@ -14,6 +14,12 @@ pub const TRASH_DIR: &str = ".imagecropper-trash";
 pub const ORIGINALS_DIR: &str = ".imagecropper-originals";
 pub const TEMP_DIR: &str = ".imagecropper-tmp";
 
+const RESERVED_DIRS: &[&str] = &[TRASH_DIR, ORIGINALS_DIR, TEMP_DIR];
+
+fn is_reserved_dir_name(name: &OsStr) -> bool {
+    RESERVED_DIRS.iter().any(|reserved| name == *reserved)
+}
+
 pub const SUPPORTED_EXTENSIONS: &[&str] = &[
     "png", "jpg", "jpeg", "bmp", "gif", "webp", "tiff", "tif", "ico", "avif",
 ];
@@ -130,6 +136,11 @@ pub fn collect_images_with_filter(
                 for entry in WalkDir::new(path)
                     .follow_links(false)
                     .into_iter()
+                    .filter_entry(|e| {
+                        e.depth() == 0
+                            || !e.file_type().is_dir()
+                            || !is_reserved_dir_name(e.file_name())
+                    })
                     .filter_map(|e| e.ok())
                 {
                     if entry.file_type().is_file()

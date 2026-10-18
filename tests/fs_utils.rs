@@ -48,6 +48,45 @@ fn collect_images_respects_recursive_flag() {
 }
 
 #[test]
+fn collect_images_skips_reserved_dirs_recursively() {
+    let tmp = tempdir().unwrap();
+    let root = tmp.path();
+    fs::write(root.join("keep.png"), []).unwrap();
+    for reserved in [TRASH_DIR, ORIGINALS_DIR, TEMP_DIR] {
+        let dir = root.join(reserved);
+        fs::create_dir(&dir).unwrap();
+        fs::write(dir.join("hidden.png"), []).unwrap();
+    }
+    // A non-reserved dir containing a nested reserved dir
+    let nested = root.join("sub").join(TRASH_DIR);
+    fs::create_dir_all(&nested).unwrap();
+    fs::write(nested.join("deep.png"), []).unwrap();
+
+    let files = collect_images(&[root.to_path_buf()], true).unwrap();
+    assert_eq!(files, vec![root.join("keep.png")]);
+}
+
+#[test]
+fn collect_images_scans_reserved_dir_when_listed_as_source() {
+    let tmp = tempdir().unwrap();
+    let root = tmp.path();
+    let trash = root.join(TRASH_DIR);
+    fs::create_dir(&trash).unwrap();
+    fs::write(trash.join("trashed.png"), []).unwrap();
+    let sub = trash.join("sub");
+    fs::create_dir(&sub).unwrap();
+    fs::write(sub.join("deep.png"), []).unwrap();
+
+    let mut nonrec = collect_images(&[trash.clone()], false).unwrap();
+    nonrec.sort();
+    assert_eq!(nonrec, vec![trash.join("trashed.png")]);
+
+    let mut rec = collect_images(&[trash.clone()], true).unwrap();
+    rec.sort();
+    assert_eq!(rec, vec![sub.join("deep.png"), trash.join("trashed.png")]);
+}
+
+#[test]
 fn collect_images_errors_for_missing_directory() {
     let missing = Path::new("/does/not/exist");
     let err = collect_images(&[missing.to_path_buf()], false).unwrap_err();
