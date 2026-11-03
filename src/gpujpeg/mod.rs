@@ -215,8 +215,9 @@ impl GpuJpeg {
     }
 
     /// Resize-to-fit on GPU into an RGBA-word buffer that stays
-    /// device-resident — for feeding [`encode_jpeg_buf`] or further
-    /// GPU passes without a host roundtrip.
+    /// device-resident — for feeding further GPU passes without a host
+    /// roundtrip. The resample may still be in flight; queue ordering
+    /// makes dependent submissions observe it complete.
     pub fn resize_to_buffer(&self, max_w: u32, max_h: u32) -> Option<(wgpu::Buffer, u32, u32)> {
         let _active = GpuActive::enter()?;
         let (ow, oh) = fit_dims(self.width, self.height, max_w, max_h);
@@ -232,64 +233,104 @@ impl GpuJpeg {
         Some((buf, ow, oh))
     }
 
-    /// Baseline-encode a JPEG of `self` at `quality` (1-100, 4:2:0 or
-    /// gray) entirely on the GPU. Returns JFIF bytes.
+    /// Baseline-encode a JPEG of `self` at `quality` (1-100, 4:2:0)
+    /// entirely on the GPU. Returns JFIF bytes.
     pub fn encode_jpeg(&self, quality: i32) -> Option<Vec<u8>> {
+        self.encode_jpeg_start(quality)?
+            .finish()
+            .map(|(j, _, _)| j)
+    }
+
+    /// Full-res encode chain — same lazy model as
+    /// [`encode_resized_start`].
+    pub fn encode_jpeg_start(&self, quality: i32) -> Option<EncodeJob> {
         let _active = GpuActive::enter()?;
         let ctx = gpu::ctx()?;
-        let px = self.px.as_ref()?;
-        let (seg_buf, tab) = ctx.encode_into(px, self.width, self.height, false, quality);
-        let mx = self.width.div_ceil(16);
-        let my = self.height.div_ceil(16);
-        let raw = ctx.read_buf(&seg_buf, enc_buf_len(self.width, self.height, false));
-        Some(jenc::assemble_jpeg(
-            &raw,
+        let p = ctx.encode_chain(
+            self.px.as_ref()?,
             self.width,
             self.height,
-            mx,
-            my,
-            false,
-            &tab,
-        ))
+            self.width,
+            self.height,
+            FILTER_LANCZOS,
+            quality,
+        );
+        Some(EncodeJob {
+            p,
+            w: self.width,
+            h: self.height,
+        })
+    }
+
+    /// Resize-to-fit + JPEG-encode submitted as ONE GPU chain (resize,
+    /// encode, readback-copy ride a single submission). No wait happens
+    /// here — [`EncodeJob::finish`] resolves the readback. Submit
+    /// several jobs back-to-back and finish them later for genuine
+    /// multi-image pipelining: a later finish also implies earlier
+    /// jobs are done (in-order queue).
+    pub fn encode_resized_start(
+        &self,
+        max_w: u32,
+        max_h: u32,
+        quality: i32,
+    ) -> Option<EncodeJob> {
+        let _active = GpuActive::enter()?;
+        let (ow, oh) = fit_dims(self.width, self.height, max_w, max_h);
+        let ctx = gpu::ctx()?;
+        let p = ctx.encode_chain(
+            self.px.as_ref()?,
+            self.width,
+            self.height,
+            ow,
+            oh,
+            FILTER_LANCZOS,
+            quality,
+        );
+        Some(EncodeJob { p, w: ow, h: oh })
     }
 
     /// Resize-to-fit + JPEG-encode, all on GPU: decode, resample and
     /// entropy-encode never bring pixels to the host — only the JPEG
-    /// bytes and (via [`resize_to_buffer`]) nothing else cross back.
-    /// Returns (jpeg, w, h).
+    /// bytes cross back. Returns (jpeg, w, h).
     pub fn encode_resized(
         &self,
         max_w: u32,
         max_h: u32,
         quality: i32,
     ) -> Option<(Vec<u8>, u32, u32)> {
+        self.encode_resized_start(max_w, max_h, quality)?.finish()
+    }
+}
+
+/// A submitted encode chain — resolves to (jpeg, w, h) on `finish`.
+/// Cheap to hold: the GPU keeps working meanwhile, and other jobs can
+/// be submitted behind it before this one is finished.
+pub struct EncodeJob {
+    p: gpu::EncodePending,
+    w: u32,
+    h: u32,
+}
+
+impl EncodeJob {
+    /// Wait for this job's chain (covering all earlier queue work) and
+    /// assemble the JFIF. Returns (jpeg_bytes, w, h).
+    pub fn finish(self) -> Option<(Vec<u8>, u32, u32)> {
         let _active = GpuActive::enter()?;
         let ctx = gpu::ctx()?;
-        let (buf, ow, oh) = self.resize_to_buffer(max_w, max_h)?;
-        let (seg_buf, tab) = ctx.encode_into(&buf, ow, oh, false, quality);
-        let (mx, my) = (ow.div_ceil(16), oh.div_ceil(16));
-        let raw = ctx.read_buf(&seg_buf, enc_buf_len(ow, oh, false));
+        let raw = ctx.map_wait(self.p.staging.as_ref()?, self.p.len, self.p.idx.clone());
+        if raw.is_empty() {
+            return None;
+        }
         Some((
-            jenc::assemble_jpeg(&raw, ow, oh, mx, my, false, &tab),
-            ow,
-            oh,
+            jenc::assemble_jpeg(&raw, self.w, self.h, self.p.mx, self.p.my, false, &self.p.tab),
+            self.w,
+            self.h,
         ))
     }
 }
 
-/// Byte size of the raw encoder output buffer for an `w`x`h` image.
-fn enc_buf_len(w: u32, h: u32, gray: bool) -> u64 {
-    let (mx, my) = if gray {
-        (w.div_ceil(8), h.div_ceil(8))
-    } else {
-        (w.div_ceil(16), h.div_ceil(16))
-    };
-    let total = u64::from((mx * my).max(1));
-    total * 4 + total * 4 * u64::from(jenc::SEG_WORDS)
-}
-
-/// One-shot JPEG encode of CPU-side RGBA bytes (0xAABBGGRR or packed
-/// R,G,B,A per pixel). Uploads, encodes on GPU, returns JFIF bytes.
+/// One-shot JPEG encode of CPU-side RGBA bytes (packed R,G,B,A per
+/// pixel). Uploads, encodes on GPU, returns JFIF bytes.
 pub fn encode_rgba(rgba: &[u8], w: u32, h: u32, quality: i32) -> Option<Vec<u8>> {
     let _active = GpuActive::enter()?;
     if disabled() || w == 0 || h == 0 || rgba.len() != (w as usize) * (h as usize) * 4 {
@@ -297,8 +338,10 @@ pub fn encode_rgba(rgba: &[u8], w: u32, h: u32, quality: i32) -> Option<Vec<u8>>
     }
     let ctx = gpu::ctx()?;
     let src = ctx.upload_rgba(rgba, w, h);
-    let (seg_buf, tab) = ctx.encode_into(&src, w, h, false, quality);
-    let (mx, my) = (w.div_ceil(16), h.div_ceil(16));
-    let raw = ctx.read_buf(&seg_buf, enc_buf_len(w, h, false));
-    Some(jenc::assemble_jpeg(&raw, w, h, mx, my, false, &tab))
+    let p = ctx.encode_chain(&src, w, h, w, h, FILTER_LANCZOS, quality);
+    let raw = ctx.map_wait(p.staging.as_ref()?, p.len, p.idx.clone());
+    if raw.is_empty() {
+        return None;
+    }
+    Some(jenc::assemble_jpeg(&raw, w, h, p.mx, p.my, false, &p.tab))
 }

@@ -20,7 +20,63 @@ fn main() -> Result<()> {
     match cli.command {
         Commands::Crop(args) => run_crop(args),
         Commands::Album(args) => run_album(args),
+        Commands::GpuCheck => run_gpucheck(),
     }
+}
+
+/// `gpucheck`: exercise every GPU path on synthetic input and report what
+/// actually works on this machine — the presence of `gpujpeg::available()`
+/// alone doesn't prove decode/resize/encode all succeed.
+fn run_gpucheck() -> Result<()> {
+    use imagecropper::gpujpeg;
+    println!("gpujpeg capabilities:");
+    println!(
+        "  IC_NO_GPUJPEG:      {}",
+        if std::env::var("IC_NO_GPUJPEG").is_ok() {
+            "set (GPU disabled)"
+        } else {
+            "unset"
+        }
+    );
+    let avail = gpujpeg::available();
+    println!("  wgpu adapter:       {}", if avail { "found (IMMEDIATES ok)" } else { "NOT FOUND — all GPU paths fall back to CPU" });
+    if !avail {
+        return Ok(());
+    }
+
+    // A small synthetic JPEG through the normal encoder (typically DRI=0 —
+    // exactly the class the survey/virtual-interval path must handle).
+    let img = image::DynamicImage::ImageRgb8(image::RgbImage::from_fn(64, 48, |x, y| {
+        image::Rgb([(x * 4) as u8, (y * 4) as u8, 128])
+    }));
+    let mut jpeg = Vec::new();
+    img.write_to(
+        &mut std::io::Cursor::new(&mut jpeg),
+        image::ImageFormat::Jpeg,
+    )?;
+
+    match gpujpeg::probe(&jpeg) {
+        Some((w, h, dri)) => println!("  probe test jpeg:    {w}x{h} dri={dri}"),
+        None => println!("  probe test jpeg:    unsupported format"),
+    }
+    match gpujpeg::decode_rgba(&jpeg) {
+        Some((rgba, w, h)) => println!("  GPU decode:         ok ({w}x{h}, {} bytes)", rgba.len()),
+        None => println!("  GPU decode:         FAILS → CPU fallback"),
+    }
+    match gpujpeg::open(&jpeg).and_then(|s| s.resize_rgb(32, 24)) {
+        Some((rgb, w, h)) => println!("  GPU decode+resize:  ok ({w}x{h}, {} bytes)", rgb.len()),
+        None => println!("  GPU decode+resize:  FAILS → CPU fallback"),
+    }
+    let rgba = vec![0x80u8; 32 * 32 * 4];
+    match gpujpeg::encode_rgba(&rgba, 32, 32, 80) {
+        Some(j) => {
+            // Round-trip check: the GPU-encoded bytes must decode again.
+            let ok = image::load_from_memory(&j).is_ok();
+            println!("  GPU jpeg encode:    ok ({} bytes, decodes: {ok})", j.len());
+        }
+        None => println!("  GPU jpeg encode:    unavailable"),
+    }
+    Ok(())
 }
 
 fn fullscreen_window() -> eframe::NativeOptions {

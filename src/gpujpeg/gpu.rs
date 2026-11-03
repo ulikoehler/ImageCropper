@@ -272,7 +272,7 @@ impl GpuCtx {
         let scan_buf = buf(
             dev,
             j.data.len().div_ceil(4) as u64 * 4,
-            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
         );
         {
             let mut file_bytes = j.data.to_vec();
@@ -335,13 +335,13 @@ impl GpuCtx {
         let iv_buf = buf(
             dev,
             (ck_all.len() * 4) as u64,
-            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
         );
         q.write_buffer(&iv_buf, 0, &u32_bytes(&ck_all));
         let st_buf = buf(
             dev,
             (total_slots * 12 * 4) as u64,
-            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
         );
         // preload surveyed states into each interval's own slot
         {
@@ -361,7 +361,7 @@ impl GpuCtx {
         let tab_buf = buf(
             dev,
             ((n_scans as usize + 1) * super::jpeg::TAB_WORDS * 4) as u64,
-            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
         );
         {
             let mut words = Vec::with_capacity((n_scans as usize + 1) * super::jpeg::TAB_WORDS);
@@ -383,7 +383,7 @@ impl GpuCtx {
         let flut_buf = buf(
             dev,
             (n_scans as usize * super::jpeg::FLUT_WORDS * 4) as u64,
-            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
         );
         {
             let mut all = Vec::with_capacity(n_scans as usize * super::jpeg::FLUT_WORDS);
@@ -498,7 +498,6 @@ impl GpuCtx {
         // 1) entropy decode: scan generations grouped by MCU budget
         let coef_len = (fg.total_blocks as u64) * 32 * 4;
         let mut first = true;
-        let mut last_idx = None;
         for &(j0, j1) in &submits {
             // AC-refine surveys run between submits: the host reads the
             // coef buffer only after all prior scans' dispatches land.
@@ -510,7 +509,9 @@ impl GpuCtx {
                         // coef buffer not yet filled — survey on zeros
                         survey_scan(j, &mut sc0, &NoCoef, fg)
                     } else {
-                        self.wait_sub(last_idx.unwrap());
+                        // read_buf waits on its own copy submission —
+                        // in-order queue ⇒ the entropy submits are
+                        // covered by that wait too.
                         let bytes = self.read_buf(&coef_buf, coef_len);
                         let words: Vec<u32> = bytes
                             .chunks_exact(4)
@@ -577,9 +578,8 @@ impl GpuCtx {
                     cp.dispatch_workgroups(n_iv.div_ceil(32), 1, 1);
                 }
             }
-            last_idx = Some(q.submit([enc.finish()]));
+            q.submit([enc.finish()]);
         }
-        self.wait_sub(last_idx.unwrap());
         // 2) + 3) reconstruction and upsample in one submit. Upsample
         // applies EXIF orientation: pc.w/h are the ORIENTED output dims
         // (swapped for orient 5-8); uW/uH stay the source plane dims.
@@ -612,8 +612,10 @@ impl GpuCtx {
             cp.set_immediates(0, &pc_bytes(&pc8));
             cp.dispatch_workgroups(ow.div_ceil(16), oh.div_ceil(16), 1);
         }
-        let idx = q.submit([enc.finish()]);
-        self.wait_sub(idx);
+        // No wait: the returned buffer may still be filling. Queue
+        // ordering guarantees later submissions (resize/encode) and
+        // host readbacks (read_buf) observe the finished decode.
+        q.submit([enc.finish()]);
         j.scans = scans;
         out_buf
     }
@@ -670,7 +672,7 @@ impl GpuCtx {
                 let bb = buf(
                     dev,
                     (b.len() * 4) as u64,
-                    wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                    wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
                 );
                 self.queue.write_buffer(&bb, 0, &i32_bytes(b));
                 bb
@@ -761,12 +763,11 @@ impl GpuCtx {
         Some(out)
     }
 
-    /// GPU-resident variant of [`resize_pack`]: runs the same separable
-    /// resample passes but returns the RGBA-word buffer instead of a
-    /// readback — for feeding the encoder or further GPU work.
-    /// Identity case returns a copy of `px` (encoder needs its own out).
-    pub fn resize_to_buffer(
+    /// Record the separable resample passes into `enc` (no submit).
+    /// Returns the RGBA-word output buffer; identity records a copy.
+    fn record_resize(
         &self,
+        enc: &mut wgpu::CommandEncoder,
         px: &wgpu::Buffer,
         in_w: u32,
         in_h: u32,
@@ -778,92 +779,98 @@ impl GpuCtx {
         let out_rgba = buf(
             dev,
             u64::from(out_w) * u64::from(out_h) * 4,
-            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
         );
-        let mut enc = dev.create_command_encoder(&Default::default());
         if out_w == in_w && out_h == in_h {
             enc.copy_buffer_to_buffer(px, 0, &out_rgba, 0, out_rgba.size());
-        } else {
-            let ax = coeffs::axis_coeffs(in_w as i32, out_w as i32, filter);
-            let ay = coeffs::axis_coeffs(in_h as i32, out_h as i32, filter);
-            let bnd_buf = |b: &[i32]| {
-                let bb = buf(
-                    dev,
-                    (b.len() * 4) as u64,
-                    wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-                );
-                self.queue.write_buffer(&bb, 0, &i32_bytes(b));
-                bb
-            };
-            let (bnd_x, cf_x) = (bnd_buf(&ax.bounds), bnd_buf(&ax.coefs));
-            let (bnd_y, cf_y) = (bnd_buf(&ay.bounds), bnd_buf(&ay.coefs));
-            let tmp_buf = buf(
-                dev,
-                u64::from(out_w) * u64::from(in_h) * 4,
-                wgpu::BufferUsages::STORAGE,
-            );
-            let resample_pass = |enc: &mut wgpu::CommandEncoder,
-                                 inp: &wgpu::Buffer,
-                                 bnd: &wgpu::Buffer,
-                                 cf: &wgpu::Buffer,
-                                 outp: &wgpu::Buffer,
-                                 pc: [u32; 6],
-                                 dx: u32,
-                                 dy: u32| {
-                let bg = dev.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: None,
-                    layout: &self.r_bgl,
-                    entries: &[
-                        bg_entry(0, inp),
-                        bg_entry(1, bnd),
-                        bg_entry(2, cf),
-                        bg_entry(3, outp),
-                    ],
-                });
-                let mut cp = enc.begin_compute_pass(&Default::default());
-                cp.set_pipeline(&self.p_resample);
-                cp.set_bind_group(0, &bg, &[]);
-                cp.set_immediates(0, &pc_bytes(&pc));
-                cp.dispatch_workgroups(dx.div_ceil(8), dy.div_ceil(8), 1);
-            };
-            resample_pass(
-                &mut enc,
-                px,
-                &bnd_x,
-                &cf_x,
-                &tmp_buf,
-                [in_w, in_h, out_w, in_h, ax.ksize as u32, 0],
-                out_w,
-                in_h,
-            );
-            resample_pass(
-                &mut enc,
-                &tmp_buf,
-                &bnd_y,
-                &cf_y,
-                &out_rgba,
-                [out_w, in_h, out_w, out_h, ay.ksize as u32, 1],
-                out_w,
-                out_h,
-            );
+            return out_rgba;
         }
-        let idx = self.queue.submit([enc.finish()]);
-        self.wait_sub(idx);
+        let ax = coeffs::axis_coeffs(in_w as i32, out_w as i32, filter);
+        let ay = coeffs::axis_coeffs(in_h as i32, out_h as i32, filter);
+        let bnd_buf = |b: &[i32]| {
+            let bb = buf(
+                dev,
+                (b.len() * 4) as u64,
+                wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
+            );
+            self.queue.write_buffer(&bb, 0, &i32_bytes(b));
+            bb
+        };
+        let (bnd_x, cf_x) = (bnd_buf(&ax.bounds), bnd_buf(&ax.coefs));
+        let (bnd_y, cf_y) = (bnd_buf(&ay.bounds), bnd_buf(&ay.coefs));
+        let tmp_buf = buf(
+            dev,
+            u64::from(out_w) * u64::from(in_h) * 4,
+            wgpu::BufferUsages::STORAGE,
+        );
+        let resample_pass = |enc: &mut wgpu::CommandEncoder,
+                             inp: &wgpu::Buffer,
+                             bnd: &wgpu::Buffer,
+                             cf: &wgpu::Buffer,
+                             outp: &wgpu::Buffer,
+                             pc: [u32; 6],
+                             dx: u32,
+                             dy: u32| {
+            let bg = dev.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &self.r_bgl,
+                entries: &[
+                    bg_entry(0, inp),
+                    bg_entry(1, bnd),
+                    bg_entry(2, cf),
+                    bg_entry(3, outp),
+                ],
+            });
+            let mut cp = enc.begin_compute_pass(&Default::default());
+            cp.set_pipeline(&self.p_resample);
+            cp.set_bind_group(0, &bg, &[]);
+            cp.set_immediates(0, &pc_bytes(&pc));
+            cp.dispatch_workgroups(dx.div_ceil(8), dy.div_ceil(8), 1);
+        };
+        resample_pass(
+            enc, px, &bnd_x, &cf_x, &tmp_buf,
+            [in_w, in_h, out_w, in_h, ax.ksize as u32, 0], out_w, in_h,
+        );
+        resample_pass(
+            enc, &tmp_buf, &bnd_y, &cf_y, &out_rgba,
+            [out_w, in_h, out_w, out_h, ay.ksize as u32, 1], out_w, out_h,
+        );
         out_rgba
     }
 
-    /// Baseline JPEG encode of an RGBA-word buffer (0xAABBGGRR) entirely
-    /// on the GPU: one workgroup per MCU, restart-parallel (DRI=1).
-    /// Returns the raw encoder buffer (u32 sizes then per-MCU segments);
-    /// [`super::jenc::assemble_jpeg`] wraps it into a JFIF.
-    pub fn encode_into(
+    /// GPU-resident variant of [`resize_pack`]: records the resample in
+    /// its own submission and returns the RGBA-word buffer immediately —
+    /// it may still be filling; queue ordering makes any later GPU
+    /// submission (or [`read_buf`]) see it complete.
+    pub fn resize_to_buffer(
         &self,
+        px: &wgpu::Buffer,
+        in_w: u32,
+        in_h: u32,
+        out_w: u32,
+        out_h: u32,
+        filter: i32,
+    ) -> wgpu::Buffer {
+        let mut enc = self.device.create_command_encoder(&Default::default());
+        let out = self.record_resize(&mut enc, px, in_w, in_h, out_w, out_h, filter);
+        self.queue.submit([enc.finish()]);
+        out
+    }
+
+    /// Record the baseline-encode dispatch into `enc` (no submit): one
+    /// workgroup per MCU, restart-parallel (DRI=1). Returns the raw
+    /// encoder buffer (u32 sizes then per-MCU segments), packed tables
+    /// and the MCU grid — everything [`super::jenc::assemble_jpeg`]
+    /// needs later.
+    fn record_encode(
+        &self,
+        enc: &mut wgpu::CommandEncoder,
         src: &wgpu::Buffer,
         w: u32,
         h: u32,
         gray: bool,
         quality: i32,
-    ) -> (wgpu::Buffer, Vec<u32>) {
+    ) -> (wgpu::Buffer, Vec<u32>, u32, u32) {
         let dev = &self.device;
         let (mx, my) = if gray {
             (w.div_ceil(8), h.div_ceil(8))
@@ -880,19 +887,14 @@ impl GpuCtx {
         let tab_buf = buf(
             dev,
             (tab.len() * 4) as u64,
-            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
         );
         self.queue.write_buffer(&tab_buf, 0, &u32_bytes(&tab));
         let bg = dev.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
             layout: &self.e_bgl,
-            entries: &[
-                bg_entry(0, src),
-                bg_entry(1, &out_buf),
-                bg_entry(2, &tab_buf),
-            ],
+            entries: &[bg_entry(0, src), bg_entry(1, &out_buf), bg_entry(2, &tab_buf)],
         });
-        let mut enc = dev.create_command_encoder(&Default::default());
         {
             let mut cp = enc.begin_compute_pass(&Default::default());
             cp.set_pipeline(&self.p_encode);
@@ -903,21 +905,99 @@ impl GpuCtx {
             );
             cp.dispatch_workgroups(total.div_ceil(64), 1, 1);
         }
+        (out_buf, tab, mx, my)
+    }
+
+    /// Record resize→encode→readback-copy in ONE submission: the whole
+    /// chain runs on the GPU with zero intermediate waits. [`map_wait`]
+    /// resolves the staging buffer once the chain's index completes.
+    pub fn encode_chain(
+        &self,
+        px: &wgpu::Buffer,
+        in_w: u32,
+        in_h: u32,
+        out_w: u32,
+        out_h: u32,
+        filter: i32,
+        quality: i32,
+    ) -> EncodePending {
+        let dev = &self.device;
+        let mut enc = dev.create_command_encoder(&Default::default());
+        let rgba = self.record_resize(&mut enc, px, in_w, in_h, out_w, out_h, filter);
+        let (seg_buf, tab, mx, my) =
+            self.record_encode(&mut enc, &rgba, out_w, out_h, false, quality);
+        let len =
+            u64::from(mx * my) * 4 + u64::from(mx * my) * 4 * u64::from(super::jenc::SEG_WORDS);
+        let staging = buf(
+            dev,
+            len,
+            wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        );
+        enc.copy_buffer_to_buffer(&seg_buf, 0, &staging, 0, len);
         let idx = self.queue.submit([enc.finish()]);
+        EncodePending {
+            staging: Some(staging),
+            len,
+            mx,
+            my,
+            tab,
+            idx,
+        }
+    }
+
+    /// Map `staging` once `idx` completes and return its contents.
+    pub fn map_wait(&self, staging: &wgpu::Buffer, len: u64, idx: wgpu::SubmissionIndex) -> Vec<u8> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        staging
+            .slice(..len)
+            .map_async(wgpu::MapMode::Read, move |r| {
+                let _ = tx.send(r);
+            });
         self.wait_sub(idx);
-        (out_buf, tab)
+        let _ = rx.recv();
+        let out = staging
+            .slice(..len)
+            .get_mapped_range()
+            .map(|r| r.to_vec())
+            .unwrap_or_default();
+        staging.unmap();
+        out
     }
 
     /// Upload packed RGBA bytes (R,G,B,A per pixel) into an RGBA-word
-    /// storage buffer — the CPU-side entry point of [`encode_into`].
+    /// storage buffer — the CPU-side entry point of the encode chain.
     pub fn upload_rgba(&self, rgba: &[u8], w: u32, h: u32) -> wgpu::Buffer {
         let src = buf(
             &self.device,
             u64::from(w) * u64::from(h) * 4,
-            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
         );
         self.queue.write_buffer(&src, 0, rgba);
         src
+    }
+}
+
+/// An encode chain submitted but not yet read back: the staging buffer
+/// + its submission index — everything [`GpuCtx::map_wait`] and
+/// [`super::jenc::assemble_jpeg`] need to finish on the host.
+pub struct EncodePending {
+    pub staging: Option<wgpu::Buffer>,
+    pub len: u64,
+    pub mx: u32,
+    pub my: u32,
+    pub tab: Vec<u32>,
+    pub idx: wgpu::SubmissionIndex,
+}
+
+impl Drop for EncodePending {
+    fn drop(&mut self) {
+        if super::stopped() {
+            // Device teardown: a buffer release is a driver call —
+            // leak instead, same policy as GpuJpeg::drop.
+            if let Some(b) = self.staging.take() {
+                std::mem::forget(b);
+            }
+        }
     }
 }
 

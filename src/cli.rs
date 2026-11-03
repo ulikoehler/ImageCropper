@@ -57,6 +57,9 @@ pub enum Commands {
     Crop(CropArgs),
     /// Browse images as a space-filling album grid of previews
     Album(AlbumArgs),
+    /// Probe which image ops run on the GPU and which fall back to CPU
+    #[command(name = "gpucheck")]
+    GpuCheck,
 }
 
 /// Arguments shared by all subcommands: input paths, recursion, filters,
