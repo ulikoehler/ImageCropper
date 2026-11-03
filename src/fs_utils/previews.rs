@@ -171,6 +171,37 @@ fn persist_screen_jpeg(source: &Path, expected: &Path, screen: &DynamicImage, en
     persist_screen_bytes(source, expected, &jpeg, engine);
 }
 
+/// Submit the screen-size encode chain off the session's decoded
+/// buffer — returns the pending job + target path so the caller can
+/// overlap it with other GPU work before `finish`. The full-res
+/// pixels never round-trip through the host.
+fn screen_encode_start(
+    source: &Path,
+    session: &crate::gpujpeg::GpuJpeg,
+    sig: Option<(u64, u128)>,
+) -> Option<(PathBuf, crate::gpujpeg::EncodeJob)> {
+    let (len, nanos) = sig.or_else(|| source_signature(source))?;
+    let expected = screen_path_with_sig(source, len, nanos);
+    if expected.exists() {
+        return None;
+    }
+    let job = session.encode_resized_start(
+        SCREEN_MAX_DIM,
+        SCREEN_MAX_DIM,
+        PREVIEW_JPEG_QUALITY.into(),
+    )?;
+    Some((expected, job))
+}
+
+/// Resolve a [`screen_encode_start`] job and persist the JPEG.
+fn screen_encode_finish(job: Option<(PathBuf, crate::gpujpeg::EncodeJob)>, source: &Path) {
+    if let Some((expected, job)) = job {
+        if let Some((jpeg, _, _)) = job.finish() {
+            persist_screen_bytes(source, &expected, &jpeg, "gpu");
+        }
+    }
+}
+
 /// GPU-session variant of [`ensure_screen_preview`]: resizes straight
 /// off the session's decoded buffer — the full-res pixels never
 /// round-trip through the host.
@@ -179,20 +210,8 @@ fn ensure_screen_preview_gpu(
     session: &crate::gpujpeg::GpuJpeg,
     sig: Option<(u64, u128)>,
 ) {
-    let Some((len, nanos)) = sig.or_else(|| source_signature(source)) else {
-        return;
-    };
-    let expected = screen_path_with_sig(source, len, nanos);
-    if expected.exists() {
-        return;
-    }
-    // decode → resample → entropy-encode all on the GPU; only the
-    // finished JPEG bytes ever reach the host.
-    if let Some((jpeg, _, _)) =
-        session.encode_resized(SCREEN_MAX_DIM, SCREEN_MAX_DIM, PREVIEW_JPEG_QUALITY.into())
-    {
-        persist_screen_bytes(source, &expected, &jpeg, "gpu");
-    }
+    let pending = screen_encode_start(source, session, sig);
+    screen_encode_finish(pending, source);
 }
 
 /// Ensure a fullscreen-size preview exists in the global cache. `decoded`
@@ -401,11 +420,15 @@ pub fn produce_preview_bytes(
     let bytes = std::fs::read(path).ok()?;
     if let Some(session) = crate::gpujpeg::open(&bytes) {
         let (w, h) = (session.width, session.height);
-        ensure_screen_preview_gpu(path, &session, Some((len, nanos)));
-        // decode → resample → encode never leaves the GPU.
+        // Submit the (bigger) screen chain first, then the thumb chain:
+        // the thumb finish waits on a later submission index, which
+        // covers the screen job too — both run back-to-back on the GPU
+        // with a single effective wait.
+        let screen_job = screen_encode_start(path, &session, Some((len, nanos)));
         let (jpeg, _, _) =
             session.encode_resized(THUMB_MAX_DIM, THUMB_MAX_DIM, PREVIEW_JPEG_QUALITY.into())?;
         persist_preview_bytes(path, &expected_name, &jpeg);
+        screen_encode_finish(screen_job, path);
         if verbose() {
             eprintln!("preview generated [gpu]: {}", path.display());
         }

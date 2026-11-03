@@ -353,6 +353,34 @@ fn encode_decodes_with_libjpeg() {
     assert!(worst <= 16, "djpeg roundtrip max diff {worst}");
 }
 
+/// Deferred finish: submit several encode chains back-to-back, finish
+/// them afterwards — the pipelining pattern the preview pool uses.
+#[test]
+fn deferred_encode_jobs() {
+    if !gpujpeg::available() {
+        eprintln!("gpujpeg not compiled in — skipping");
+        return;
+    }
+    let Some(jpg) = cjpeg(&gradient_ppm(256, 192), &["-quality", "90"]) else {
+        eprintln!("cjpeg missing — skipping");
+        return;
+    };
+    let Some(s) = gpujpeg::open(&jpg) else {
+        panic!("session open failed");
+    };
+    let jobs: Vec<_> = [128u32, 64, 32]
+        .iter()
+        .map(|&d| s.encode_resized_start(d, d, 85).expect("start"))
+        .collect();
+    for (job, &d) in jobs.into_iter().zip([128u32, 64, 32].iter()) {
+        let (enc, w, h) = job.finish().expect("finish");
+        assert!(w <= d && h <= d);
+        let mut dec = zune_jpeg::JpegDecoder::new(std::io::Cursor::new(&enc));
+        let rgb = dec.decode().expect("zune decode");
+        assert_eq!(rgb.len(), (w * h) as usize * 3);
+    }
+}
+
 /// Arbitrary in-flight images: several threads decode+resize+encode
 /// concurrently — every result must be individually correct. This is
 /// the regression test for per-submission synchronization (no global
