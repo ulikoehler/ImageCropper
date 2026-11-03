@@ -62,10 +62,12 @@ struct Entry {
     /// Decoded fullscreen-size preview for hold-`f`.
     full_color: Option<egui::ColorImage>,
     failed: bool,
+    /// Byte size from the scan walker (0 when unknown).
+    bytes: u64,
 }
 
 impl Entry {
-    fn new(path: PathBuf) -> Self {
+    fn new(path: PathBuf, bytes: u64) -> Self {
         Self {
             path,
             aspect: 1.0,
@@ -73,6 +75,7 @@ impl Entry {
             texture: None,
             full_color: None,
             failed: false,
+            bytes,
         }
     }
 }
@@ -103,6 +106,9 @@ pub struct AlbumApp {
     entries: Vec<Entry>,
     positions: HashMap<PathBuf, usize>,
     thumbnailer: Thumbnailer,
+    /// Fraction of the panel width the justified grid occupies (w/W
+    /// shrinks/grows the viewer on screen; 1.0 = full width).
+    view_width: f32,
     deleter: Deleter,
     mover: Option<Mover>,
     selected: BTreeSet<usize>,
@@ -161,7 +167,7 @@ impl AlbumApp {
             None => (None, SortOrder::Filename, false),
         };
         Self {
-            entries: files.into_iter().map(Entry::new).collect(),
+            entries: files.into_iter().map(|p| Entry::new(p, 0)).collect(),
             positions: HashMap::new(),
             thumbnailer: Thumbnailer::new(parallel),
             deleter: Deleter::new(parallel),
@@ -170,6 +176,7 @@ impl AlbumApp {
             focus: 0,
             anchor: 0,
             base_height: 200.0,
+            view_width: 1.0,
             zoom: 1.0,
             status: "Ready".into(),
             dry_run: options.dry_run,
@@ -228,10 +235,10 @@ impl AlbumApp {
         if let Some(rx) = &self.scan_rx {
             loop {
                 match rx.try_recv() {
-                    Ok(ScanEvent::Found(p)) => {
-                        if !self.positions.contains_key(&p) {
-                            self.positions.insert(p.clone(), self.entries.len());
-                            self.entries.push(Entry::new(p));
+                    Ok(ScanEvent::Found { path, bytes }) => {
+                        if !self.positions.contains_key(&path) {
+                            self.positions.insert(path.clone(), self.entries.len());
+                            self.entries.push(Entry::new(path, bytes));
                         }
                     }
                     Ok(ScanEvent::Error(e)) => {
@@ -325,8 +332,11 @@ impl AlbumApp {
                 // resident (~8 MB each at 1920px).
                 while self.full_loaded.len() > 8 {
                     let p = self.full_loaded.pop_front().unwrap();
-                    let focused = self.entries.get(self.focus).map(|e| &e.path);
-                    if focused == Some(&p) {
+                    // Keep the focused and the currently displayed
+                    // (hold-`f` hover target) previews resident.
+                    let keep = self.entries.get(self.focus).map(|e| &e.path) == Some(&p)
+                        || self.fs_path.as_ref() == Some(&p);
+                    if keep {
                         self.full_loaded.push_back(p);
                         break;
                     }
@@ -598,7 +608,8 @@ impl AlbumApp {
             }
             Some(new_path) if new_path != origin => {
                 let aspect = self.entries[idx].aspect;
-                self.entries[idx] = Entry::new(new_path.clone());
+                let bytes = std::fs::metadata(&new_path).map(|m| m.len()).unwrap_or(0);
+                self.entries[idx] = Entry::new(new_path.clone(), bytes);
                 // Keep the old aspect as a first guess until the new
                 // thumbnail arrives so the layout doesn't jump.
                 self.entries[idx].aspect = aspect;
@@ -663,9 +674,13 @@ impl AlbumApp {
         egui::CentralPanel::default().show(ui, |ui| {
             let panel_rect = ui.max_rect();
             let width = ui.available_width();
+            // `w`/`W` restrict the viewer: the grid lays out inside
+            // `width * view_width` and renders centered with margins.
+            let layout_width = width * self.view_width;
+            let x_off = (width - layout_width) / 2.0;
             let row_height = (self.base_height * self.zoom).clamp(24.0, 2048.0);
             let aspects: Vec<f32> = self.entries.iter().map(|e| e.aspect).collect();
-            let layout = layout_justified(&aspects, width, row_height, TILE_GAP);
+            let layout = layout_justified(&aspects, layout_width, row_height, TILE_GAP);
 
             let keys = Self::read_keys(&ctx);
             let modifiers = ctx.input(|i| i.modifiers);
@@ -687,10 +702,10 @@ impl AlbumApp {
                 self.zoom = (self.zoom / ZOOM_STEP).clamp(0.1, 12.0);
             }
             if keys.width_increase {
-                self.base_height = (self.base_height * WIDTH_STEP).clamp(32.0, 1024.0);
+                self.view_width = (self.view_width * WIDTH_STEP).clamp(0.05, 1.0);
             }
             if keys.width_decrease {
-                self.base_height = (self.base_height / WIDTH_STEP).clamp(32.0, 1024.0);
+                self.view_width = (self.view_width / WIDTH_STEP).clamp(0.05, 1.0);
             }
 
             if keys.select_all {
@@ -744,21 +759,36 @@ impl AlbumApp {
                 }
             }
 
-            // Hold-`f`: fullscreen preview of the focused tile. Navigation
-            // still works while held — the overlay tracks the focus.
+            // Rubber-band drag selection. Pointer is sampled before the
+            // tiles run so `drag_active` also suppresses the stray click
+            // egui reports on the release frame.
+            let pointer = ctx.input(|i| i.pointer.clone());
+
+            // Hold-`f`: fullscreen loupe. It follows the tile under the
+            // mouse; when the pointer isn't over a tile the focus (the
+            // last used image) is shown instead.
             let show_fullscreen = keys.fullscreen && !self.entries.is_empty();
+            let fs_target = if show_fullscreen {
+                pointer
+                    .latest_pos()
+                    .and_then(|p| {
+                        self.painted
+                            .iter()
+                            .find(|(_, r)| r.contains(p))
+                            .map(|(i, _)| *i)
+                    })
+                    .unwrap_or(self.focus)
+                    .min(self.entries.len() - 1)
+            } else {
+                0
+            };
             if show_fullscreen {
-                if let Some(entry) = self.entries.get_mut(self.focus) {
+                if let Some(entry) = self.entries.get_mut(fs_target) {
                     if entry.full_color.is_none() {
                         self.thumbnailer.request_screen(entry.path.clone());
                     }
                 }
             }
-
-            // Rubber-band drag selection. Pointer is sampled before the
-            // tiles run so `drag_active` also suppresses the stray click
-            // egui reports on the release frame.
-            let pointer = ctx.input(|i| i.pointer.clone());
             if pointer.primary_pressed() {
                 // Only start a band inside the content area, not on the
                 // scrollbar strip.
@@ -802,10 +832,15 @@ impl AlbumApp {
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    let (response, painter) =
-                        ui.allocate_painter(layout.total_size, egui::Sense::hover());
+                    let (response, painter) = ui.allocate_painter(
+                        egui::vec2(width.max(layout.total_size.x), layout.total_size.y),
+                        egui::Sense::hover(),
+                    );
                     let origin = response.rect.min;
                     let clip = ui.clip_rect().translate(-origin.to_vec2());
+                    // Tiles shift right by x_off so a narrowed viewer
+                    // renders centered inside the panel.
+                    let off = origin.to_vec2() + egui::vec2(x_off, 0.0);
 
                     new_visible = Self::visible_range(&layout, clip);
                     self.last_visible = new_visible.clone();
@@ -813,7 +848,7 @@ impl AlbumApp {
                     if self.scroll_to_focus {
                         if let Some(tile) = layout.tiles.get(self.focus) {
                             ui.scroll_to_rect(
-                                tile.translate(origin.to_vec2()),
+                                tile.translate(off),
                                 Some(egui::Align::Center),
                             );
                         }
@@ -822,7 +857,7 @@ impl AlbumApp {
 
                     for i in new_visible.clone() {
                         let tile = layout.tiles[i];
-                        let rect = tile.translate(origin.to_vec2());
+                        let rect = tile.translate(off);
                         self.painted.push((i, rect));
 
                         let texture_id = {
@@ -986,10 +1021,10 @@ impl AlbumApp {
 
             if show_fullscreen {
                 // Upload the decoded fullscreen preview once, keep the
-                // texture for as long as the same file is focused.
+                // texture for as long as the same file is targeted.
                 if let Some(color) = self
                     .entries
-                    .get_mut(self.focus)
+                    .get_mut(fs_target)
                     .and_then(|e| e.full_color.take())
                 {
                     self.fs_tex = Some(ctx.load_texture(
@@ -997,12 +1032,12 @@ impl AlbumApp {
                         color,
                         egui::TextureOptions::LINEAR,
                     ));
-                    self.fs_path = self.entries.get(self.focus).map(|e| e.path.clone());
+                    self.fs_path = self.entries.get(fs_target).map(|e| e.path.clone());
                 }
                 painter.rect_filled(panel_rect, 0.0, Color32::BLACK);
                 let ready = self
                     .entries
-                    .get(self.focus)
+                    .get(fs_target)
                     .map(|e| self.fs_path.as_ref() == Some(&e.path) && self.fs_tex.is_some())
                     .unwrap_or(false);
                 if ready {
@@ -1067,7 +1102,7 @@ impl AlbumApp {
                 &ctx,
                 panel_rect.right_bottom() + egui::vec2(-12.0, -12.0),
                 Align2::RIGHT_BOTTOM,
-                "Click: Select | Ctrl+Click: Toggle | Shift+Click: Range | Space: Toggle | Arrows: Move | Shift+Arrows: Extend | Del: Trash | m: Move | f(hold): Fullscreen | c/2xClick: Crop | +/-: Zoom | w/W: Width | Esc: Clear/Quit".to_string(),
+                "Click: Select | Ctrl+Click: Toggle | Shift+Click: Range | Space: Toggle | Arrows: Move | Shift+Arrows: Extend | Del: Trash | m: Move | f(hold): Fullscreen | c/2xClick: Crop | +/-: Zoom | w/W: Viewer width | Esc: Clear/Quit".to_string(),
                 FontId::monospace(16.0),
                 Color32::from_gray(200),
             );
@@ -1093,7 +1128,17 @@ impl AlbumApp {
             line += &format!(" — {} scan error(s)", self.scan_errors);
         }
         if !self.selected.is_empty() {
-            line += &format!(" — {} selected", self.selected.len());
+            let bytes: u64 = self
+                .selected
+                .iter()
+                .filter_map(|&i| self.entries.get(i))
+                .map(|e| e.bytes)
+                .sum();
+            line += &format!(
+                " — {} selected ({})",
+                self.selected.len(),
+                format_size(bytes)
+            );
         }
         if !self.deleter.pending.is_empty() {
             line += &format!(" — deleting {}", self.deleter.pending.len());

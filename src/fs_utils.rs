@@ -131,8 +131,9 @@ fn normalize_filter_path(path: &Path) -> String {
 /// One event from a streaming directory scan.
 #[derive(Debug, Clone)]
 pub enum ScanEvent {
-    /// An image file matched — emitted the moment it is discovered.
-    Found(PathBuf),
+    /// An image file matched — emitted the moment it is discovered, with
+    /// its byte size (one metadata call inside the walker thread).
+    Found { path: PathBuf, bytes: u64 },
     /// Non-fatal problem (missing root, unreadable dir); the scan continues.
     Error(String),
 }
@@ -157,7 +158,11 @@ pub fn walk_images(
 
         if path.is_file() {
             if is_supported_image(path) && filter.is_none_or(|f| f.matches(path)) {
-                emit(ScanEvent::Found(path.to_path_buf()));
+                let bytes = path.metadata().map(|m| m.len()).unwrap_or(0);
+                emit(ScanEvent::Found {
+                    path: path.to_path_buf(),
+                    bytes,
+                });
             }
         } else if path.is_dir() {
             if recursive {
@@ -175,7 +180,11 @@ pub fn walk_images(
                         && is_supported_image(entry.path())
                         && filter.is_none_or(|f| f.matches(entry.path()))
                     {
-                        emit(ScanEvent::Found(entry.path().to_path_buf()));
+                        let bytes = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                        emit(ScanEvent::Found {
+                            path: entry.path().to_path_buf(),
+                            bytes,
+                        });
                     }
                 }
             } else {
@@ -191,7 +200,8 @@ pub fn walk_images(
                                 && is_supported_image(&p)
                                 && filter.is_none_or(|f| f.matches(&p))
                             {
-                                emit(ScanEvent::Found(p));
+                                let bytes = p.metadata().map(|m| m.len()).unwrap_or(0);
+                                emit(ScanEvent::Found { path: p, bytes });
                             }
                         }
                     }
@@ -230,7 +240,7 @@ pub fn collect_images_with_filter(
     let mut files = Vec::new();
     let mut error = None;
     walk_images(paths, recursive, filter, &mut |ev| match ev {
-        ScanEvent::Found(p) => files.push(p),
+        ScanEvent::Found { path, .. } => files.push(path),
         ScanEvent::Error(e) => {
             if error.is_none() {
                 error = Some(e);

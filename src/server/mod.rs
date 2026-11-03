@@ -103,14 +103,16 @@ impl ServerState {
     /// Queues previews and broadcasts a `manifest-patch` event so clients
     /// upsert differentially instead of re-pulling the manifest.
     /// Returns how many items were inserted or updated.
-    pub fn upsert_files(&self, paths: Vec<PathBuf>) -> usize {
+    /// `bytes` = walker-supplied size when known (`None` → sniffed here).
+    pub fn upsert_files(&self, files: Vec<(PathBuf, Option<u64>)>) -> usize {
         // Phase 1 (no lock): sniff per-file metadata — this is the I/O part
         // and must not block manifest readers.
-        let sniffed: Vec<(PathBuf, u32, u32, u64, u64)> = paths
+        let sniffed: Vec<(PathBuf, u32, u32, u64, u64)> = files
             .into_iter()
-            .map(|p| {
+            .map(|(p, known_bytes)| {
                 let (w, h) = image::image_dimensions(&p).unwrap_or((0, 0));
-                let bytes = std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
+                let bytes = known_bytes
+                    .unwrap_or_else(|| std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0));
                 let sig = crate::fs_utils::previews::preview_sig_u64(&p).unwrap_or(0);
                 (p, w, h, bytes, sig)
             })
@@ -293,7 +295,7 @@ impl ServerState {
                                 if new_path != &done.src {
                                     state.remove_ids(&[done.id]);
                                 }
-                                state.upsert_files(vec![new_path.clone()]);
+                                state.upsert_files(vec![(new_path.clone(), None)]);
                             }
                         }
                     }
@@ -345,11 +347,11 @@ pub fn spawn_scan_feeder(state: &Arc<ServerState>, stream: crate::cli::ScanStrea
         if crate::fs_utils::verbose() {
             eprintln!("scan: started");
         }
-        let mut batch: Vec<PathBuf> = Vec::new();
+        let mut batch: Vec<(PathBuf, Option<u64>)> = Vec::new();
         loop {
             let timed_out = match stream.rx.recv_timeout(FLUSH) {
-                Ok(ScanEvent::Found(p)) => {
-                    batch.push(p);
+                Ok(ScanEvent::Found { path, bytes }) => {
+                    batch.push((path, Some(bytes)));
                     false
                 }
                 Ok(ScanEvent::Error(e)) => {

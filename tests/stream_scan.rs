@@ -8,12 +8,12 @@ use std::fs;
 use std::path::PathBuf;
 use tempfile::tempdir;
 
-fn drain(rx: std::sync::mpsc::Receiver<ScanEvent>) -> (Vec<PathBuf>, Vec<String>) {
+fn drain(rx: std::sync::mpsc::Receiver<ScanEvent>) -> (Vec<(PathBuf, u64)>, Vec<String>) {
     let mut found = Vec::new();
     let mut errors = Vec::new();
     for ev in rx {
         match ev {
-            ScanEvent::Found(p) => found.push(p),
+            ScanEvent::Found { path, bytes } => found.push((path, bytes)),
             ScanEvent::Error(e) => errors.push(e),
         }
     }
@@ -45,9 +45,20 @@ fn stream_emits_all_supported_files() {
 
     let (found, errors) = drain(spawn_image_scan(vec![root.to_path_buf()], false, None));
     assert!(errors.is_empty());
-    let mut sorted = found.clone();
+    let mut sorted: Vec<PathBuf> = found.iter().map(|(p, _)| p.clone()).collect();
     sorted.sort();
     assert_eq!(sorted, vec![root.join("a.jpg"), root.join("b.png")]);
+}
+
+#[test]
+fn stream_found_carries_byte_size() {
+    let tmp = tempdir().unwrap();
+    let root = tmp.path();
+    fs::write(root.join("sized.png"), [0u8; 123]).unwrap();
+
+    let (found, errors) = drain(spawn_image_scan(vec![root.to_path_buf()], false, None));
+    assert!(errors.is_empty());
+    assert_eq!(found, vec![(root.join("sized.png"), 123)]);
 }
 
 #[test]
@@ -71,7 +82,8 @@ fn stream_respects_filters() {
         PathFilter::compile(FilterSyntax::Glob, &["**/keep.png".to_string()], &[]).unwrap();
     let (found, errors) = drain(spawn_image_scan(vec![root.to_path_buf()], false, filter));
     assert!(errors.is_empty());
-    assert_eq!(found, vec![root.join("keep.png")]);
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].0, root.join("keep.png"));
 }
 
 #[test]
@@ -88,7 +100,8 @@ fn stream_recurses_and_skips_reserved() {
     .unwrap();
 
     let (found, _) = drain(spawn_image_scan(vec![root.to_path_buf()], true, None));
-    assert_eq!(found, vec![root.join("sub/deep.png")]);
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].0, root.join("sub/deep.png"));
 }
 
 #[test]
@@ -103,5 +116,6 @@ fn scan_stream_carries_order_settings() {
     assert_eq!(stream.order, SortOrder::Filename);
     let (found, errors) = drain(stream.rx);
     assert!(errors.is_empty());
-    assert_eq!(found, vec![root.join("x.png")]);
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].0, root.join("x.png"));
 }

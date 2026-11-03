@@ -158,8 +158,13 @@ function onData(f){
 
 // ---- justified layout (same math as the native album) ----
 let rows=[];
+// `w`/`W` restrict the viewer: the grid lays out inside
+// canvas.width*viewW and renders centered with margins.
+let viewW=1.0;
+const viewWpx=()=>canvas.width*viewW;
+const xOff=()=>(canvas.width-viewWpx())/2;
 function layout(){
-  rows=[]; const W=canvas.width;
+  rows=[]; const W=viewWpx();
   const target=tileH*zoom;
   let cur=[], curW=0;
   for(let i=0;i<items.length;i++){
@@ -173,7 +178,7 @@ function layout(){
 }
 function rowY(ri){let y=0;for(let r=0;r<ri;r++)y+=rowH(rows[r]);return y}
 function rowH(row){
-  const target=tileH*zoom, W=canvas.width;
+  const target=tileH*zoom, W=viewWpx();
   if(row.last)return Math.min(target,W/row.ids.reduce((s,i)=>s+aspect(i),0));
   return target*(W/row.w)/1||0;
 }
@@ -183,8 +188,8 @@ function tileRects(){
   const out=[];
   let y=0;
   for(const row of rows){
-    const h=rowH(row); let x=0;
-    const scale=row.last?h/(tileH*zoom):canvas.width/row.w;
+    const h=rowH(row); let x=xOff();
+    const scale=row.last?h/(tileH*zoom):viewWpx()/row.w;
     for(const i of row.ids){
       const w=aspect(i)*tileH*zoom*scale;
       out.push({i,x,y,w,h});x+=w;
@@ -221,6 +226,20 @@ const tileNearest=(x,y)=>{
 
 // ---- hold-`f` fullscreen preview (1920-class JPEG from /bulk) ----
 let fHeld=false, screenBmp=null, screenIdx=-1;
+// Last mouse position in client coords (-1 = outside). The hold-`f`
+// loupe uses the tile under it, falling back to `focus` when the
+// pointer isn't over the grid.
+let mouseX=-1, mouseY=-1;
+const fsIdx=()=>{
+  const t=tileAt(mouseX*devicePixelRatio,mouseY*devicePixelRatio+scrollY);
+  return t>=0?t:focus;
+};
+const formatSize=b=>{
+  const u=["B","KB","MB","GB","TB"];let i=0,v=b;
+  while(v>=1024&&i<u.length-1){v/=1024;i++}
+  return i?`${v.toFixed(1)} ${u[i]}`:`${v} ${u[i]}`;
+};
+const selBytes=()=>{let s=0;for(const i of selected)s+=(items[i]&&items[i].bytes)||0;return s};
 const screenFetching=new Set();
 async function fetchScreen(i){
   const it=items[i];
@@ -248,13 +267,13 @@ function draw(){
 
   if(fHeld){
     ctx.fillStyle="#000";ctx.fillRect(0,0,W,H);
-    const it=items[focus];
-    if(screenIdx===focus&&screenBmp){
+    const fi=fsIdx(),it=items[fi];
+    if(screenIdx===fi&&screenBmp){
       const s=Math.min(W/screenBmp.width,H/screenBmp.height),
             w=screenBmp.width*s,h=screenBmp.height*s;
       ctx.drawImage(screenBmp,(W-w)/2,(H-h)/2,w,h);
     }else{
-      if(it&&!it.removed)fetchScreen(focus);
+      if(it&&!it.removed)fetchScreen(fi);
       ctx.fillStyle="#888";ctx.font=`${16*devicePixelRatio}px monospace`;
       ctx.fillText("loading fullscreen preview…",W/2-160*devicePixelRatio,H/2);
     }
@@ -285,7 +304,8 @@ function draw(){
     want.forEach((id,i)=>v.setUint32(2+4*i,id,true));
     dataWs.send(frame(CL_WANT,0,b));
   }
-  topEl.textContent=`${items.length} images · ${thumbs.size} cached · ${selected.size} selected${scanning?" · scanning…":""}`;
+  topEl.textContent=`${items.length} images · ${thumbs.size} cached · ${selected.size} selected`+
+    `${selected.size?` (${formatSize(selBytes())})`:""}${scanning?" · scanning…":""}`;
 }
 
 let dataWs=null;
@@ -297,7 +317,7 @@ addEventListener("keydown",e=>{
   const cols=()=>Math.max(1,Math.floor(canvas.width/(tileH*zoom)));
   if(e.key==="+"||e.key==="="){zoom*=1.1;layout();draw()}
   else if(e.key==="-"){zoom/=1.1;layout();draw()}
-  else if(e.key==="w"){tileH*=e.shiftKey?1.25:0.8;layout();draw()}
+  else if(e.key.toLowerCase()==="w"&&!e.ctrlKey&&!e.metaKey){viewW=e.shiftKey?Math.min(1,viewW*1.25):Math.max(0.05,viewW/1.25);layout();draw()}
   else if(e.key==="Delete"){
     const at=selected.size?Math.min(...selected):focus;
     for(const i of selected){
@@ -330,7 +350,7 @@ addEventListener("keydown",e=>{
     draw();
   }
   else if((e.key==="f"||e.key==="F")&&!e.ctrlKey&&!e.metaKey){
-    fHeld=true;if(screenIdx!==focus)fetchScreen(focus);draw();
+    fHeld=true;const i=fsIdx();if(screenIdx!==i)fetchScreen(i);draw();
   }
   else if(e.key==="c"||e.key==="Escape"){}
   else if(e.key.startsWith("Arrow")){
@@ -361,6 +381,8 @@ canvas.addEventListener("mousedown",e=>{
   e.preventDefault();
 });
 addEventListener("mousemove",e=>{
+  mouseX=e.clientX;mouseY=e.clientY;
+  if(fHeld){draw();return}
   if(!drag)return;
   const x=e.clientX*devicePixelRatio,y=e.clientY*devicePixelRatio+scrollY;
   const dx=x-drag.x0,dy=y-drag.y0;
@@ -395,6 +417,7 @@ addEventListener("mouseup",e=>{
   if(drag&&drag.rect)suppressClick=true;
   drag=null;draw();
 });
+document.addEventListener("mouseleave",()=>{mouseX=mouseY=-1;if(fHeld)draw()});
 canvas.addEventListener("click",e=>{
   if(suppressClick){suppressClick=false;return}
   const mx=e.clientX*devicePixelRatio,my=e.clientY*devicePixelRatio+scrollY;

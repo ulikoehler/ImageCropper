@@ -46,7 +46,7 @@ fn upsert_and_remove_broadcast_to_all_subscribers() {
     let mut rx2 = state.events.subscribe();
 
     // Upsert: both subscribers get the identical patch, id 0.
-    state.upsert_files(vec![root.join("a.png")]);
+    state.upsert_files(vec![(root.join("a.png"), None)]);
     for rx in [&mut rx1, &mut rx2] {
         let patch = recv_patch(rx);
         assert_eq!(patch.upsert.len(), 1);
@@ -59,7 +59,7 @@ fn upsert_and_remove_broadcast_to_all_subscribers() {
 
     // Second file appends at id 1 — positional, both clients patched.
     write_image(root.join("b.png"), &solid_image(5, 5, [9, 9, 9, 255]));
-    state.upsert_files(vec![root.join("b.png")]);
+    state.upsert_files(vec![(root.join("b.png"), None)]);
     for rx in [&mut rx1, &mut rx2] {
         let patch = recv_patch(rx);
         assert_eq!(patch.upsert.len(), 1);
@@ -102,7 +102,7 @@ fn finish_scan_broadcasts_resync_patch() {
     let mut rx = state.events.subscribe();
 
     // Files discovered in reverse alphabetical order (filesystem order).
-    state.upsert_files(vec![root.join("z.png"), root.join("a.png")]);
+    state.upsert_files(vec![(root.join("z.png"), None), (root.join("a.png"), None)]);
     let _ = recv_patch(&mut rx);
 
     // Finish: final sort reassigns ids → resync patch carries everything.

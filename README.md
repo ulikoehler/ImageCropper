@@ -119,9 +119,9 @@ imagecropper album -m ~/keep -r ~/incoming-photos
 *   **Ctrl + A**: Select all images.
 *   **Delete**: Selected tiles vanish immediately; the actual move to `.imagecropper-trash` runs on a background deletion queue.
 *   **m**: Same flow for the `-m/--move` directory — tiles vanish at keypress, the move completes in the background. (No-op with a status hint when `-m` was not given.)
-*   **f (hold)**: Show the focused image fullscreen using the preloaded ≤1920px preview; release to return to the grid. Arrow keys still work while held.
+*   **f (hold)**: Loupe the image under the mouse fullscreen (falls back to the focused image when hovering nothing) using the preloaded ≤1920px preview; release to return to the grid. Moving the mouse while held switches the loupe to the newly hovered tile.
 *   **+ / -**: Fine-grained zoom of the tile size.
-*   **W / w** (Shift+W / w): Increase / decrease the tile width in coarse steps.
+*   **W / w** (Shift+W / w): Grow / shrink the viewer's width — the grid narrows into a centered band, so repeated `w` presses make it less and less wide.
 *   **Esc**: Clear the selection; with no selection, exit.
 
 ## Web UI (`--serve` / `-G`)

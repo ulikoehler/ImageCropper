@@ -97,6 +97,10 @@ test.describe("album grid", () => {
     await page.mouse.click(center(rects[1]).x, center(rects[1]).y);
     await page.keyboard.up("Control");
     await expect(page.locator("#top")).toContainText("2 selected");
+    // The selection's byte size is shown next to the count.
+    await expect(page.locator("#top")).toContainText(
+      /2 selected \(\d+(\.\d+)? [KMGT]?B\)/,
+    );
 
     // Shift+click extends to a range ending at the anchor (rects[1]=anchor).
     await page.keyboard.down("Shift");
@@ -175,7 +179,7 @@ test.describe("album grid", () => {
     expect(sel).toEqual([r0.i, next.i]);
   });
 
-  test("+/- zoom and w/W width change the layout", async ({ page }) => {
+  test("+/- zoom and w/W restrict the viewer width", async ({ page }) => {
     await openApp(page);
     await waitAllCached(page);
     const before = await tileRects(page);
@@ -188,13 +192,23 @@ test.describe("album grid", () => {
     const unzoomed = await tileRects(page);
     expect(unzoomed[0].w).toBeLessThan(zoomed[0].w);
 
-    // w (lowercase) shrinks width, W (Shift+w) grows it.
+    // w restricts the viewer: the grid narrows into a centered band and
+    // shrinks further with every press; W (Shift+w) grows it back.
+    const span = (rs) =>
+      Math.max(...rs.map((r) => r.x + r.w)) - Math.min(...rs.map((r) => r.x));
+    await page.keyboard.press("w");
+    const narrow = await tileRects(page);
+    expect(span(narrow)).toBeLessThan(span(unzoomed) * 0.9);
+    expect(Math.min(...narrow.map((r) => r.x))).toBeGreaterThan(8); // margin
+
     await page.keyboard.press("w");
     const narrower = await tileRects(page);
-    expect(narrower[0].w).toBeLessThan(unzoomed[0].w);
+    expect(span(narrower)).toBeLessThan(span(narrow) * 0.9);
+
     await page.keyboard.press("Shift+w");
-    const wider = await tileRects(page);
-    expect(wider[0].w).toBeGreaterThan(narrower[0].w);
+    await page.keyboard.press("Shift+w");
+    const restored = await tileRects(page);
+    expect(span(restored)).toBeGreaterThan(span(narrower) * 1.2);
   });
 
   test("holding f shows the focused image fullscreen", async ({ page }) => {
@@ -227,6 +241,49 @@ test.describe("album grid", () => {
     // Releasing restores the grid.
     await page.keyboard.up("f");
     await expect(page.locator("#top")).toContainText("images");
+    await page.waitForFunction(() => !fHeld);
+  });
+
+  test("holding f loupes the hovered tile; no hover falls back to focus", async ({
+    page,
+  }) => {
+    await openApp(page);
+    await waitAllCached(page);
+    const rects = await tileRects(page);
+    const redIdx = SORTED.indexOf("red");
+    const purpleIdx = SORTED.indexOf("purple");
+
+    // Focus is purple (keyboard-style) while the mouse parks over red —
+    // the loupe must show the hovered tile, not the focus.
+    await page.evaluate((i) => {
+      focus = i;
+      draw();
+    }, purpleIdx);
+    const r = rects.find((t) => t.i === redIdx);
+    await page.mouse.move(r.x + r.w / 2, r.y + r.h / 2);
+
+    await page.keyboard.down("f");
+    await page.waitForFunction(() => fHeld && screenBmp, null, {
+      timeout: 15_000,
+    });
+    const centre = await page.evaluate(() => [
+      (innerWidth * devicePixelRatio) / 2,
+      (innerHeight * devicePixelRatio) / 2,
+    ]);
+    let px = await pixelAt(page, centre[0], centre[1]);
+    expect(colorClose(px, EXPECTED["red"]), `got ${px}`).toBeTruthy();
+
+    // Park the mouse below the last row (over no tile) while still
+    // holding f — the loupe falls back to the focused image.
+    const vp = page.viewportSize();
+    await page.mouse.move(vp.width / 2, vp.height - 4);
+    await page.waitForFunction((i) => screenIdx === i, purpleIdx, {
+      timeout: 15_000,
+    });
+    px = await pixelAt(page, centre[0], centre[1]);
+    expect(colorClose(px, EXPECTED["purple"]), `got ${px}`).toBeTruthy();
+
+    await page.keyboard.up("f");
     await page.waitForFunction(() => !fHeld);
   });
 
