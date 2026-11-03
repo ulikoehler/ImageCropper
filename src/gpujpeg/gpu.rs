@@ -510,7 +510,22 @@ impl GpuCtx {
                             &u32_bytes(&sc0.surv_st),
                         );
                     } else {
-                        eprintln!("gpujpeg: deferred survey failed (scan {si})");
+                        // Degrade to a single serial chunk: entry 0
+                        // covers the whole scan from its data offset
+                        // (flag 0 = fresh state); the rest of this
+                        // scan's slots get n_mcu=0 and are skipped.
+                        eprintln!(
+                            "gpujpeg: deferred survey failed (scan {si}) — serial fallback"
+                        );
+                        let n_iv = n_iv_v[si] as usize;
+                        let mut ent = vec![0u32; n_iv * 4];
+                        ent[0] = sc0.data_off;
+                        ent[2] = sc0.total_mcus;
+                        q.write_buffer(
+                            &iv_buf,
+                            (ck_base[si] * 16) as u64,
+                            &u32_bytes(&ent),
+                        );
                     }
                     scans[si] = sc0;
                 }
