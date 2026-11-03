@@ -136,10 +136,11 @@ async fn handle(socket: WebSocket, state: Arc<ServerState>) {
                         last_resync = seq;
                         q.reset(state.item_count());
                     }
-                    // While destructive actions drain, the listing is in flux
-                    // — sweeping thumbs for about-to-vanish files is wasted
-                    // work competing with action-done delivery.
-                    if state.actions.pending() == 0 && q.may_send() {
+                    // Thumbnails keep flowing no matter what actions are in
+                    // flight — a wedged delete/move must never freeze image
+                    // loading. Paths queued for deletion are skipped
+                    // individually below instead of pausing the sweep.
+                    if q.may_send() {
                         while ids.len() < PUMP_WIDTH {
                             match q.next_id() {
                                 Some(id) => ids.push(id),
@@ -162,6 +163,11 @@ async fn handle(socket: WebSocket, state: Arc<ServerState>) {
                             .map(|p| (p, m.items.get(id as usize).map(|i| i.sig).unwrap_or(0)))
                     };
                     match found {
+                        // Queued for delete/move: the file is about to
+                        // vanish, so skip this pass. Deliberately not marked
+                        // pushed — if the action fails (or times out) the
+                        // item is restored and must still get a thumbnail.
+                        Some((path, _)) if state.actions.is_pending(&path) => {}
                         Some((path, sig)) => jobs.push((id, path, sig)),
                         None => queue.lock().await.mark_pushed(id),
                     }
@@ -180,6 +186,12 @@ async fn handle(socket: WebSocket, state: Arc<ServerState>) {
                             previews.get_or_produce(&produce_path)
                         }),
                     ));
+                }
+                if handles.is_empty() {
+                    // Every id in this batch is queued for delete/move — give
+                    // the workers a moment rather than spinning on the queue.
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    continue;
                 }
                 for (id, path, sig, handle) in handles {
                     let produced = handle.await.ok().flatten();

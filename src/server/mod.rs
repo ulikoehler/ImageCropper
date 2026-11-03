@@ -536,10 +536,12 @@ pub fn build_router(state: Arc<ServerState>) -> Router {
 
 /// Ctrl-C shutdown: stop preview generation immediately, then wait for
 /// queued deletes/moves/etc. to drain — destructive ops are preferential.
+/// The wait is bounded well below `ACTION_TIMEOUT`: a wedged op
+/// must not hold the process hostage.
 async fn shutdown(state: &ServerState) {
     state.previews.stop();
     let started = std::time::Instant::now();
-    let deadline = started + std::time::Duration::from_secs(60);
+    let deadline = started + std::time::Duration::from_secs(10);
     let mut last = usize::MAX;
     while state.actions.pending() > 0 && std::time::Instant::now() < deadline {
         let n = state.actions.pending();
@@ -547,11 +549,11 @@ async fn shutdown(state: &ServerState) {
             eprintln!("shutdown: finishing {n} queued action(s)…");
             last = n;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
     let left = state.actions.pending();
     if left > 0 {
-        eprintln!("shutdown: {left} action(s) did not finish in 60s");
+        eprintln!("shutdown: {left} action(s) still unfinished after 10s");
     }
 }
 

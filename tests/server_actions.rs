@@ -204,3 +204,49 @@ fn action_queue_deletes_bulk_in_parallel() {
         }
     });
 }
+
+/// An op that misses its deadline must be reported as failed — and every
+/// dispatched tag must get exactly one completion, so `pending()` always
+/// drains (no 60s shutdown wait, no stuck client counter).
+#[test]
+fn action_queue_times_out_wedged_ops_and_always_drains() {
+    with_temp_workdir(|root| {
+        // A 1ms deadline with a single worker: the ops queued behind the
+        // first one cannot finish in time, exactly like a wedged FS op.
+        let queue = ActionQueue::with_timeout(1, 1, None, std::time::Duration::from_millis(1));
+        let mut tags = Vec::new();
+        for i in 0..50u32 {
+            let img = root.join(format!("slow{i:02}.png"));
+            write_image(&img, &solid_image(8, 8, [i as u8, 1, 1, 255]));
+            let sig = preview_sig_u64(&img).unwrap();
+            queue.dispatch(i, Action::Delete { id: i, sig }, img);
+            tags.push(i);
+        }
+        assert_eq!(queue.pending(), tags.len());
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let mut seen: Vec<u32> = Vec::new();
+        while queue.pending() > 0 && std::time::Instant::now() < deadline {
+            for done in queue.poll() {
+                assert!(
+                    !seen.contains(&done.tag),
+                    "tag {} completed twice — late results must be dropped",
+                    done.tag
+                );
+                if !done.ok {
+                    assert!(
+                        done.error.as_deref().unwrap_or("").contains("timed out")
+                            || done.error.is_some(),
+                        "failed op carries an error"
+                    );
+                }
+                seen.push(done.tag);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert_eq!(queue.pending(), 0, "the queue must always drain");
+        assert_eq!(seen.len(), tags.len(), "every dispatched op completed once");
+        seen.sort_unstable();
+        assert_eq!(seen, tags);
+    });
+}

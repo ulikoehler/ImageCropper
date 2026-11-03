@@ -379,4 +379,27 @@ test.describe("album grid", () => {
       { timeout: 10_000 },
     );
   });
+
+  test("a pending action the server never acks is dropped by the watchdog", async ({
+    page,
+  }) => {
+    await openApp(page);
+    await waitAllCached(page);
+
+    // Simulate an action whose completion event never arrives (lost ack, or
+    // a wedged FS op on the server): it must not leave the top bar stuck at
+    // "moving 1" forever.
+    await page.evaluate(() => {
+      pendingActions.set(424242, { kind: "move", at: Date.now() - 31_000 });
+      scheduleDraw();
+    });
+    await expect(page.locator("#top")).toContainText("moving 1");
+
+    // The watchdog (1s interval, 30s limit) clears it and reports the failure.
+    await expect(page.locator("#top")).not.toContainText("moving", {
+      timeout: 5_000,
+    });
+    await expect(page.locator("#status")).toContainText("timed out");
+    expect(await page.evaluate(() => pendingActions.size)).toBe(0);
+  });
 });

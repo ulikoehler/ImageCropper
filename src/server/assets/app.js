@@ -27,9 +27,9 @@ const token=new URLSearchParams(location.search).get("token")||"";
 const canvas=document.getElementById("c"), ctx=canvas.getContext("2d");
 const topEl=document.getElementById("top"), statusEl=document.getElementById("status"),
       helpEl=document.getElementById("help");
-helpEl.textContent="scroll: wheel · zoom: +/- · width: w/W · select: click/ctrl/shift · delete: Del · move: m · fullscreen: hold f · crop: c";
+helpEl.textContent="scroll: wheel · zoom: +/- · width: w/W · select: click/ctrl/shift · delete: Del · move: m · fullscreen: f (toggle, ←/→) · crop: c";
 
-let manifest=null, items=[], thumbs=new Map(), pending=new Set();
+let manifest=null, items=[], thumbs=new Map(), pending=new Map();
 let scanning=false;
 let tileH=180, zoom=1.0, scrollY=0, selected=new Set(), focus=0, anchor=0;
 let creditBudget=8*1024*1024;
@@ -152,19 +152,48 @@ async function boot(){
 
 const thumbReqs=[];
 // N virtual want-workers: keep up to WANT_WORKERS chunked CL_WANT requests
-// in flight so thumb delivery never stalls on one round-trip.
-const WANT_WORKERS=6, WANT_CHUNK=8;
-let wantQ=[], wantInFlight=0;
+// in flight so thumb delivery never stalls on one round-trip. A worker slot
+// is freed when its whole chunk arrived, or after WANT_TIMEOUT — a request
+// the server could not serve (deleted/moved item) must not retire a slot
+// permanently.
+const WANT_WORKERS=6, WANT_CHUNK=8, WANT_TIMEOUT=8000;
+// A requested thumbnail that never arrives is retried: drop it from
+// `pending` so the next draw() re-requests it.
+const PENDING_TIMEOUT=8000;
+// The server fails a wedged delete/move after 30s and acks it. This local
+// watchdog is the backstop if that ack is lost — the counter can never sit
+// at "1 moving" forever.
+const ACTION_TIMEOUT=30000;
+let wantQ=[], wantCtr=0;
+const wantSlots=new Map();   // reqId -> {left:Set(ids), at:ms}
 function pumpWants(){
-  while(wantInFlight<WANT_WORKERS&&wantQ.length&&dataWs&&dataWs.readyState===1){
+  while(wantSlots.size<WANT_WORKERS&&wantQ.length&&dataWs&&dataWs.readyState===1){
     const chunk=wantQ.splice(0,WANT_CHUNK);
+    const reqId=++wantCtr;
     const b=new Uint8Array(2+4*chunk.length),v=new DataView(b.buffer);
     v.setUint16(0,chunk.length,true);
     chunk.forEach((id,i)=>v.setUint32(2+4*i,id,true));
-    dataWs.send(frame(CL_WANT,0,b));
-    wantInFlight++;
+    dataWs.send(frame(CL_WANT,reqId,b));
+    wantSlots.set(reqId,{left:new Set(chunk),at:Date.now()});
   }
 }
+// Housekeeping: retire stalled want slots, retry lost thumbnails, and fail
+// pending actions the server never acknowledged.
+setInterval(()=>{
+  const now=Date.now();
+  let dirty=false;
+  for(const [reqId,s] of wantSlots)
+    if(now-s.at>WANT_TIMEOUT){wantSlots.delete(reqId);dirty=true}
+  for(const [id,at] of pending)
+    if(now-at>PENDING_TIMEOUT){pending.delete(id);dirty=true}
+  for(const [tag,a] of pendingActions)
+    if(now-a.at>ACTION_TIMEOUT){
+      pendingActions.delete(tag);
+      statusEl.textContent=`${a.kind} timed out after ${ACTION_TIMEOUT/1000}s`;
+      dirty=true;
+    }
+  if(dirty){pumpWants();scheduleDraw();}
+},1000);
 function onData(f){
   if(f.type===EV_THUMB){
     const v=new DataView(f.payload.buffer,f.payload.byteOffset);
@@ -172,7 +201,10 @@ function onData(f){
     const sig=v.getBigUint64(4,true).toString();   // manifest sigs are strings
     const jpeg=f.payload.subarray(12);
     pending.delete(id);
-    if(wantInFlight>0)wantInFlight--;   // a want-worker slot freed
+    // Free the want-worker slot that asked for this id (sweep pushes carry
+    // req_id 0 and free nothing).
+    const slot=wantSlots.get(f.reqId);
+    if(slot){slot.left.delete(id);if(!slot.left.size){wantSlots.delete(f.reqId);pumpWants();}}
     const it=items[id];
     // Drop pushes for a known item whose content no longer matches —
     // the id was reassigned mid-flight, tombstoned, or the file changed.
@@ -185,13 +217,13 @@ function onData(f){
   } else if(f.type===EV_EVENT){
     const ev=JSON.parse(new TextDecoder().decode(f.payload));
     if(ev.ev==="action-done"){
-      const kind=pendingActions.get(ev.tag);
-      if(kind!=null){
+      const act=pendingActions.get(ev.tag);
+      if(act!=null){
         pendingActions.delete(ev.tag);
         // Tombstones and restores arrive as manifest patches (ordered
         // ahead of the ack) — the ack only runs the pending counter and
         // surfaces failures.
-        if(!ev.ok)statusEl.textContent=`${kind} failed: ${ev.error||"?"}`;
+        if(!ev.ok)statusEl.textContent=`${act.kind} failed: ${ev.error||"?"}`;
         scheduleDraw();
       }
     }
@@ -337,13 +369,19 @@ function draw(){
     topEl.textContent=`${liveFs} images · fullscreen: ${it?it.name:"?"}`;
     return;
   }
-  const want=[];
+  // Missing tiles: everything on screen first, then the prefetch ring (one
+  // screen ahead, a quarter behind). Rebuilt every frame so a scroll always
+  // outranks whatever is still queued from the previous viewport — an
+  // append-only queue lets offscreen ids starve the tiles you are looking at.
+  const want=[], ahead=[];
   for(const t of tileRects()){
     const y=t.y-scrollY;
-    // Prefetch one screen ahead (and a quarter behind) — scrolling into
-    // those rows finds thumbs already loaded instead of placeholders.
-    if(y+t.h>=-H/4&&y<=H*2&&!thumbs.has(t.i)&&!pending.has(t.i)){
-      pending.add(t.i);want.push(t.i)}
+    const missing=!thumbs.has(t.i)&&!pending.has(t.i);
+    if(y+t.h>=0&&y<=H){
+      if(missing){pending.set(t.i,Date.now());want.push(t.i)}
+    }else if(missing&&y+t.h>=-H/4&&y<=H*2){
+      pending.set(t.i,Date.now());ahead.push(t.i);
+    }
     if(y+t.h<0||y>H)continue;
     const bmp=thumbs.get(t.i);
     if(bmp)ctx.drawImage(bmp,t.x,y,t.w,t.h);
@@ -358,10 +396,14 @@ function draw(){
     ctx.fillStyle="rgba(78,161,255,0.22)";ctx.fillRect(r.x,y,r.w,r.h);
     ctx.strokeStyle="#4ea1ff";ctx.lineWidth=2;ctx.strokeRect(r.x,y,r.w,r.h);
   }
-  want.forEach(id=>wantQ.push(id));
+  // Replace the queue with the current wish-list; release the `pending`
+  // marker of anything dropped so a later frame can request it again.
+  const wanted=new Set(want.concat(ahead));
+  for(const id of wantQ)if(!wanted.has(id))pending.delete(id);
+  wantQ=want.concat(ahead);
   pumpWants();
   let delQ=0,movQ=0,live=0;
-  for(const k of pendingActions.values()){if(k==="delete")delQ++;else if(k==="move")movQ++}
+  for(const a of pendingActions.values()){if(a.kind==="delete")delQ++;else if(a.kind==="move")movQ++}
   for(const it of items)if(it&&!it.removed)live++;
   topEl.textContent=`${live} images · ${thumbs.size} cached · ${selected.size} selected`+
     `${selected.size?` (${formatSize(selBytes())})`:""}${delQ?` · deleting ${delQ}`:""}`+
@@ -392,7 +434,7 @@ addEventListener("keydown",e=>{
     const at=targets.length?Math.min(...targets):focus;
     for(const i of targets){
       const it=items[i];if(!it||it.removed)continue;const tag=nextTag();
-      pendingActions.set(tag,kind);
+      pendingActions.set(tag,{kind,at:Date.now()});
       // Optimistic: the tile vanishes now, the FS op lands async.
       it.removed=true;thumbs.delete(it.id);
       dataWs.send(frame(CL_ACTION,0,str(JSON.stringify({
