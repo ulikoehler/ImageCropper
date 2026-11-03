@@ -1,0 +1,7 @@
+[env]
+# dav1d-sys (AVIF decode via `image`) normally wants a system dav1d
+# >= 1.3.0 through pkg-config. `auto` keeps using the system lib when
+# it's new enough and otherwise builds dav1d 1.5.0 from source
+# (git+meson+ninja) inside OUT_DIR — first build needs network access
+# to code.videolan.org.
+SYSTEM_DEPS_DAV1D_BUILD_INTERNAL = "auto"
