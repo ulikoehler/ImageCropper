@@ -103,19 +103,28 @@ pub fn decode_image_bytes(path: &Path, bytes: &[u8]) -> image::ImageResult<Dynam
     }
 }
 
+/// Target dims for a fit-resize — shared by [`resize_to_fit`] and the
+/// GPU resize path (`gpujpeg::GpuJpeg`) so both produce identical
+/// output sizes.
+pub(crate) fn fit_dims(w: u32, h: u32, max_w: u32, max_h: u32) -> (u32, u32) {
+    if w <= max_w && h <= max_h {
+        return (w, h);
+    }
+    let ratio = w as f64 / h as f64;
+    if ratio > max_w as f64 / max_h as f64 {
+        (max_w, ((max_w as f64 / ratio) as u32).max(1))
+    } else {
+        (((max_h as f64 * ratio) as u32).max(1), max_h)
+    }
+}
+
 /// Resize the image so it fits within `max_w` x `max_h`, preserving aspect
 /// ratio. Returns the image unchanged if it already fits.
 pub fn resize_to_fit(image: DynamicImage, max_w: u32, max_h: u32) -> DynamicImage {
-    if image.width() <= max_w && image.height() <= max_h {
+    let (new_w, new_h) = fit_dims(image.width(), image.height(), max_w, max_h);
+    if new_w == image.width() && new_h == image.height() {
         return image;
     }
-
-    let ratio = image.width() as f64 / image.height() as f64;
-    let (new_w, new_h) = if ratio > max_w as f64 / max_h as f64 {
-        (max_w, (max_w as f64 / ratio) as u32)
-    } else {
-        ((max_h as f64 * ratio) as u32, max_h)
-    };
 
     let src_image = match image {
         image::DynamicImage::ImageRgb8(ref rgb) => Image::from_vec_u8(

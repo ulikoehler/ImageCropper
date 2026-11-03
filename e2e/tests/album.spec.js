@@ -402,4 +402,71 @@ test.describe("album grid", () => {
     await expect(page.locator("#status")).toContainText("timed out");
     expect(await page.evaluate(() => pendingActions.size)).toBe(0);
   });
+
+  test("scrolling loads the tiles that come into view", async ({ page }) => {
+    await openApp(page);
+    await waitAllCached(page);
+
+    // Make the album taller than the viewport, then drop every thumbnail so
+    // the tiles below have to be fetched on demand.
+    await page.evaluate(() => {
+      tileH = 600;
+      layout();
+      thumbs.clear();
+      pending.clear();
+      scheduleDraw();
+    });
+
+    const visible = () =>
+      page.evaluate(() =>
+        tileRects()
+          .filter((t) => t.y + t.h > scrollY && t.y < scrollY + canvas.height)
+          .map((t) => ({ i: t.i, loaded: thumbs.has(t.i) })),
+      );
+
+    // Nothing loaded yet at the top of the album.
+    await page.waitForFunction(
+      () => {
+        const vis = tileRects().filter(
+          (t) => t.y + t.h > scrollY && t.y < scrollY + canvas.height,
+        );
+        return vis.length > 0 && vis.every((t) => thumbs.has(t.i));
+      },
+      null,
+      { timeout: 15_000 },
+    );
+
+    // Which tiles the top of the album had cached before scrolling.
+    const atTop = await page.evaluate(() => [...thumbs.keys()]);
+
+    // Jump to the last row: those tiles were never in view, so scrolling is
+    // what has to fetch them.
+    const target = await page.evaluate(() => {
+      scrollY = rowY(rows.length - 1);
+      scheduleDraw();
+      return {
+        ids: tileRects()
+          .filter((t) => t.y + t.h > scrollY && t.y < scrollY + canvas.height)
+          .map((t) => t.i),
+      };
+    });
+    expect(target.ids.length).toBeGreaterThan(0);
+
+    await page.waitForFunction(
+      () => {
+        const vis = tileRects().filter(
+          (t) => t.y + t.h > scrollY && t.y < scrollY + canvas.height,
+        );
+        return vis.length > 0 && vis.every((t) => thumbs.has(t.i));
+      },
+      null,
+      { timeout: 15_000 },
+    );
+    const after = await visible();
+    expect(after.every((t) => t.loaded)).toBe(true);
+    // The scrolled-to tiles include ones that were not cached before, so the
+    // scroll itself is what loaded them.
+    const fresh = after.filter((t) => !atTop.includes(t.i));
+    expect(fresh.length).toBeGreaterThan(0);
+  });
 });

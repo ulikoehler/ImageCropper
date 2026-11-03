@@ -136,30 +136,9 @@ pub fn produce_screen_image(source: &Path) -> Option<DynamicImage> {
     decode_image_bytes(source, &jpeg).ok()
 }
 
-/// Ensure a fullscreen-size preview exists in the global cache. `decoded`
-/// may pass an already-decoded source image to avoid a second decode;
-/// `sig` carries the caller's `source_signature` to skip a second stat.
-fn ensure_screen_preview(source: &Path, decoded: Option<&DynamicImage>, sig: Option<(u64, u128)>) {
-    let Some((len, nanos)) = sig.or_else(|| source_signature(source)) else {
-        return;
-    };
-    let expected = screen_path_with_sig(source, len, nanos);
-    if expected.exists() {
-        return;
-    }
-    let image = match decoded {
-        Some(img) => img.clone(),
-        None => {
-            let Some(bytes) = std::fs::read(source).ok() else {
-                return;
-            };
-            let Some(img) = decode_image_bytes(source, &bytes).ok() else {
-                return;
-            };
-            img
-        }
-    };
-    let screen = resize_to_fit(image, SCREEN_MAX_DIM, SCREEN_MAX_DIM);
+/// JPEG-encode the resized `screen` image, prune stale signature
+/// variants in the per-source cache dir, and write it to `expected`.
+fn persist_screen_jpeg(source: &Path, expected: &Path, screen: &DynamicImage) {
     let mut jpeg = Vec::new();
     {
         let writer = std::io::BufWriter::new(std::io::Cursor::new(&mut jpeg));
@@ -182,9 +161,63 @@ fn ensure_screen_preview(source: &Path, decoded: Option<&DynamicImage>, sig: Opt
             }
         }
     }
-    if std::fs::write(&expected, &jpeg).is_ok() && verbose() {
+    if std::fs::write(expected, &jpeg).is_ok() && verbose() {
         eprintln!("screen preview generated: {}", source.display());
     }
+}
+
+/// GPU-session variant of [`ensure_screen_preview`]: resizes straight
+/// off the session's decoded buffer — the full-res pixels never
+/// round-trip through the host.
+fn ensure_screen_preview_gpu(
+    source: &Path,
+    session: &crate::gpujpeg::GpuJpeg,
+    sig: Option<(u64, u128)>,
+) {
+    let Some((len, nanos)) = sig.or_else(|| source_signature(source)) else {
+        return;
+    };
+    let expected = screen_path_with_sig(source, len, nanos);
+    if expected.exists() {
+        return;
+    }
+    if let Some(screen) = session.resize_image(SCREEN_MAX_DIM, SCREEN_MAX_DIM) {
+        persist_screen_jpeg(source, &expected, &screen);
+    }
+}
+
+/// Ensure a fullscreen-size preview exists in the global cache. `decoded`
+/// may pass an already-decoded source image to avoid a second decode;
+/// `sig` carries the caller's `source_signature` to skip a second stat.
+fn ensure_screen_preview(source: &Path, decoded: Option<&DynamicImage>, sig: Option<(u64, u128)>) {
+    let Some((len, nanos)) = sig.or_else(|| source_signature(source)) else {
+        return;
+    };
+    let expected = screen_path_with_sig(source, len, nanos);
+    if expected.exists() {
+        return;
+    }
+    if let Some(img) = decoded {
+        let screen = resize_to_fit(img.clone(), SCREEN_MAX_DIM, SCREEN_MAX_DIM);
+        persist_screen_jpeg(source, &expected, &screen);
+        return;
+    }
+    let Some(bytes) = std::fs::read(source).ok() else {
+        return;
+    };
+    // GPU session path: decode+resize on the GPU — the full-res image
+    // never materializes on the host.
+    if let Some(session) = crate::gpujpeg::open(&bytes) {
+        if let Some(screen) = session.resize_image(SCREEN_MAX_DIM, SCREEN_MAX_DIM) {
+            persist_screen_jpeg(source, &expected, &screen);
+            return;
+        }
+    }
+    let Some(img) = decode_image_bytes(source, &bytes).ok() else {
+        return;
+    };
+    let screen = resize_to_fit(img, SCREEN_MAX_DIM, SCREEN_MAX_DIM);
+    persist_screen_jpeg(source, &expected, &screen);
 }
 
 /// Remove stale previews of `source` inside `dir`, keeping `expected_name`.
@@ -297,12 +330,22 @@ pub fn produce_preview_image(path: &Path) -> Option<DynamicImage> {
         let _ = std::fs::remove_file(&expected);
     }
 
-    // Slow path: decode the source, downscale, persist.
+    // Slow path: decode the source, downscale, persist. Restart-marker
+    // JPEGs go entirely through the GPU session — decode + both resizes
+    // run on the GPU and the full-res image never reaches the host.
     let bytes = std::fs::read(path).ok()?;
-    let image = decode_image_bytes(path, &bytes).ok()?;
-    drop(bytes);
-    ensure_screen_preview(path, Some(&image), Some((len, nanos)));
-    let thumb = resize_to_fit(image, THUMB_MAX_DIM, THUMB_MAX_DIM);
+    let thumb = match crate::gpujpeg::open(&bytes) {
+        Some(session) => {
+            ensure_screen_preview_gpu(path, &session, Some((len, nanos)));
+            session.resize_image(THUMB_MAX_DIM, THUMB_MAX_DIM)?
+        }
+        None => {
+            let image = decode_image_bytes(path, &bytes).ok()?;
+            drop(bytes);
+            ensure_screen_preview(path, Some(&image), Some((len, nanos)));
+            resize_to_fit(image, THUMB_MAX_DIM, THUMB_MAX_DIM)
+        }
+    };
     persist_preview(path, &expected_name, &thumb);
     if verbose() {
         eprintln!("preview generated: {}", path.display());
@@ -342,11 +385,27 @@ pub fn produce_preview_bytes(
     }
 
     let bytes = std::fs::read(path).ok()?;
-    let image = decode_image_bytes(path, &bytes).ok()?;
-    drop(bytes);
-    let (w, h) = (image.width(), image.height());
-    ensure_screen_preview(path, Some(&image), Some((len, nanos)));
-    let thumb = resize_to_fit(image, THUMB_MAX_DIM, THUMB_MAX_DIM);
+    let (thumb, w, h) = match crate::gpujpeg::open(&bytes) {
+        Some(session) => {
+            let (w, h) = (session.width, session.height);
+            ensure_screen_preview_gpu(path, &session, Some((len, nanos)));
+            let Some(t) = session.resize_image(THUMB_MAX_DIM, THUMB_MAX_DIM) else {
+                return None;
+            };
+            (t, w, h)
+        }
+        None => {
+            let image = decode_image_bytes(path, &bytes).ok()?;
+            drop(bytes);
+            let (w, h) = (image.width(), image.height());
+            ensure_screen_preview(path, Some(&image), Some((len, nanos)));
+            (
+                resize_to_fit(image, THUMB_MAX_DIM, THUMB_MAX_DIM),
+                w,
+                h,
+            )
+        }
+    };
 
     let mut jpeg = Vec::new();
     {

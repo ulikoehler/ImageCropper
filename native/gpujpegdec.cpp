@@ -729,6 +729,175 @@ void main() {
 )GLSL";
 
 // ============================================================
+//  PIL-exact resize (ported from VulkanExamples/p81_resize):
+//  separable resample on the decoded RGBA-u32 buffer, 22-bit
+//  fixed-point coefficients, u8-clamped intermediate.
+// ============================================================
+using FilterFn = double (*)(double);
+struct FilterDef { FilterFn fn; double support; };
+
+static double box_filter(double x) {
+    return (x > -0.5 && x <= 0.5) ? 1.0 : 0.0;
+}
+static double bilinear_filter(double x) {
+    if (x < 0.0) x = -x;
+    return (x < 1.0) ? 1.0 - x : 0.0;
+}
+static double hamming_filter(double x) {
+    if (x < 0.0) x = -x;
+    if (x == 0.0) return 1.0;
+    if (x >= 1.0) return 0.0;
+    x = x * M_PI;
+    return sin(x) / x * (0.54 + 0.46 * cos(x));
+}
+static double bicubic_filter(double x) {
+    const double a = -0.5;
+    if (x < 0.0) x = -x;
+    if (x < 1.0) return ((a + 2.0) * x - (a + 3.0)) * x * x + 1;
+    if (x < 2.0) return (((x - 5) * x + 8) * x - 4) * a;
+    return 0.0;
+}
+static double sinc_filter(double x) {
+    if (x == 0.0) return 1.0;
+    x = x * M_PI;
+    return sin(x) / x;
+}
+static double lanczos_filter(double x) {
+    if (-3.0 <= x && x < 3.0) return sinc_filter(x) * sinc_filter(x / 3);
+    return 0.0;
+}
+
+// filter id: 0=nearest 1=box 2=bilinear 3=hamming 4=bicubic 5=lanczos
+static const FilterDef kFilterDefs[5] = {
+    {box_filter, 0.5},      {bilinear_filter, 1.0}, {hamming_filter, 1.0},
+    {bicubic_filter, 2.0},  {lanczos_filter, 3.0},
+};
+
+static constexpr int kPrecBits = 22;
+
+struct Axis {
+    int inSize, outSize, ksize;
+    std::vector<int32_t> bounds;   // 2 per out px: {xmin, xmax}
+    std::vector<int32_t> coefs;    // outSize * ksize
+};
+
+static Axis precomputeCoeffs(int inSize, int outSize, const FilterDef& f) {
+    double scale = double(inSize) / outSize;
+    double filterscale = std::max(scale, 1.0);
+    double support = f.support * filterscale;
+    int ksize = int(ceil(support)) * 2 + 1;
+    double inv_fs = 1.0 / filterscale;
+
+    Axis a{inSize, outSize, ksize,
+           std::vector<int32_t>(outSize * 2),
+           std::vector<int32_t>(size_t(outSize) * ksize, 0)};
+    std::vector<double> k(ksize);
+    for (int xx = 0; xx < outSize; ++xx) {
+        double center = (xx + 0.5) * scale;
+        int xmin = int(center - support + 0.5);
+        if (xmin < 0) xmin = 0;
+        int xmax = int(center + support + 0.5);
+        if (xmax > inSize) xmax = inSize;
+        xmax -= xmin;
+        double ww = 0.0;
+        for (int x = 0; x < xmax; ++x) {
+            double w = f.fn((x + xmin - center + 0.5) * inv_fs);
+            k[x] = w;
+            ww += w;
+        }
+        if (ww != 0.0)
+            for (int x = 0; x < xmax; ++x) k[x] /= ww;
+        for (int x = xmax; x < ksize; ++x) k[x] = 0.0;
+        for (int x = 0; x < ksize; ++x) {
+            double v = k[x] * (1 << kPrecBits);
+            a.coefs[size_t(xx) * ksize + x] =
+                int32_t(v < 0 ? v - 0.5 : v + 0.5);
+        }
+        a.bounds[xx * 2] = xmin;
+        a.bounds[xx * 2 + 1] = xmax;
+    }
+    return a;
+}
+
+// PIL NEAREST accumulates xo += a0 iteratively in double (see
+// p81_resize); expressed as a degenerate 1-tap resample so the same
+// shader path reproduces it.
+static Axis nearestCoeffs(int inSize, int outSize) {
+    Axis a{inSize, outSize, 1,
+           std::vector<int32_t>(outSize * 2),
+           std::vector<int32_t>(outSize)};
+    double a0 = double(inSize) / outSize;
+    double xo = 0.5 * a0;
+    for (int xx = 0; xx < outSize; ++xx) {
+        int sx = int(xo);
+        if (sx >= inSize) sx = inSize - 1;
+        a.bounds[xx * 2] = sx;
+        a.bounds[xx * 2 + 1] = 1;
+        a.coefs[xx] = 1 << kPrecBits;
+        xo += a0;
+    }
+    return a;
+}
+
+// Separable resample on RGBA-u32 pixels (0xFF000000|b<<16|g<<8|r) —
+// same math as p81's V-pass used for both directions since the decoded
+// image is already an RGBA-word buffer, not packed bytes.
+static const char* kResampleRgba = R"GLSL(
+#version 460
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0) readonly buffer In  { uint inBuf[]; };
+layout(set = 0, binding = 1) readonly buffer Bnd { ivec2 bnd[]; };
+layout(set = 0, binding = 2) readonly buffer Cfs { int cf[]; };
+layout(set = 0, binding = 3) writeonly buffer Out{ uint outBuf[]; };
+layout(push_constant) uniform P {
+    uint inW, inH, outW, outH, ksize, axis;
+};
+void main() {
+    uint ox = gl_GlobalInvocationID.x, oy = gl_GlobalInvocationID.y;
+    if (ox >= outW || oy >= outH) return;
+    uint o = (axis == 0u) ? ox : oy;
+    ivec2 b = bnd[o];
+    // ss = 1 << (PRECISION_BITS-1) per channel
+    ivec4 ss = ivec4(1 << 21);
+    for (int i = 0; i < b.y; ++i) {
+        int k = cf[o * ksize + uint(i)];
+        uint src = uint(b.x + i);
+        uint px = (axis == 0u) ? inBuf[oy * inW + src]
+                               : inBuf[src * inW + ox];
+        ss += ivec4(int(px & 0xFFu), int((px >> 8) & 0xFFu),
+                    int((px >> 16) & 0xFFu), 0) * k;
+    }
+    uint r = uint(clamp(ss.r >> 22, 0, 255));
+    uint g = uint(clamp(ss.g >> 22, 0, 255));
+    uint bch = uint(clamp(ss.b >> 22, 0, 255));
+    outBuf[oy * outW + ox] = r | (g << 8) | (bch << 16) | 0xFF000000u;
+}
+)GLSL";
+
+// Pack RGBA u32 pixels -> packed u8 (nComp bytes/px) — the p82-style
+// pixel-format conversion, on-GPU so the host only memcpy()s the final
+// bytes. One invocation per output word, no atomics.
+static const char* kPack = R"GLSL(
+#version 460
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) readonly buffer In  { uint inBuf[]; };
+layout(set = 0, binding = 3) writeonly buffer Out{ uint outBuf[]; };
+layout(push_constant) uniform P { uint npx, nComp; };
+void main() {
+    uint w = gl_GlobalInvocationID.x;
+    if (w * 4u >= npx * nComp) return;
+    uint word = 0u;
+    for (uint k = 0u; k < 4u; ++k) {
+        uint bpos = w * 4u + k;
+        if (bpos >= npx * nComp) break;
+        uint px = bpos / nComp, ch = bpos - px * nComp;
+        word |= ((inBuf[px] >> (ch * 8u)) & 0xFFu) << (k * 8u);
+    }
+    outBuf[w] = word;
+}
+)GLSL";
+
+// ============================================================
 //  Vulkan plumbing
 // ============================================================
 
@@ -739,6 +908,13 @@ struct Gpu {
     vk::DescriptorSet dset;
     vk::UniquePipelineLayout pipeLayout;
     vk::UniquePipeline pEntropy, pRecon, pUpsample;
+    // resize path: separate 4-binding layout; three sets cover
+    // decode-rgba -> temp -> out-rgba -> pack in one submit
+    vk::UniqueDescriptorSetLayout rsetLayout;
+    vk::UniqueDescriptorPool rpool;
+    vk::DescriptorSet rsets[3];
+    vk::UniquePipelineLayout rpipeLayout;
+    vk::UniquePipeline pResample, pPack;
 
     void init() {
         v.createInstance({});
@@ -762,26 +938,53 @@ struct Gpu {
         vk::PushConstantRange pc{vk::ShaderStageFlagBits::eCompute, 0, 36};
         pipeLayout = v.device->createPipelineLayoutUnique(
             {{}, dsetLayout.get(), pc});
-        auto mk = [&](const char* src, const char* name) {
+        auto mk = [&](const char* src, const char* name,
+                      vk::PipelineLayout layout) {
             auto mod = v.shader(src, shaderc_compute_shader, name);
             vk::ComputePipelineCreateInfo ci{};
             ci.stage = {vk::PipelineShaderStageCreateFlags{},
                         vk::ShaderStageFlagBits::eCompute, mod.get(), "main"};
-            ci.layout = pipeLayout.get();
+            ci.layout = layout;
             return v.device->createComputePipelineUnique({}, ci).value;
         };
-        pEntropy = mk(kEntropy, "entropy");
-        pRecon = mk(kRecon, "recon");
-        pUpsample = mk(kUpsample, "upsample");
+        pEntropy = mk(kEntropy, "entropy", pipeLayout.get());
+        pRecon = mk(kRecon, "recon", pipeLayout.get());
+        pUpsample = mk(kUpsample, "upsample", pipeLayout.get());
+
+        // resize descriptor layout: 0=in, 1=bounds, 2=coefs, 3=out
+        std::vector<vk::DescriptorSetLayoutBinding> rbinds;
+        for (uint32_t i = 0; i < 4; ++i)
+            rbinds.push_back({i, vk::DescriptorType::eStorageBuffer, 1,
+                              vk::ShaderStageFlagBits::eCompute});
+        rsetLayout =
+            v.device->createDescriptorSetLayoutUnique({{}, rbinds});
+        std::vector<vk::DescriptorPoolSize> rsz = {
+            {vk::DescriptorType::eStorageBuffer, 12}};
+        rpool = v.device->createDescriptorPoolUnique(
+            {vk::DescriptorPoolCreateFlagBits::eFreeDescriptorSet, 3,
+             rsz});
+        std::vector<vk::DescriptorSetLayout> rlayouts(
+            3, rsetLayout.get());
+        auto rs = v.device->allocateDescriptorSets(
+            {rpool.get(), rlayouts});
+        for (int i = 0; i < 3; ++i) rsets[i] = rs[i];
+        vk::PushConstantRange rpc{vk::ShaderStageFlagBits::eCompute, 0,
+                                  24};
+        rpipeLayout = v.device->createPipelineLayoutUnique(
+            {{}, rsetLayout.get(), rpc});
+        pResample = mk(kResampleRgba, "resample", rpipeLayout.get());
+        pPack = mk(kPack, "pack", rpipeLayout.get());
     }
 
     vkmini::Vk::Buffer ssbo(vk::DeviceSize bytes, bool map = false,
-                            vk::BufferUsageFlags extra = {}) {
+                            vk::BufferUsageFlags extra = {},
+                            bool cached = false) {
+        auto props = vk::MemoryPropertyFlagBits::eHostVisible |
+                     vk::MemoryPropertyFlagBits::eHostCoherent;
+        if (cached) props |= vk::MemoryPropertyFlagBits::eHostCached;
         return v.createBuffer(
             bytes, vk::BufferUsageFlagBits::eStorageBuffer | extra,
-            vk::MemoryPropertyFlagBits::eHostVisible |
-                vk::MemoryPropertyFlagBits::eHostCoherent,
-            map);
+            props, map);
     }
 
     void bindBuf(uint32_t binding, const vkmini::Vk::Buffer& b,
@@ -790,6 +993,15 @@ struct Gpu {
         vk::WriteDescriptorSet w{dset, binding, 0, 1,
                                  ubo ? vk::DescriptorType::eUniformBuffer
                                      : vk::DescriptorType::eStorageBuffer,
+                                 nullptr, &bi};
+        v.device->updateDescriptorSets(w, {});
+    }
+
+    void bindR(uint32_t set, uint32_t binding,
+               const vkmini::Vk::Buffer& b) {
+        vk::DescriptorBufferInfo bi{b.buf.get(), 0, b.size};
+        vk::WriteDescriptorSet w{rsets[set], binding, 0, 1,
+                                 vk::DescriptorType::eStorageBuffer,
                                  nullptr, &bi};
         v.device->updateDescriptorSets(w, {});
     }
@@ -810,8 +1022,10 @@ struct Gpu {
 //  main()/libjpeg verify path lives there, this file is the library.
 // ============================================================
 
-static void decodeInto(Gpu& g, const Jpg& j, const FrameGpu& fg,
-                       uint8_t* out) {
+// Decode into a fresh RGBA-u32 SSBO and return it. For session use the
+// buffer stays GPU-resident; the plain decode path memcpy()s it out.
+static vkmini::Vk::Buffer decodeInto(Gpu& g, const Jpg& j,
+                                     const FrameGpu& fg) {
     auto scanBuf = g.ssbo((j.scanLen + 3) & ~3u, true);
     memcpy(scanBuf.mapped, j.data.data() + j.scanOff, j.scanLen);
 
@@ -917,7 +1131,7 @@ static void decodeInto(Gpu& g, const Jpg& j, const FrameGpu& fg,
         c.dispatch((j.W + 15) / 16, (j.H + 15) / 16, 1);
     });
 
-    memcpy(out, outBuf.mapped, size_t(j.W) * j.H * 4);
+    return outBuf;
 }
 
 static Gpu& gpuCtx() {
@@ -965,7 +1179,167 @@ int gpujpeg_decode(const uint8_t* data, size_t len,
         for (auto& t : j.dctab) buildCanon(t);
         for (auto& t : j.actab) buildCanon(t);
         FrameGpu fg = packComps(j);
-        decodeInto(g, j, fg, out);
+        auto outBuf = decodeInto(g, j, fg);
+        memcpy(out, outBuf.mapped, size_t(j.W) * j.H * 4);
+        return 0;
+    } catch (...) {
+        return -1;
+    }
+}
+
+// ---- GPU-resident sessions: decode once, resize many times ----
+// The decoded RGBA image stays in a GPU buffer; gpujpeg_resize runs
+// the PIL-exact resample + pack passes on it and returns only the
+// (small) packed output. The full-res pixels never round-trip through
+// the host. The caller serializes all entry points (Rust GPU_LOCK),
+// so the session table needs no locking of its own.
+struct GpuSession {
+    vkmini::Vk::Buffer px;   // decoded RGBA-u32 words
+    int W = 0, H = 0;
+};
+static std::map<int, GpuSession> gSessions;
+static int gNextSid = 1;
+
+// Open a decode session. Returns a session id > 0 on success,
+// 0 = unsupported (caller uses CPU path), <0 = error.
+int gpujpeg_open(const uint8_t* data, size_t len, int require_restart,
+                 int* w, int* h) {
+    Jpg j;
+    j.data.assign(data, data + len);
+    if (!parseJpg(j)) return 0;
+    if (require_restart && j.dri == 0) return 0;
+    try {
+        Gpu& g = gpuCtx();
+        for (auto& t : j.dctab) buildCanon(t);
+        for (auto& t : j.actab) buildCanon(t);
+        FrameGpu fg = packComps(j);
+        GpuSession s{decodeInto(g, j, fg), j.W, j.H};
+        int sid = gNextSid++;
+        gSessions.emplace(sid, std::move(s));
+        *w = j.W;
+        *h = j.H;
+        return sid;
+    } catch (...) {
+        return -1;
+    }
+}
+
+void gpujpeg_close(int sid) { gSessions.erase(sid); }
+
+// GPU-resize a session's decoded image to outW x outH and pack into
+// `out` as nComp bytes/px (3 = RGB, 4 = RGBA).
+//   filter: 0 nearest, 1 box, 2 bilinear, 3 hamming, 4 bicubic,
+//           5 lanczos — all PIL-exact (bit-identical to
+//           Image.resize()).
+// A same-size request skips resampling and just packs the decoded
+// words — identical pixels to gpujpeg_decode's RGBA.
+// Returns 0 on success, <0 on error.
+int gpujpeg_resize(int sid, int outW, int outH, int nComp, int filter,
+                   uint8_t* out) {
+    auto it = gSessions.find(sid);
+    if (it == gSessions.end()) return -1;
+    if (outW <= 0 || outH <= 0 || (nComp != 3 && nComp != 4) ||
+        filter < 0 || filter > 5)
+        return -1;
+    GpuSession& s = it->second;
+    try {
+        Gpu& g = gpuCtx();
+        const size_t outBytes = size_t(outW) * outH * nComp;
+        auto packBuf = g.ssbo((outBytes + 3) & ~size_t(3), true, {},
+                              true);
+        uint32_t ppc[2] = {uint32_t(outW) * uint32_t(outH),
+                           uint32_t(nComp)};
+
+        if (outW == s.W && outH == s.H) {
+            // identity: pack the decoded words straight to bytes
+            g.bindR(0, 0, s.px);
+            g.bindR(0, 1, s.px);   // unused by pack — keep them valid
+            g.bindR(0, 2, s.px);
+            g.bindR(0, 3, packBuf);
+            g.v.oneTime([&](vk::CommandBuffer c) {
+                c.pushConstants(g.rpipeLayout.get(),
+                                vk::ShaderStageFlagBits::eCompute, 0, 8,
+                                ppc);
+                c.bindDescriptorSets(vk::PipelineBindPoint::eCompute,
+                                     g.rpipeLayout.get(), 0, g.rsets[0],
+                                     {});
+                c.bindPipeline(vk::PipelineBindPoint::eCompute,
+                               g.pPack.get());
+                c.dispatch(uint32_t((outBytes + 1023) / 1024), 1, 1);
+            });
+            memcpy(out, packBuf.mapped, outBytes);
+            return 0;
+        }
+
+        const FilterDef* f =
+            filter == 0 ? nullptr : &kFilterDefs[filter - 1];
+        Axis ax = f ? precomputeCoeffs(s.W, outW, *f)
+                    : nearestCoeffs(s.W, outW);
+        Axis ay = f ? precomputeCoeffs(s.H, outH, *f)
+                    : nearestCoeffs(s.H, outH);
+        auto bndX = g.ssbo(ax.bounds.size() * 4, true);
+        auto bndY = g.ssbo(ay.bounds.size() * 4, true);
+        auto cfX = g.ssbo(ax.coefs.size() * 4, true);
+        auto cfY = g.ssbo(ay.coefs.size() * 4, true);
+        memcpy(bndX.mapped, ax.bounds.data(), ax.bounds.size() * 4);
+        memcpy(bndY.mapped, ay.bounds.data(), ay.bounds.size() * 4);
+        memcpy(cfX.mapped, ax.coefs.data(), ax.coefs.size() * 4);
+        memcpy(cfY.mapped, ay.coefs.data(), ay.coefs.size() * 4);
+        auto tmpBuf = g.ssbo(size_t(outW) * s.H * 4);
+        auto outRgba = g.ssbo(size_t(outW) * outH * 4);
+
+        // one submit, three dispatches:
+        //   set0: decoded RGBA -> temp (outW x inH), horizontal
+        //   set1: temp -> out RGBA (outW x outH), vertical
+        //   set2: out RGBA -> packed bytes
+        g.bindR(0, 0, s.px);
+        g.bindR(0, 1, bndX);
+        g.bindR(0, 2, cfX);
+        g.bindR(0, 3, tmpBuf);
+        g.bindR(1, 0, tmpBuf);
+        g.bindR(1, 1, bndY);
+        g.bindR(1, 2, cfY);
+        g.bindR(1, 3, outRgba);
+        g.bindR(2, 0, outRgba);
+        g.bindR(2, 1, bndX);   // unused by pack — keep them valid
+        g.bindR(2, 2, cfX);
+        g.bindR(2, 3, packBuf);
+        g.v.oneTime([&](vk::CommandBuffer c) {
+            uint32_t pc[6] = {uint32_t(s.W),   uint32_t(s.H),
+                              uint32_t(outW),  uint32_t(s.H),
+                              uint32_t(ax.ksize), 0u};
+            c.pushConstants(g.rpipeLayout.get(),
+                            vk::ShaderStageFlagBits::eCompute, 0, 24,
+                            pc);
+            c.bindPipeline(vk::PipelineBindPoint::eCompute,
+                           g.pResample.get());
+            c.bindDescriptorSets(vk::PipelineBindPoint::eCompute,
+                                 g.rpipeLayout.get(), 0, g.rsets[0],
+                                 {});
+            c.dispatch((outW + 7) / 8, (s.H + 7) / 8, 1);
+            g.barrier(c);
+            uint32_t pc2[6] = {uint32_t(outW), uint32_t(s.H),
+                               uint32_t(outW), uint32_t(outH),
+                               uint32_t(ay.ksize), 1u};
+            c.pushConstants(g.rpipeLayout.get(),
+                            vk::ShaderStageFlagBits::eCompute, 0, 24,
+                            pc2);
+            c.bindDescriptorSets(vk::PipelineBindPoint::eCompute,
+                                 g.rpipeLayout.get(), 0, g.rsets[1],
+                                 {});
+            c.dispatch((outW + 7) / 8, (outH + 7) / 8, 1);
+            g.barrier(c);
+            c.pushConstants(g.rpipeLayout.get(),
+                            vk::ShaderStageFlagBits::eCompute, 0, 8,
+                            ppc);
+            c.bindDescriptorSets(vk::PipelineBindPoint::eCompute,
+                                 g.rpipeLayout.get(), 0, g.rsets[2],
+                                 {});
+            c.bindPipeline(vk::PipelineBindPoint::eCompute,
+                           g.pPack.get());
+            c.dispatch(uint32_t((outBytes + 1023) / 1024), 1, 1);
+        });
+        memcpy(out, packBuf.mapped, outBytes);
         return 0;
     } catch (...) {
         return -1;

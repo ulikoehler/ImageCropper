@@ -192,7 +192,11 @@ setInterval(()=>{
       statusEl.textContent=`${a.kind} timed out after ${ACTION_TIMEOUT/1000}s`;
       dirty=true;
     }
-  if(dirty){pumpWants();scheduleDraw();}
+  if(dirty){pumpWants()}
+  // Always redraw: draw() re-evaluates which visible tiles still lack a
+  // thumbnail and re-queues them. This is the self-healing loop that keeps
+  // a blank viewport from staying blank after lost/dropped pushes.
+  scheduleDraw();
 },1000);
 function onData(f){
   if(f.type===EV_THUMB){
@@ -210,10 +214,14 @@ function onData(f){
     // the id was reassigned mid-flight, tombstoned, or the file changed.
     // Unknown ids (manifest still loading) are kept: ids are positional
     // from that same manifest, and resyncs clear thumbs anyway.
-    if(it&&(it.removed||(sig!=="0"&&it.sig!==sig)))return;
-    if(sig!=="0"&&thumbs.has(id))return;   // exact duplicate
+    // A dropped frame must still trigger a redraw: the tile is missing and
+    // `pending` was just cleared, so the next draw re-requests it. Without
+    // this the page can go idle on a viewport full of blank tiles.
+    if(it&&(it.removed||(sig!=="0"&&it.sig!==sig))){scheduleDraw();return}
+    if(sig!=="0"&&thumbs.has(id)){scheduleDraw();return}   // exact duplicate
     createImageBitmap(new Blob([jpeg],{type:"image/jpeg"})).then(bmp=>{
-      thumbs.set(id,bmp); scheduleDraw();});
+      thumbs.set(id,bmp); scheduleDraw();},
+      ()=>{pending.delete(id);scheduleDraw()});   // undecodable: retry later
   } else if(f.type===EV_EVENT){
     const ev=JSON.parse(new TextDecoder().decode(f.payload));
     if(ev.ev==="action-done"){

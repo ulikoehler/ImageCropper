@@ -87,7 +87,13 @@ impl Loader {
                     match file_bytes {
                         Ok(bytes) => {
                             let decode_start = Instant::now();
-                            let img_result = decode_image_bytes(&path, &bytes);
+                            // Restart-marker JPEGs: GPU decode+resize in one
+                            // session (the ≤4K image is all we need — the
+                            // full-res pixels never reach the host).
+                            let img_result = crate::gpujpeg::open(&bytes)
+                                .and_then(|s| s.resize_image_rgba(3840, 2160))
+                                .map(Ok)
+                                .unwrap_or_else(|| decode_image_bytes(&path, &bytes));
                             let decode_duration = decode_start.elapsed();
                             drop(bytes); // Free memory early
 
