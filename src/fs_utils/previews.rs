@@ -92,27 +92,35 @@ pub fn screen_dir_for(source: &Path) -> PathBuf {
         .join(format!("{:016x}", source_key(source)))
 }
 
+/// Screen-preview path for a known signature — no I/O at all.
+fn screen_path_with_sig(source: &Path, len: u64, nanos: u128) -> PathBuf {
+    let sig = len ^ nanos as u64 ^ (nanos >> 64) as u64;
+    screen_dir_for(source).join(format!("{sig}-f{SCREEN_MAX_DIM}.jpg"))
+}
+
 /// Expected fullscreen-preview path for the source's current signature.
 /// Stale variants (different signature) are pruned on write.
 pub fn screen_preview_path(source: &Path) -> Option<PathBuf> {
-    let sig = preview_sig_u64(source)?;
-    Some(screen_dir_for(source).join(format!("{sig}-f{SCREEN_MAX_DIM}.jpg")))
+    let (len, nanos) = source_signature(source)?;
+    Some(screen_path_with_sig(source, len, nanos))
 }
 
 /// Read the cached fullscreen preview, generating + persisting it if
 /// missing. Returns (jpeg bytes, preview w, preview h).
 pub fn produce_screen_jpeg(source: &Path) -> Option<(Vec<u8>, u32, u32)> {
-    let path = screen_preview_path(source)?;
+    let (len, nanos) = source_signature(source)?;
+    let path = screen_path_with_sig(source, len, nanos);
     if !path.exists() {
-        ensure_screen_preview(source, None);
+        ensure_screen_preview(source, None, Some((len, nanos)));
     }
-    match std::fs::read(&path) {
-        Ok(jpeg) => {
-            let (w, h) = image::image_dimensions(&path).unwrap_or((0, 0));
-            Some((jpeg, w, h))
-        }
-        Err(_) => None,
-    }
+    let jpeg = std::fs::read(&path).ok()?;
+    // Dimensions from the bytes in hand — never re-open the file.
+    let (w, h) = image::ImageReader::new(std::io::Cursor::new(&jpeg))
+        .with_guessed_format()
+        .ok()?
+        .into_dimensions()
+        .unwrap_or((0, 0));
+    Some((jpeg, w, h))
 }
 
 /// Like [`produce_screen_jpeg`] but returns the decoded preview image —
@@ -123,11 +131,13 @@ pub fn produce_screen_image(source: &Path) -> Option<DynamicImage> {
 }
 
 /// Ensure a fullscreen-size preview exists in the global cache. `decoded`
-/// may pass an already-decoded source image to avoid a second decode.
-fn ensure_screen_preview(source: &Path, decoded: Option<&DynamicImage>) {
-    let Some(expected) = screen_preview_path(source) else {
+/// may pass an already-decoded source image to avoid a second decode;
+/// `sig` carries the caller's `source_signature` to skip a second stat.
+fn ensure_screen_preview(source: &Path, decoded: Option<&DynamicImage>, sig: Option<(u64, u128)>) {
+    let Some((len, nanos)) = sig.or_else(|| source_signature(source)) else {
         return;
     };
+    let expected = screen_path_with_sig(source, len, nanos);
     if expected.exists() {
         return;
     }
@@ -216,32 +226,34 @@ pub fn remove_previews_for(source: &Path) {
 
 /// Load the cached preview or generate, persist and return a fresh one.
 /// Returns the decoded preview image (≤ `THUMB_MAX_DIM`).
+///
+/// Cache-hit I/O on slow/remote filesystems is kept minimal: one
+/// `stat` (signature) plus one `read` of the deterministic preview
+/// path — no directory scan, no second stat, no touching the source.
 pub fn produce_preview_image(path: &Path) -> Option<DynamicImage> {
     let (len, nanos) = source_signature(path)?;
     let source_name = path.file_name()?.to_string_lossy().into_owned();
     let expected_name = preview_file_name(&source_name, len, nanos);
-    let dir = previews_dir_for(path);
+    let expected = previews_dir_for(path).join(&expected_name);
 
-    // Fast path: an up-to-date preview exists on disk.
-    if let Some(cached) = find_cached_preview(&dir, path, &expected_name) {
-        if let Ok(bytes) = std::fs::read(&cached) {
-            if let Ok(img) = decode_image_bytes(&cached, &bytes) {
-                ensure_screen_preview(path, None);
-                if verbose() {
-                    eprintln!("preview cache hit: {}", path.display());
-                }
-                return Some(img);
+    // Fast path: the deterministic path exists → read it straight away.
+    if let Ok(bytes) = std::fs::read(&expected) {
+        if let Ok(img) = decode_image_bytes(&expected, &bytes) {
+            ensure_screen_preview(path, None, Some((len, nanos)));
+            if verbose() {
+                eprintln!("preview cache hit: {}", path.display());
             }
+            return Some(img);
         }
         // Corrupt preview — regenerate.
-        let _ = std::fs::remove_file(&cached);
+        let _ = std::fs::remove_file(&expected);
     }
 
     // Slow path: decode the source, downscale, persist.
     let bytes = std::fs::read(path).ok()?;
     let image = decode_image_bytes(path, &bytes).ok()?;
     drop(bytes);
-    ensure_screen_preview(path, Some(&image));
+    ensure_screen_preview(path, Some(&image), Some((len, nanos)));
     let thumb = resize_to_fit(image, THUMB_MAX_DIM, THUMB_MAX_DIM);
     persist_preview(path, &expected_name, &thumb);
     if verbose() {
@@ -254,29 +266,35 @@ pub fn produce_preview_image(path: &Path) -> Option<DynamicImage> {
 /// the source image's natural dimensions — the form the web server needs.
 /// Also ensures the fullscreen-size preview exists in `~/.cache`, so
 /// hold-`f` previews are preloaded alongside thumbnails.
-pub fn produce_preview_bytes(path: &Path) -> Option<(Vec<u8>, u32, u32)> {
+///
+/// `dims_hint` (w,h already known — e.g. from the manifest) lets a cache
+/// hit skip opening the source file entirely; without it the source's
+/// header is read for dimensions, same as before.
+pub fn produce_preview_bytes(
+    path: &Path,
+    dims_hint: Option<(u32, u32)>,
+) -> Option<(Vec<u8>, u32, u32)> {
     let (len, nanos) = source_signature(path)?;
     let source_name = path.file_name()?.to_string_lossy().into_owned();
     let expected_name = preview_file_name(&source_name, len, nanos);
-    let dir = previews_dir_for(path);
+    let expected = previews_dir_for(path).join(&expected_name);
 
-    if let Some(cached) = find_cached_preview(&dir, path, &expected_name) {
-        if let Ok(bytes) = std::fs::read(&cached) {
-            ensure_screen_preview(path, None);
-            let dims = image::image_dimensions(path).unwrap_or((0, 0));
-            if verbose() {
-                eprintln!("preview cache hit: {}", path.display());
-            }
-            return Some((bytes, dims.0, dims.1));
+    if let Ok(bytes) = std::fs::read(&expected) {
+        ensure_screen_preview(path, None, Some((len, nanos)));
+        let dims = dims_hint
+            .or_else(|| image::image_dimensions(path).ok())
+            .unwrap_or((0, 0));
+        if verbose() {
+            eprintln!("preview cache hit: {}", path.display());
         }
-        let _ = std::fs::remove_file(&cached);
+        return Some((bytes, dims.0, dims.1));
     }
 
     let bytes = std::fs::read(path).ok()?;
     let image = decode_image_bytes(path, &bytes).ok()?;
     drop(bytes);
     let (w, h) = (image.width(), image.height());
-    ensure_screen_preview(path, Some(&image));
+    ensure_screen_preview(path, Some(&image), Some((len, nanos)));
     let thumb = resize_to_fit(image, THUMB_MAX_DIM, THUMB_MAX_DIM);
 
     let mut jpeg = Vec::new();
@@ -293,9 +311,18 @@ pub fn produce_preview_bytes(path: &Path) -> Option<(Vec<u8>, u32, u32)> {
     Some((jpeg, w, h))
 }
 
+/// Prune stale signature variants of `source` in `dir`, keeping
+/// `expected_name`. Runs on the write path only — cache hits never scan.
+fn prune_stale_previews(dir: &Path, source: &Path, expected_name: &str) {
+    // find_cached_preview deletes every prefix-matching file that isn't
+    // expected_name as it scans — exactly the pruning we need here.
+    let _ = find_cached_preview(dir, source, expected_name);
+}
+
 fn persist_preview(source: &Path, expected_name: &str, thumb: &DynamicImage) {
     let parent = source.parent().unwrap_or_else(|| Path::new("."));
     if let Ok(preview_dir) = prepare_dir(parent, PREVIEWS_DIR) {
+        prune_stale_previews(&preview_dir, source, expected_name);
         let preview_path = preview_dir.join(expected_name);
         if let Ok(file) = std::fs::File::create(&preview_path) {
             let writer = std::io::BufWriter::new(file);
@@ -310,6 +337,7 @@ fn persist_preview(source: &Path, expected_name: &str, thumb: &DynamicImage) {
 fn persist_preview_bytes(source: &Path, expected_name: &str, jpeg: &[u8]) {
     let parent = source.parent().unwrap_or_else(|| Path::new("."));
     if let Ok(preview_dir) = prepare_dir(parent, PREVIEWS_DIR) {
+        prune_stale_previews(&preview_dir, source, expected_name);
         let _ = std::fs::write(preview_dir.join(expected_name), jpeg);
     }
 }

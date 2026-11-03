@@ -12,7 +12,7 @@ fn delete_moves_to_trash_and_purges_previews() {
     with_temp_workdir(|root| {
         let img = root.join("a.png");
         write_image(&img, &solid_image(40, 40, [9, 9, 9, 255]));
-        produce_preview_bytes(&img).unwrap();
+        produce_preview_bytes(&img, None).unwrap();
         assert!(previews_dir_for(&img).read_dir().unwrap().next().is_some());
 
         let sig = preview_sig_u64(&img).unwrap();
@@ -99,7 +99,7 @@ fn move_lands_in_move_dir_and_purges_previews() {
     with_temp_workdir(|root| {
         let img = root.join("b.png");
         write_image(&img, &solid_image(24, 24, [200, 100, 50, 255]));
-        produce_preview_bytes(&img).unwrap();
+        produce_preview_bytes(&img, None).unwrap();
         let dest = root.join("moved");
         std::fs::create_dir_all(&dest).unwrap();
 

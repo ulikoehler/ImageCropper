@@ -3,10 +3,10 @@
 //! the PushScheduler can stream previews as they're generated.
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     num::NonZeroUsize,
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, RwLock},
 };
 
 use lru::LruCache;
@@ -26,15 +26,21 @@ pub struct PreviewStore {
     cache: Mutex<LruCache<PathBuf, Preview>>,
     /// In-flight/queued paths — kept for tests; the pool dedupes anyway.
     pub pending: Mutex<HashSet<PathBuf>>,
+    /// Natural source dims already sniffed at manifest build/upsert time —
+    /// lets a preview cache hit skip opening the source file at all.
+    dims: Arc<RwLock<HashMap<PathBuf, (u32, u32)>>>,
 }
 
 impl PreviewStore {
     /// `concurrency` is the scaling ceiling (`-j`); `ram_cache` entries held
     /// decoded-to-JPEG in RAM.
     pub fn new(concurrency: usize, ram_cache: usize) -> Self {
+        let dims = Arc::new(RwLock::new(HashMap::new()));
+        let worker_dims = dims.clone();
         Self {
-            pool: AdaptivePool::new(2, concurrency.max(1), |path| {
-                produce_preview_bytes(path).map(|(jpeg, w, h)| Preview {
+            pool: AdaptivePool::new(2, concurrency.max(1), move |path| {
+                let hint = worker_dims.read().unwrap().get(path).copied();
+                produce_preview_bytes(path, hint).map(|(jpeg, w, h)| Preview {
                     jpeg: Arc::new(jpeg),
                     w,
                     h,
@@ -42,6 +48,15 @@ impl PreviewStore {
             }),
             cache: Mutex::new(LruCache::new(NonZeroUsize::new(ram_cache.max(1)).unwrap())),
             pending: Mutex::new(HashSet::new()),
+            dims,
+        }
+    }
+
+    /// Record natural dims for a path (from manifest sniffing) so preview
+    /// production can answer `w`/`h` without opening the source.
+    pub fn note_dims(&self, path: &PathBuf, dims: (u32, u32)) {
+        if dims != (0, 0) {
+            self.dims.write().unwrap().insert(path.clone(), dims);
         }
     }
 
@@ -89,7 +104,8 @@ impl PreviewStore {
         if let Some(p) = self.cached(path) {
             return Some(p);
         }
-        let preview = produce_preview_bytes(path).map(|(jpeg, w, h)| Preview {
+        let hint = self.dims.read().unwrap().get(path).copied();
+        let preview = produce_preview_bytes(path, hint).map(|(jpeg, w, h)| Preview {
             jpeg: Arc::new(jpeg),
             w,
             h,

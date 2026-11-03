@@ -62,6 +62,11 @@ impl ServerState {
     ) -> Arc<Self> {
         let manifest = Manifest::build(&files, &roots, mode, mouse_select, 1);
         let previews = Arc::new(PreviewStore::new(parallel, 2048));
+        for item in &manifest.items {
+            if let Some(path) = manifest.path_of(item.id) {
+                previews.note_dims(&path, (item.w, item.h));
+            }
+        }
         previews.request_all(files.iter());
         let (events, _) = broadcast::channel(256);
         Arc::new(Self {
@@ -110,6 +115,11 @@ impl ServerState {
                 (p, w, h, bytes, sig)
             })
             .collect();
+        // Feed the dims hint map before queueing — manifest sniffing already
+        // paid for this information, so preview cache hits won't pay again.
+        for (p, w, h, _, _) in &sniffed {
+            self.previews.note_dims(p, (*w, *h));
+        }
 
         let (added, patch_json) = {
             let mut m = self.manifest.write().unwrap();

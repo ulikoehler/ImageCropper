@@ -173,7 +173,7 @@ fn pregenerate_stream(stream: ScanStream, parallel: usize) {
     use std::sync::mpsc::RecvTimeoutError;
     use std::time::Duration;
 
-    let pool = AdaptivePool::new(2, parallel.max(1), |p| produce_preview_bytes(p));
+    let pool = AdaptivePool::new(2, parallel.max(1), |p| produce_preview_bytes(p, None));
     let mut queued = 0usize;
     let mut done = 0usize;
     let mut scanning = true;
