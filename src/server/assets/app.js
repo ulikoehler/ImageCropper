@@ -30,7 +30,7 @@ const topEl=document.getElementById("top"), statusEl=document.getElementById("st
 helpEl.textContent="scroll: wheel · zoom: +/- · width: w/W · select: click/ctrl/shift · delete: Del · move: m · fullscreen: f (toggle, ←/→) · crop: c";
 
 let manifest=null, items=[], thumbs=new Map(), pending=new Map();
-let scanning=false;
+let scanning=false, scanErrs=[];
 let tileH=180, zoom=1.0, scrollY=0, selected=new Set(), focus=0, anchor=0;
 let creditBudget=8*1024*1024;
 
@@ -292,6 +292,14 @@ function onData(f){
       }
     }
     if(ev.ev==="scan-start"){scanning=true;scheduleDraw();}
+    if(ev.ev==="scan-end"){scanning=false;
+      if(ev.count===0&&!scanErrs.length)statusEl.textContent=
+        "no images found — check the path, extensions and filters (use -r for subdirs)";
+      else if(scanErrs.length)statusEl.textContent=
+        `scan done — ${ev.count} images, ${scanErrs.length} errors (last: ${scanErrs[scanErrs.length-1]})`;
+      scheduleDraw();}
+    if(ev.ev==="scan-error"){scanErrs.push(ev.msg||"?");
+      statusEl.textContent=`scan error: ${ev.msg}`;scheduleDraw();}
     if(ev.ev==="manifest-patch"){applyPatch(ev.patch||{});}
     if(ev.ev==="fs-changed"){refreshManifest();}
     if(ev.ev==="progress") statusEl.textContent=

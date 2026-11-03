@@ -639,6 +639,13 @@ pub fn spawn_scan_feeder(state: &Arc<ServerState>, stream: crate::cli::ScanStrea
                 }
                 Ok(ScanEvent::Error(e)) => {
                     eprintln!("scan: {e}");
+                    // Surface scan errors to clients — a directory that
+                    // can't be read must not silently show "0 images".
+                    if let Ok(json) = serde_json::to_string(
+                        &serde_json::json!({"ev": "scan-error", "msg": e}),
+                    ) {
+                        let _ = state.events.send(ServerEvent::Json(json));
+                    }
                     false
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => true,
@@ -678,6 +685,11 @@ pub fn spawn_scan_feeder(state: &Arc<ServerState>, stream: crate::cli::ScanStrea
         if crate::fs_utils::verbose() {
             eprintln!("scan: {} items indexed", state.item_count());
         }
+        // Let clients distinguish "still scanning" from "done, found
+        // nothing" — the manifest resync alone can't express that.
+        let _ = state.events.send(ServerEvent::Json(format!(
+            "{{\"ev\":\"scan-end\",\"count\":{found}}}"
+        )));
     });
 }
 
