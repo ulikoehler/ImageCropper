@@ -11,11 +11,20 @@
        padding:6px 10px;background:rgba(0,0,0,.55);pointer-events:none}
   #top{position:absolute;left:0;top:0;color:#eee;font:13px/1.4 system-ui;
        padding:6px 10px;background:rgba(0,0,0,.55);pointer-events:none}
+  #fsbar{position:absolute;right:0;top:0;display:none;color:#eee;
+         font:13px/1.4 system-ui;padding:6px 10px;background:rgba(0,0,0,.55);
+         pointer-events:none;align-items:center;gap:8px;max-width:75vw}
+  #fspath{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  #fscopy{pointer-events:auto;background:#333;border:1px solid #666;
+          color:#eee;font:inherit;padding:1px 8px;cursor:pointer;
+          border-radius:3px}
+  #fscopy:hover{background:#444}
 </style>
 </head>
 <body>
 <canvas id="c"></canvas>
 <div id="top"></div>
+<div id="fsbar"><span id="fspath"></span><button id="fscopy">copy</button></div>
 <div id="hud"><span id="status"></span><span id="help"></span></div>
 <script src="/app.js"></script>
 </body>

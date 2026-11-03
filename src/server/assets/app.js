@@ -408,6 +408,25 @@ const tileNearest=(x,y)=>{
 
 // ---- `f` fullscreen preview (1920-class JPEG from /bulk) ----
 let fsMode=false, screenBmp=null, screenIdx=-1;
+const fsBar=document.getElementById("fsbar"),
+      fsPathEl=document.getElementById("fspath"),
+      fsCopyEl=document.getElementById("fscopy");
+const fsItemPath=i=>{
+  const it=items[i];
+  return it&&manifest?`${manifest.dirs[it.dir_index]}/${it.name}`:"";
+};
+fsCopyEl.onclick=()=>{
+  const p=fsItemPath(focus);if(!p)return;
+  const done=()=>{fsCopyEl.textContent="copied";
+    setTimeout(()=>fsCopyEl.textContent="copy",1200)};
+  const legacy=()=>{   // clipboard API needs a secure context
+    const ta=document.createElement("textarea");ta.value=p;
+    document.body.appendChild(ta);ta.select();
+    try{document.execCommand("copy");done()}catch(e){}
+    ta.remove();};
+  if(navigator.clipboard)navigator.clipboard.writeText(p).then(done,legacy);
+  else legacy();
+};
 // Last mouse position in client coords (-1 = outside). Consulted once
 // when `f` mode is entered — the fullscreen preview does not follow
 // the pointer; Left/Right arrows navigate instead.
@@ -455,6 +474,7 @@ function draw(){
   scrollY=Math.min(scrollY,Math.max(0,rowY(rows.length)-H));
   canvas.style.width=innerWidth+"px";canvas.style.height=innerHeight+"px";
   ctx.fillStyle="#111";ctx.fillRect(0,0,W,H);
+  fsBar.style.display=fsMode?"flex":"none";
 
   if(fsMode){
     ctx.fillStyle="#000";ctx.fillRect(0,0,W,H);
@@ -468,8 +488,10 @@ function draw(){
       ctx.fillStyle="#888";ctx.font=`${16*devicePixelRatio}px monospace`;
       ctx.fillText("loading fullscreen preview…",W/2-160*devicePixelRatio,H/2);
     }
+    fsPathEl.textContent=fsItemPath(fi);
+    fsPathEl.title=fsPathEl.textContent;
     let liveFs=0;for(const it2 of items)if(it2&&!it2.removed)liveFs++;
-    topEl.textContent=`${liveFs} images · fullscreen: ${it?it.name:"?"}`;
+    topEl.textContent=`${liveFs} images · fullscreen`;
     return;
   }
   // Missing tiles: everything on screen first, then the prefetch ring (one
