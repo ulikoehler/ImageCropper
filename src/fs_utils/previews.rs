@@ -263,6 +263,11 @@ pub fn find_cached_preview(dir: &Path, source: &Path, expected_name: &str) -> Op
 
     for entry in std::fs::read_dir(dir).ok()?.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with(".tmp-") {
+            // Orphaned atomic-write scratch file (crash mid-persist).
+            let _ = std::fs::remove_file(entry.path());
+            continue;
+        }
         if !name.starts_with(&prefix) {
             continue;
         }
@@ -509,18 +514,38 @@ fn persist_preview(source: &Path, expected_name: &str, thumb: &DynamicImage) {
     }
 }
 
+/// Counter making each persist's scratch path unique within the process —
+/// concurrent producers of the same preview (want + sweep + pin-fill all
+/// racing a miss) must never interleave into one shared tmp file, or the
+/// rename could publish a Frankenstein mix of two encodes.
+static PERSIST_TMP_CTR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn persist_preview_bytes(source: &Path, expected_name: &str, jpeg: &[u8]) {
+    use std::io::Write;
     let parent = source.parent().unwrap_or_else(|| Path::new("."));
     if let Ok(preview_dir) = prepare_dir(parent, PREVIEWS_DIR) {
         prune_stale_previews(&preview_dir, source, expected_name);
         // tmp + rename: a crash mid-write must never leave a truncated file
         // that looks like a finished preview — readers and later runs would
-        // serve corrupt bytes forever.
+        // serve corrupt bytes forever. `.tmp-` prefix hides the scratch
+        // file from the source-prefix prune and marks it for cleanup.
         let target = preview_dir.join(expected_name);
-        let tmp = preview_dir.join(format!("{expected_name}.tmp-{}", std::process::id()));
-        if std::fs::write(&tmp, jpeg).is_ok() {
-            let _ = std::fs::rename(&tmp, &target);
-        } else {
+        let tmp = preview_dir.join(format!(
+            ".tmp-{}-{}",
+            std::process::id(),
+            PERSIST_TMP_CTR.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let ok = std::fs::File::create(&tmp)
+            .and_then(|mut f| {
+                f.write_all(jpeg)?;
+                // fsync: surfaces close-time writeback failures (9p,
+                // virtiofs) that a plain write() would swallow — better
+                // no preview than a silently truncated one.
+                f.sync_all()
+            })
+            .and_then(|_| std::fs::rename(&tmp, &target))
+            .is_ok();
+        if !ok {
             let _ = std::fs::remove_file(&tmp);
         }
     }

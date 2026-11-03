@@ -98,3 +98,33 @@ fn preview_store_regenerate_replaces_corrupt_bytes() {
     assert_eq!(&healed.jpeg[0..2], &[0xFF, 0xD8]);
     assert_eq!(healed.jpeg.len(), good.jpeg.len());
 }
+
+#[test]
+fn concurrent_produce_of_same_path_all_succeed() {
+    let tmp = tempdir().unwrap();
+    let src = tmp.path().join("c.png");
+    write_image(&src, &solid_image(200, 150, [60, 160, 220, 255]));
+    let store = std::sync::Arc::new(imagecropper::server::PreviewStore::new(4, 16));
+
+    // 8 threads race the same missing preview — the in-flight slot dedups
+    // them onto one production; every caller must still get valid bytes.
+    std::thread::scope(|s| {
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let store = store.clone();
+            let src = src.clone();
+            handles.push(s.spawn(move || store.get_or_produce(&src)));
+        }
+        let mut first = None;
+        for h in handles {
+            let p = h.join().unwrap().expect("produce");
+            assert_eq!(&p.jpeg[0..2], &[0xFF, 0xD8]);
+            if let Some(f) = &first {
+                assert_eq!(&p.jpeg, f);
+            } else {
+                first = Some(p.jpeg);
+            }
+        }
+    });
+    assert_eq!(store.inflight_len(), 0, "no leaked in-flight slots");
+}

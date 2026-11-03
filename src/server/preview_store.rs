@@ -67,11 +67,45 @@ impl Ram {
     }
 }
 
+/// Dedup slot for inline `get_or_produce` calls: the first caller for a
+/// path produces, followers wait on `cv` and clone the result. Without
+/// this every want/sweep/pin racer of the same miss pays a full
+/// decode+encode — and all of them log/cache-check the same file.
+struct Inflight {
+    /// None = still producing; Some(result) = finished (result may be None).
+    done: Mutex<Option<Option<Preview>>>,
+    cv: Condvar,
+}
+
+/// Removes the leader's map entry even on panic — waiters must never hang.
+/// An unfilled result is completed as `None` (produce failure), which the
+/// callers already handle via the normal miss path.
+struct InflightGuard<'a> {
+    map: &'a Mutex<HashMap<PathBuf, Arc<Inflight>>>,
+    path: PathBuf,
+    slot: Arc<Inflight>,
+}
+
+impl Drop for InflightGuard<'_> {
+    fn drop(&mut self) {
+        {
+            let mut d = self.slot.done.lock().unwrap();
+            if d.is_none() {
+                *d = Some(None);
+            }
+        }
+        self.slot.cv.notify_all();
+        self.map.lock().unwrap().remove(&self.path);
+    }
+}
+
 pub struct PreviewStore {
     pool: AdaptivePool<Option<Preview>>,
     ram: Mutex<Ram>,
     /// In-flight/queued paths — kept for tests; the pool dedupes anyway.
     pub pending: Mutex<HashSet<PathBuf>>,
+    /// Inline produces currently running, keyed by source path.
+    inflight: Mutex<HashMap<PathBuf, Arc<Inflight>>>,
     /// Natural source dims already sniffed at manifest build/upsert time —
     /// lets a preview cache hit skip opening the source file at all.
     dims: Arc<RwLock<HashMap<PathBuf, (u32, u32)>>>,
@@ -151,6 +185,7 @@ impl PreviewStore {
                 capacity,
             }),
             pending: Mutex::new(HashSet::new()),
+            inflight: Mutex::new(HashMap::new()),
             dims,
             stopped: AtomicBool::new(false),
             gate,
@@ -286,7 +321,9 @@ impl PreviewStore {
 
     /// Synchronous produce for paths that bypass the queue (e.g. a WANT that
     /// isn't cached yet — still cheaper than making the client wait for the
-    /// background sweep to reach it).
+    /// background sweep to reach it). Concurrent calls for the same path
+    /// share one production: the leader produces, followers wait on the
+    /// slot and clone its result.
     pub fn get_or_produce(&self, path: &PathBuf) -> Option<Preview> {
         if let Some(p) = self.cached(path) {
             if crate::fs_utils::verbose() {
@@ -298,6 +335,48 @@ impl PreviewStore {
         if self.stopped() {
             return None;
         }
+        // Leader produces; followers wait on the shared slot. A wedged
+        // produce (network mount) blocks followers too, but the callers'
+        // own waits are already bounded by PRODUCE_TIMEOUT — and a leader
+        // that panics completes the slot as failure via InflightGuard.
+        let (slot, leader) = {
+            let mut m = self.inflight.lock().unwrap();
+            match m.get(path) {
+                Some(s) => (s.clone(), false),
+                None => {
+                    let s = Arc::new(Inflight {
+                        done: Mutex::new(None),
+                        cv: Condvar::new(),
+                    });
+                    m.insert(path.clone(), s.clone());
+                    (s, true)
+                }
+            }
+        };
+        if !leader {
+            let mut g = slot.done.lock().unwrap();
+            loop {
+                if let Some(res) = &*g {
+                    return res.clone();
+                }
+                // Leader vanished without a result (map entry removed by a
+                // different exit path) — take over rather than hang.
+                if !self.inflight.lock().unwrap().contains_key(path) {
+                    drop(g);
+                    return self.get_or_produce(path);
+                }
+                let (ng, _) = slot
+                    .cv
+                    .wait_timeout(g, std::time::Duration::from_millis(250))
+                    .unwrap();
+                g = ng;
+            }
+        }
+        let _guard = InflightGuard {
+            map: &self.inflight,
+            path: path.clone(),
+            slot: slot.clone(),
+        };
         // A live client is waiting for this — mark it so background work
         // (preload, deletes, crops) holds off while it runs.
         let _client = self.gate.client_work();
@@ -313,6 +392,7 @@ impl PreviewStore {
             // fill thread — never inline on the thumbnail hot path.
             self.screen.push(path.clone());
         }
+        *slot.done.lock().unwrap() = Some(preview.clone());
         preview
     }
 
@@ -324,6 +404,12 @@ impl PreviewStore {
     #[doc(hidden)]
     pub fn ram_insert_for_test(&self, path: PathBuf, preview: Preview) {
         self.ram.lock().unwrap().insert(path, preview);
+    }
+
+    /// Test hook: inline produces still in flight (should drain to zero).
+    #[doc(hidden)]
+    pub fn inflight_len(&self) -> usize {
+        self.inflight.lock().unwrap().len()
     }
 
     /// Drop every cached copy of `path`'s preview (RAM + persisted file)
