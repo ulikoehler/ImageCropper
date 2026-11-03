@@ -5,9 +5,9 @@ use std::sync::Arc;
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
-        State,
+        Query, State,
     },
-    response::Response,
+    response::{IntoResponse, Response},
 };
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
@@ -25,7 +25,14 @@ const FMT_ORIGINAL: u8 = 0;
 /// used by hold-`f` in the web client.
 const FMT_SCREEN: u8 = 2;
 
-pub async fn handler(ws: WebSocketUpgrade, State(state): State<Arc<ServerState>>) -> Response {
+pub async fn handler(
+    ws: WebSocketUpgrade,
+    State(state): State<Arc<ServerState>>,
+    Query(query): Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    if !super::ws_authed(&state, &query) {
+        return axum::http::StatusCode::UNAUTHORIZED.into_response();
+    }
     ws.max_message_size(1024)
         .on_upgrade(move |socket| handle(socket, state))
 }

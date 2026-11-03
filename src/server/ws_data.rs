@@ -5,16 +5,25 @@ use std::sync::Arc;
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
-        State,
+        Query, State,
     },
-    response::Response,
+    http::StatusCode,
+    response::{IntoResponse, Response},
 };
 use futures_util::{SinkExt, StreamExt};
+use std::collections::HashMap;
 use tokio::sync::{mpsc, Mutex};
 
 use super::{proto::*, ActionEnvelope, PushQueue, ServerEvent, ServerState};
 
-pub async fn handler(ws: WebSocketUpgrade, State(state): State<Arc<ServerState>>) -> Response {
+pub async fn handler(
+    ws: WebSocketUpgrade,
+    State(state): State<Arc<ServerState>>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    if !super::ws_authed(&state, &query) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
     ws.max_message_size(64 * 1024)
         .on_upgrade(move |socket| handle(socket, state))
 }

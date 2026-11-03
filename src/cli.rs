@@ -104,6 +104,18 @@ pub struct ScanArgs {
     pub order: SortOrder,
 }
 
+/// WebSocket auth mode for `--serve`.
+#[derive(clap::ValueEnum, Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ServeAuth {
+    /// Generate a random token; the printed/opened URL carries `?token=`.
+    #[default]
+    Token,
+    /// No token required — any client can connect.
+    None,
+    /// Fixed password supplied via -p/--password.
+    Password,
+}
+
 /// Headless/web-serving flags shared by `crop` and `album`.
 #[derive(Args, Debug, Clone, Default)]
 pub struct HeadlessArgs {
@@ -117,9 +129,15 @@ pub struct HeadlessArgs {
     #[arg(long, value_name = "ADDR:PORT")]
     pub serve: Option<SocketAddr>,
 
-    /// Bearer token required on WS connect (random and printed if unset)
-    #[arg(long)]
-    pub token: Option<String>,
+    /// WS auth: `token` (default: random, printed + in URL), `none`, or
+    /// `password` (fixed secret from -p/--password).
+    #[arg(long, value_enum, default_value_t = ServeAuth::Token)]
+    pub auth: ServeAuth,
+
+    /// Fixed password required on WS connect; implies auth regardless of
+    /// --auth (required for --auth=password).
+    #[arg(short = 'p', long)]
+    pub password: Option<String>,
 
     /// Initial per-client preview push credit in KB
     #[arg(long, default_value_t = 4096)]

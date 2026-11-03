@@ -99,9 +99,11 @@ async fn e2e_hello_manifest_thumbs_delete() {
     ))
     .await
     .unwrap();
-    let mut got_ids = Vec::new();
+    // Pushes are at-least-once: the proactive pump and the WANT fast path
+    // can race a duplicate — dedupe the received ids.
+    let mut got = std::collections::HashSet::new();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-    while got_ids.len() < 3 && std::time::Instant::now() < deadline {
+    while got.len() < 3 && std::time::Instant::now() < deadline {
         let msg = tokio::time::timeout(std::time::Duration::from_secs(5), data.next())
             .await
             .expect("thumb timeout")
@@ -113,9 +115,10 @@ async fn e2e_hello_manifest_thumbs_delete() {
             let id = u32::from_le_bytes(f.payload[0..4].try_into().unwrap());
             let jpeg = &f.payload[12..];
             assert_eq!(&jpeg[0..2], &[0xFF, 0xD8], "JPEG magic");
-            got_ids.push(id);
+            got.insert(id);
         }
     }
+    let mut got_ids: Vec<_> = got.into_iter().collect();
     got_ids.sort();
     assert_eq!(got_ids, vec![0, 1, 2]);
 
@@ -173,6 +176,40 @@ async fn e2e_healthz_and_static() {
     assert!(page.contains("/app.js"));
     let js = reqwest_get(&format!("http://{addr}/app.js")).await;
     assert!(js.contains("WebSocket"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_ws_auth_rejects_and_accepts_token() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_image(tmp.path().join("a.png"), &solid_image(8, 8, [0, 0, 0, 255]));
+    let state = ServerState::new(
+        vec![tmp.path().join("a.png")],
+        vec![tmp.path().to_path_buf()],
+        ServeMode::Album,
+        1,
+        Some("s3cret".into()),
+        4096,
+        None,
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = build_router(state);
+    tokio::spawn(async move { axum::serve(listener, router).await });
+
+    // No token → upgrade rejected at the HTTP layer on BOTH sockets.
+    assert!(connect_async(format!("ws://{addr}/data")).await.is_err());
+    assert!(connect_async(format!("ws://{addr}/bulk")).await.is_err());
+    // Wrong token → rejected too.
+    assert!(connect_async(format!("ws://{addr}/bulk?token=nope"))
+        .await
+        .is_err());
+    // Right token → upgrade succeeds.
+    connect_async(format!("ws://{addr}/data?token=s3cret"))
+        .await
+        .expect("authed /data");
+    connect_async(format!("ws://{addr}/bulk?token=s3cret"))
+        .await
+        .expect("authed /bulk");
 }
 
 /// Minimal HTTP/1.1 GET over a raw TcpStream (no reqwest dep).

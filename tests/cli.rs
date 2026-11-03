@@ -9,7 +9,7 @@ fn album_serve_and_no_gui_parse() {
         "album",
         "--serve=0.0.0.0:12345",
         "-G",
-        "--token",
+        "-p",
         "abc",
         "-r",
         "/photos",
@@ -23,7 +23,7 @@ fn album_serve_and_no_gui_parse() {
         Some("0.0.0.0:12345".parse::<SocketAddr>().unwrap())
     );
     assert!(a.headless.no_gui);
-    assert_eq!(a.headless.token.as_deref(), Some("abc"));
+    assert_eq!(a.headless.password.as_deref(), Some("abc"));
     assert!(a.scan.recursive);
 }
 
@@ -59,6 +59,47 @@ fn push_credit_default() {
     };
     assert_eq!(a.headless.push_credit_kb, 4096);
     assert!(a.headless.serve.is_none());
+}
+
+#[test]
+fn auth_defaults_to_token_and_parses_modes() {
+    use imagecropper::cli::ServeAuth;
+    let cli = Cli::try_parse_from(["imagecropper", "album", "/x"]).unwrap();
+    let Commands::Album(a) = cli.command else {
+        panic!()
+    };
+    assert_eq!(a.headless.auth, ServeAuth::Token);
+    assert!(a.headless.password.is_none());
+
+    let cli = Cli::try_parse_from([
+        "imagecropper",
+        "album",
+        "--auth=none",
+        "--serve=127.0.0.1:9",
+        "/x",
+    ])
+    .unwrap();
+    let Commands::Album(a) = cli.command else {
+        panic!()
+    };
+    assert_eq!(a.headless.auth, ServeAuth::None);
+
+    let cli = Cli::try_parse_from([
+        "imagecropper",
+        "album",
+        "--auth=password",
+        "-p",
+        "hunter2",
+        "/x",
+    ])
+    .unwrap();
+    let Commands::Album(a) = cli.command else {
+        panic!()
+    };
+    assert_eq!(a.headless.auth, ServeAuth::Password);
+    assert_eq!(a.headless.password.as_deref(), Some("hunter2"));
+
+    assert!(Cli::try_parse_from(["imagecropper", "album", "--auth=bogus", "/x"]).is_err());
 }
 
 #[test]

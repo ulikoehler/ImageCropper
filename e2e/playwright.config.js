@@ -21,7 +21,7 @@ module.exports = defineConfig({
   },
   projects: [{ name: "chromium", use: { browserName: "chromium" } }],
   webServer: {
-    command: `node ${JSON.stringify(path.join(__dirname, "fixtures.js"))} && ${JSON.stringify(BINARY)} album --serve=127.0.0.1:${PORT} -G -m ${JSON.stringify(MOVE_DIR)} ${JSON.stringify(FIXTURE_DIR)}`,
+    command: `node ${JSON.stringify(path.join(__dirname, "fixtures.js"))} && ${JSON.stringify(BINARY)} album --serve=127.0.0.1:${PORT} --auth=none -G -m ${JSON.stringify(MOVE_DIR)} ${JSON.stringify(FIXTURE_DIR)}`,
     url: `http://127.0.0.1:${PORT}/healthz`,
     reuseExistingServer: !process.env.CI,
     timeout: 120_000,

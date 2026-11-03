@@ -35,7 +35,7 @@ let tileH=180, zoom=1.0, scrollY=0, selected=new Set(), focus=0, anchor=0;
 let creditBudget=8*1024*1024;
 
 function connect(path){ return new Promise((res,rej)=>{
-  const ws=new WebSocket(`ws://${location.host}${path}`);
+  const ws=new WebSocket(`ws://${location.host}${path}?token=${encodeURIComponent(token)}`);
   ws.binaryType="arraybuffer"; ws.onopen=()=>res(ws); ws.onerror=rej; });
 }
 
@@ -108,11 +108,13 @@ async function boot(){
   layout(); draw();
 
   // credits: keep the push pipeline fed
-  const grant=()=>{data.send(frame(CL_CREDIT,0,(()=>{const b=new Uint8Array(8),
-    v=new DataView(b.buffer);v.setBigUint64(0,BigInt(creditBudget),true);return b})()));};
+  const grant=()=>{if(data.readyState===1){
+    data.send(frame(CL_CREDIT,0,(()=>{const b=new Uint8Array(8),
+      v=new DataView(b.buffer);v.setBigUint64(0,BigInt(creditBudget),true);return b})()));}};
   grant(); setInterval(grant, 500);
 
-  data.onclose=()=>setTimeout(()=>location.reload(),1500);
+  data.onclose=()=>{statusEl.textContent="connection closed — reloading…";
+    setTimeout(()=>location.reload(),1500);};
 }
 
 const thumbReqs=[];
@@ -242,7 +244,7 @@ function draw(){
     if(t.i===focus){ctx.strokeStyle="#fff";ctx.lineWidth=2;
       ctx.strokeRect(t.x+5,y+5,t.w-10,t.h-10);}
   }
-  if(want.length){
+  if(want.length&&dataWs&&dataWs.readyState===1){
     const b=new Uint8Array(2+4*want.length),v=new DataView(b.buffer);
     v.setUint16(0,want.length,true);
     want.forEach((id,i)=>v.setUint32(2+4*i,id,true));
@@ -315,4 +317,11 @@ canvas.addEventListener("click",e=>{
 });
 addEventListener("resize",()=>{layout();draw()});
 
-boot().catch(e=>statusEl.textContent="connect failed: "+e);
+boot().catch(e=>{
+  // WS upgrade refused — most likely auth (--auth=token / -p password).
+  statusEl.textContent="connect failed — "+e;
+  const t=prompt("Connection refused — enter the server token/password to retry:");
+  if(t!=null&&t!==""){
+    const u=new URL(location.href);u.searchParams.set("token",t);location.href=u;
+  }
+});

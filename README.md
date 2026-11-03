@@ -139,6 +139,7 @@ imagecropper crop  -G --resave /photos                 # headless: batch resave
 *   Files stream into the manifest as the background scan discovers them; clients show partial lists immediately.
 *   The web client mirrors the native album controls (click/ctrl/shift selection, arrows, `+/-`, `w/W`, `Delete`, `m`, hold-`f` fullscreen).
 *   `-v/--verbose` prints scan progress, preview cache hits/generation and actions to stderr.
+*   Auth defaults to `--auth=token` — a random token generated per run; the printed/opened URL already contains `?token=…` (required for the WS upgrade on both sockets). `--auth=none` disables auth entirely; `--auth=password -p <SECRET>` (or `-p` alone) pins a fixed password — the client prompts for it when the URL lacks `?token=`.
 
 ## Features
 

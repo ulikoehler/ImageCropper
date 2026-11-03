@@ -119,20 +119,21 @@ fn serve(
     move_dir: Option<PathBuf>,
 ) -> Result<()> {
     let stream = spawn_scan_stream(&scan)?;
+    // -p/--password pins the secret outright; --auth=password requires it.
+    let token = match (&headless.password, headless.auth) {
+        (Some(p), _) => Some(p.clone()),
+        (None, imagecropper::cli::ServeAuth::Token) => Some(random_token()),
+        (None, imagecropper::cli::ServeAuth::Password) => {
+            anyhow::bail!("--auth=password requires -p/--password <SECRET>");
+        }
+        (None, imagecropper::cli::ServeAuth::None) => None,
+    };
     let state = ServerState::new(
         Vec::new(),
         scan.paths.clone(),
         mode,
         scan.parallel,
-        headless.token.clone().or_else(|| {
-            // Keep it usable without a token on loopback; generate one when
-            // binding a non-loopback address.
-            if addr.ip().is_loopback() {
-                None
-            } else {
-                Some(random_token())
-            }
-        }),
+        token,
         headless.push_credit_kb,
         move_dir,
     );

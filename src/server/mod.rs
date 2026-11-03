@@ -360,11 +360,19 @@ pub fn spawn_scan_feeder(state: &Arc<ServerState>, stream: crate::cli::ScanStrea
     });
 }
 
+/// Token check at WS upgrade time (`?token=` query param). Returns `true`
+/// when no token is configured or the supplied token matches. Both sockets
+/// enforce it — `/bulk` must never be a backdoor around `/data`'s HELLO.
+fn ws_authed(state: &ServerState, query: &std::collections::HashMap<String, String>) -> bool {
+    state.token.is_none() || query.get("token").map(String::as_str) == state.token.as_deref()
+}
+
 /// Build the axum router (public for tests binding ephemeral ports).
 pub fn build_router(state: Arc<ServerState>) -> Router {
     Router::new()
         .route("/", get(http::index))
         .route("/app.js", get(http::app_js))
+        .route("/favicon.ico", get(http::favicon))
         .route("/healthz", get(http::healthz))
         .route("/data", get(ws_data::handler))
         .route("/bulk", get(ws_bulk::handler))
@@ -377,13 +385,22 @@ pub fn run_server(addr: SocketAddr, state: Arc<ServerState>, open_browser: bool)
     rt.block_on(async move {
         let listener = tokio::net::TcpListener::bind(addr).await?;
         let bound = listener.local_addr()?;
-        eprintln!("Serving at http://{bound}/");
-        if let Some(token) = &state.token {
-            eprintln!("Token: {token}");
-        }
+        // A wildcard bind (0.0.0.0) isn't a useful browser address — open
+        // loopback instead. The token goes straight into the URL so the
+        // client's WS connects carry `?token=` automatically.
+        let host = if bound.ip().is_unspecified() {
+            "127.0.0.1".to_string()
+        } else {
+            bound.ip().to_string()
+        };
+        let url = match &state.token {
+            Some(t) => format!("http://{host}:{}/?token={t}", bound.port()),
+            None => format!("http://{host}:{}/", bound.port()),
+        };
+        eprintln!("Serving at {url}");
         state.spawn_pumps();
         if open_browser {
-            let _ = webbrowser::open(&format!("http://{bound}/"));
+            let _ = webbrowser::open(&url);
         }
         axum::serve(listener, build_router(state)).await?;
         Ok(())

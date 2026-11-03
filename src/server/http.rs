@@ -33,3 +33,8 @@ pub async fn healthz(State(state): State<Arc<ServerState>>) -> impl IntoResponse
     let n = state.manifest.read().unwrap().items.len();
     (StatusCode::OK, format!("ok {n}"))
 }
+
+/// No favicon shipped — answer 204 instead of a 404 in the console.
+pub async fn favicon() -> impl IntoResponse {
+    StatusCode::NO_CONTENT
+}
