@@ -6,6 +6,7 @@
 //! web server (`PreviewStore`).
 
 use std::{
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     time::UNIX_EPOCH,
 };
@@ -212,21 +213,63 @@ pub fn find_cached_preview(dir: &Path, source: &Path, expected_name: &str) -> Op
 /// deleted or moved away): the local `.imagecropper-previews` thumbnails
 /// and the whole per-source fullscreen dir in the global cache.
 pub fn remove_previews_for(source: &Path) {
-    let Some(source_name) = source.file_name() else {
-        return;
-    };
-    let prefix = preview_file_prefix(&source_name.to_string_lossy());
-    let dir = previews_dir_for(source);
-    if let Ok(entries) = std::fs::read_dir(&dir) {
+    remove_previews_for_many([source]);
+}
+
+/// Batched form of [`remove_previews_for`]: purges cached previews for many
+/// sources, scanning each shared `.imagecropper-previews` directory once
+/// instead of once per source. Every source in a folder shares that
+/// directory, so a bulk delete otherwise does O(n²) directory scans.
+pub fn remove_previews_for_many<'a, I>(sources: I)
+where
+    I: IntoIterator<Item = &'a Path>,
+{
+    let mut groups: HashMap<PathBuf, HashSet<String>> = HashMap::new();
+    for source in sources {
+        let Some(source_name) = source.file_name() else {
+            continue;
+        };
+        groups
+            .entry(previews_dir_for(source))
+            .or_default()
+            .insert(source_name.to_string_lossy().into_owned());
+        // Global fullscreen cache: `f/<path-hash>/` holds only this file's
+        // signature variants, so the whole dir goes.
+        let _ = std::fs::remove_dir_all(screen_dir_for(source));
+    }
+    for (dir, names) in groups {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
         for entry in entries.flatten() {
-            if entry.file_name().to_string_lossy().starts_with(&prefix) {
+            let file_name = entry.file_name();
+            if preview_belongs_to(&file_name.to_string_lossy(), &names) {
                 let _ = std::fs::remove_file(entry.path());
             }
         }
     }
-    // Global fullscreen cache: `f/<path-hash>/` holds only this file's
-    // signature variants, so the whole dir goes.
-    let _ = std::fs::remove_dir_all(screen_dir_for(source));
+}
+
+/// Does `preview_name` (`<source>.<len>-<mtime>.jpg`) belong to one of
+/// `sources`? Parsing the source out of the name keeps the scan O(1) per
+/// entry; the prefix fallback covers files from older preview formats.
+fn preview_belongs_to(preview_name: &str, sources: &HashSet<String>) -> bool {
+    let parsed = preview_name
+        .strip_suffix(".jpg")
+        .and_then(|stem| stem.rsplit_once('.'))
+        .and_then(|(source, sig)| {
+            let (len, nanos) = sig.split_once('-')?;
+            let numeric = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+            (numeric(len) && numeric(nanos)).then_some(source)
+        });
+    match parsed {
+        Some(source) => sources.contains(source),
+        None => sources.iter().any(|source| {
+            preview_name
+                .strip_prefix(source.as_str())
+                .is_some_and(|rest| rest.starts_with('.'))
+        }),
+    }
 }
 
 /// Load the cached preview or generate, persist and return a fresh one.

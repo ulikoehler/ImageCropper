@@ -2,8 +2,8 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use imagecropper::album::thumbnails::{
-    preview_file_name, preview_file_prefix, previews_dir_for, remove_previews_for, Thumbnailer,
-    THUMB_MAX_DIM,
+    preview_file_name, preview_file_prefix, previews_dir_for, remove_previews_for,
+    remove_previews_for_many, Thumbnailer, THUMB_MAX_DIM,
 };
 use imagecropper::fs_utils::PREVIEWS_DIR;
 use tempfile::tempdir;
@@ -113,6 +113,39 @@ fn remove_previews_for_deletes_cached_files() {
 
     assert!(!p1.exists() && !p2.exists());
     assert!(other.exists(), "unrelated previews must be kept");
+}
+
+#[test]
+fn remove_previews_for_many_purges_only_listed_sources() {
+    let tmp = tempdir().unwrap();
+    let root = tmp.path();
+    let preview_dir = root.join(PREVIEWS_DIR);
+    std::fs::create_dir(&preview_dir).unwrap();
+
+    // Dotted source names exercise the signature-suffix parser.
+    let sources: Vec<_> = ["a.b.png", "b.png", "c.v2.png"]
+        .iter()
+        .map(|name| {
+            let p = root.join(name);
+            std::fs::write(&p, b"x").unwrap();
+            p
+        })
+        .collect();
+    let previews: Vec<_> = sources
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            let name = p.file_name().unwrap().to_string_lossy();
+            let preview = preview_dir.join(preview_file_name(&name, i as u64, i as u128));
+            std::fs::write(&preview, b"x").unwrap();
+            preview
+        })
+        .collect();
+
+    remove_previews_for_many([sources[0].as_path(), sources[1].as_path()]);
+
+    assert!(!previews[0].exists() && !previews[1].exists());
+    assert!(previews[2].exists(), "unlisted source keeps its preview");
 }
 
 #[test]

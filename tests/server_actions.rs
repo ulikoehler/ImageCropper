@@ -2,7 +2,7 @@ use imagecropper::app::saver::Saver;
 use imagecropper::fs_utils::previews::{preview_sig_u64, previews_dir_for, produce_preview_bytes};
 use imagecropper::fs_utils::TRASH_DIR;
 use imagecropper::image_utils::OutputFormat;
-use imagecropper::server::actions::{execute, verify_sig, Action, RotateOp};
+use imagecropper::server::actions::{execute, verify_sig, Action, ActionQueue, RotateOp};
 
 mod common;
 use common::{solid_image, with_temp_workdir, write_image};
@@ -146,5 +146,53 @@ fn move_already_in_dir_errors() {
         let r = execute(&Action::Move { id: 0, sig }, &img, &mut saver, Some(&dest));
         assert!(r.is_err(), "moving a file onto itself is an error");
         assert!(img.exists());
+    });
+}
+
+#[test]
+fn action_queue_deletes_bulk_in_parallel() {
+    with_temp_workdir(|root| {
+        let mut jobs = Vec::new();
+        for i in 0..40u32 {
+            let img = root.join(format!("bulk{i:02}.png"));
+            write_image(&img, &solid_image(8, 8, [i as u8, 0, 0, 255]));
+            produce_preview_bytes(&img, None).unwrap();
+            let sig = preview_sig_u64(&img).unwrap();
+            jobs.push((img, sig));
+        }
+
+        let queue = ActionQueue::new(1, 32, None);
+        for (i, (path, sig)) in jobs.iter().enumerate() {
+            queue.dispatch(
+                i as u32,
+                Action::Delete {
+                    id: i as u32,
+                    sig: *sig,
+                },
+                path.clone(),
+            );
+        }
+        assert_eq!(queue.pending(), jobs.len());
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let mut done = Vec::new();
+        while done.len() < jobs.len() && std::time::Instant::now() < deadline {
+            done.extend(queue.poll());
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert_eq!(done.len(), jobs.len(), "all delete actions completed");
+        assert!(done.iter().all(|d| d.ok), "all deletes succeeded");
+        assert_eq!(queue.pending(), 0);
+        for (path, _) in &jobs {
+            assert!(!path.exists(), "{} should be trashed", path.display());
+        }
+        let remaining: Vec<_> = std::fs::read_dir(previews_dir_for(&jobs[0].0))
+            .unwrap()
+            .flatten()
+            .collect();
+        assert!(
+            remaining.is_empty(),
+            "batched cleanup must purge every preview"
+        );
     });
 }

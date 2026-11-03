@@ -23,7 +23,7 @@ use anyhow::Result;
 use axum::{routing::get, Router};
 use tokio::sync::broadcast;
 
-pub use actions::{Action, ActionDone, ActionEnvelope, ActionQueue, RotateOp};
+pub use actions::{Action, ActionDone, ActionEnvelope, ActionKind, ActionQueue, RotateOp};
 pub use manifest::{Manifest, ManifestItem, ManifestPatch, ServeMode};
 pub use preview_store::{Preview, PreviewStore};
 pub use proto::*;
@@ -73,7 +73,11 @@ impl ServerState {
             manifest: Arc::new(RwLock::new(manifest)),
             roots,
             previews,
-            actions: Arc::new(ActionQueue::new(parallel.max(1).min(4), move_dir)),
+            actions: Arc::new(ActionQueue::new(
+                parallel.max(1).min(4),
+                parallel.max(32),
+                move_dir,
+            )),
             events,
             mode,
             mouse_select,
@@ -109,6 +113,9 @@ impl ServerState {
         // and must not block manifest readers.
         let sniffed: Vec<(PathBuf, u32, u32, u64, u64)> = files
             .into_iter()
+            // Queued for delete/move — "marked for deletion", must not
+            // resurface before the op lands.
+            .filter(|(p, _)| !self.actions.is_pending(p))
             .map(|(p, known_bytes)| {
                 let (w, h) = image::image_dimensions(&p).unwrap_or((0, 0));
                 let bytes = known_bytes
@@ -239,6 +246,75 @@ impl ServerState {
         }
     }
 
+    /// Tombstone the item at `path` — safe to call across id reassignment:
+    /// the path resolves to whatever id currently holds it, so a rescan
+    /// mid-action can't tombstone the wrong slot.
+    pub fn remove_path(&self, path: &Path) {
+        let id = self.manifest.read().unwrap().position_of(path);
+        if let Some(id) = id {
+            self.remove_ids(&[id]);
+        }
+    }
+
+    /// Undo a tombstone after a failed delete/move — the file is still on
+    /// disk, so the item goes live again (broadcast as an `upsert` patch).
+    /// Falls back to [`Self::upsert_files`] when a rescan already compacted
+    /// the slot away.
+    pub fn restore_path(&self, path: &Path) {
+        enum Out {
+            Live,
+            Missing,
+            Restored(Option<String>),
+        }
+        let out = {
+            let mut m = self.manifest.write().unwrap();
+            if m.positions.contains_key(path) {
+                Out::Live
+            } else {
+                // positions only tracks live items — scan for a tombstoned
+                // slot that still resolves to `path`.
+                let id = (0..m.items.len()).find(|&i| {
+                    let item = &m.items[i];
+                    m.dirs
+                        .get(item.dir_index as usize)
+                        .map(|d| Path::new(d).join(&item.name) == path)
+                        .unwrap_or(false)
+                });
+                match id {
+                    Some(i) => {
+                        m.items[i].removed = false;
+                        m.positions.insert(path.to_path_buf(), i as u32);
+                        let item = m.items[i].clone();
+                        m.version += 1;
+                        let json = serde_json::to_string(&serde_json::json!({
+                            "ev": "manifest-patch",
+                            "patch": {
+                                "version": m.version,
+                                "upsert": [item],
+                                "remove": [],
+                                "dirs_added": [],
+                            },
+                        }))
+                        .ok();
+                        Out::Restored(json)
+                    }
+                    None => Out::Missing,
+                }
+            }
+        };
+        match out {
+            Out::Live => {}
+            Out::Restored(json) => {
+                if let Some(json) = json {
+                    let _ = self.events.send(ServerEvent::Json(json));
+                }
+            }
+            Out::Missing => {
+                self.upsert_files(vec![(path.to_path_buf(), None)]);
+            }
+        }
+    }
+
     /// Scan finished: apply the final `-o` ordering, rebuild the manifest
     /// (ids are reassigned) and broadcast a `resync` patch so clients
     /// replace their lists in place — no reconnect or manifest re-pull.
@@ -284,21 +360,26 @@ impl ServerState {
             }
             // Action completions → differential manifest updates + events.
             for done in state.actions.poll() {
-                if done.ok {
-                    use crate::server::actions::ActionKind;
-                    match done.kind {
-                        ActionKind::Delete | ActionKind::Move => {
-                            state.remove_ids(&[done.id]);
-                        }
-                        ActionKind::Crop | ActionKind::Resave => {
-                            if let Some(new_path) = &done.new_path {
-                                if new_path != &done.src {
-                                    state.remove_ids(&[done.id]);
-                                }
-                                state.upsert_files(vec![(new_path.clone(), None)]);
+                use crate::server::actions::ActionKind;
+                match (done.ok, done.kind) {
+                    // Path-based: ids may have been reassigned by a rescan
+                    // while the action was in flight — done.src is stable.
+                    (true, ActionKind::Delete | ActionKind::Move) => {
+                        state.remove_path(&done.src);
+                    }
+                    // Undo the eager tombstone: the file never left.
+                    (false, ActionKind::Delete | ActionKind::Move) => {
+                        state.restore_path(&done.src);
+                    }
+                    (true, ActionKind::Crop | ActionKind::Resave) => {
+                        if let Some(new_path) = &done.new_path {
+                            if new_path != &done.src {
+                                state.remove_path(&done.src);
                             }
+                            state.upsert_files(vec![(new_path.clone(), None)]);
                         }
                     }
+                    (false, _) => {}
                 }
                 if crate::fs_utils::verbose() {
                     eprintln!(
@@ -324,6 +405,12 @@ impl ServerState {
     /// Rebuild the manifest (e.g. after fs changes) and bump the version.
     /// Returns the new manifest for broadcast/patch purposes.
     pub fn rebuild_manifest(&self, files: Vec<PathBuf>, roots: &[PathBuf]) {
+        // Paths queued for delete/move are "marked for deletion" — a rebuild
+        // must not resurrect them just because the file still exists.
+        let files: Vec<PathBuf> = files
+            .into_iter()
+            .filter(|p| !self.actions.is_pending(p))
+            .collect();
         let version = self.manifest.read().unwrap().version + 1;
         let fresh = Manifest::build(&files, roots, self.mode, self.mouse_select, version);
         *self.manifest.write().unwrap() = fresh;

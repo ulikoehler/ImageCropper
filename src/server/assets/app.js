@@ -73,6 +73,9 @@ async function refreshManifest(){
   items=manifest.items;
   thumbs.clear();pending.clear();
   selected=new Set();focus=0;anchor=0;scanning=false;
+  // Completions may have been lost on the way — the re-pulled manifest is
+  // now authoritative, so stale pending counters must not linger.
+  pendingActions.clear();
   screenBmp=null;screenIdx=-1;
   layout();draw();
 }
@@ -132,19 +135,12 @@ function onData(f){
     const ev=JSON.parse(new TextDecoder().decode(f.payload));
     if(ev.ev==="action-done"){
       const kind=pendingActions.get(ev.tag);
-      const id=pendingIds.get(ev.tag);
-      if(kind!=null&&ev.ok){
-        pendingActions.delete(ev.tag);pendingIds.delete(ev.tag);
-        // Optimistic tombstone — the server's manifest-patch remove
-        // arrives too; both are idempotent and keep ids positional.
-        if(items[id])items[id].removed=true;
-        thumbs.delete(id);selected.delete(id);
-        layout();draw();
-      } else if(kind!=null){
-        pendingActions.delete(ev.tag);pendingIds.delete(ev.tag);
-        // Undo the optimistic tombstone — the file is still there.
-        if(items[id]){items[id].removed=false;layout();}
-        statusEl.textContent=`${kind} failed: ${ev.error||"?"}`;
+      if(kind!=null){
+        pendingActions.delete(ev.tag);
+        // Tombstones and restores arrive as manifest patches (ordered
+        // ahead of the ack) — the ack only runs the pending counter and
+        // surfaces failures.
+        if(!ev.ok)statusEl.textContent=`${kind} failed: ${ev.error||"?"}`;
         draw();
       }
     }
@@ -262,6 +258,9 @@ function draw(){
   // be (re)computed inside draw() — boot calls draw() before canvas.width
   // is meaningful otherwise.
   layout();
+  // Deletions and resyncs shrink the grid — clamp the scroll position so
+  // the viewport can't strand past the new content end.
+  scrollY=Math.min(scrollY,Math.max(0,rowY(rows.length)-H));
   canvas.style.width=innerWidth+"px";canvas.style.height=innerHeight+"px";
   ctx.fillStyle="#111";ctx.fillRect(0,0,W,H);
 
@@ -277,7 +276,8 @@ function draw(){
       ctx.fillStyle="#888";ctx.font=`${16*devicePixelRatio}px monospace`;
       ctx.fillText("loading fullscreen preview…",W/2-160*devicePixelRatio,H/2);
     }
-    topEl.textContent=`${items.length} images · fullscreen: ${it?it.name:"?"}`;
+    let liveFs=0;for(const it2 of items)if(it2&&!it2.removed)liveFs++;
+    topEl.textContent=`${liveFs} images · fullscreen: ${it?it.name:"?"}`;
     return;
   }
   const want=[];
@@ -304,9 +304,10 @@ function draw(){
     want.forEach((id,i)=>v.setUint32(2+4*i,id,true));
     dataWs.send(frame(CL_WANT,0,b));
   }
-  let delQ=0,movQ=0;
+  let delQ=0,movQ=0,live=0;
   for(const k of pendingActions.values()){if(k==="delete")delQ++;else if(k==="move")movQ++}
-  topEl.textContent=`${items.length} images · ${thumbs.size} cached · ${selected.size} selected`+
+  for(const it of items)if(it&&!it.removed)live++;
+  topEl.textContent=`${live} images · ${thumbs.size} cached · ${selected.size} selected`+
     `${selected.size?` (${formatSize(selBytes())})`:""}${delQ?` · deleting ${delQ}`:""}`+
     `${movQ?` · moving ${movQ}`:""}${scanning?" · scanning…":""}`;
 }
@@ -314,40 +315,36 @@ function draw(){
 let dataWs=null;
 
 // ---- input ----
-let pendingTag=1, pendingActions=new Map(), pendingIds=new Map();
+// Tags carry a per-client random namespace in the high 12 bits — the
+// action-done broadcast reaches every client, so foreign tags must not
+// collide with ours. (Multiplication, not << — JS bitwise ops go int32
+// and would turn high tags negative.)
+let pendingTagBase=Math.floor(Math.random()*0x1000)*0x100000, pendingCtr=0,
+    pendingActions=new Map();
+const nextTag=()=>pendingTagBase+((pendingCtr++)&0xfffff);
 addEventListener("wheel",e=>{scrollY=Math.max(0,scrollY+e.deltaY*devicePixelRatio);draw()});
 addEventListener("keydown",e=>{
   const cols=()=>Math.max(1,Math.floor(canvas.width/(tileH*zoom)));
   if(e.key==="+"||e.key==="="){zoom*=1.1;layout();draw()}
   else if(e.key==="-"){zoom/=1.1;layout();draw()}
   else if(e.key.toLowerCase()==="w"&&!e.ctrlKey&&!e.metaKey){viewW=e.shiftKey?Math.min(1,viewW*1.25):Math.max(0.05,viewW/1.25);layout();draw()}
-  else if(e.key==="Delete"){
-    const at=selected.size?Math.min(...selected):focus;
-    for(const i of selected){
-      const it=items[i];if(!it||it.removed)continue;const tag=pendingTag++;
-      pendingActions.set(tag,"delete");pendingIds.set(tag,it.id);
-      // Optimistic: the tile vanishes now, the FS delete lands async.
+  else if(e.key==="Delete"||(e.key.toLowerCase()==="m"&&!e.ctrlKey&&!e.metaKey)){
+    const kind=e.key==="Delete"?"delete":"move";
+    // No selection → the focused tile is the target (native parity).
+    const targets=selected.size?[...selected]:
+      (items[focus]&&!items[focus].removed?[focus]:[]);
+    const at=targets.length?Math.min(...targets):focus;
+    for(const i of targets){
+      const it=items[i];if(!it||it.removed)continue;const tag=nextTag();
+      pendingActions.set(tag,kind);
+      // Optimistic: the tile vanishes now, the FS op lands async.
       it.removed=true;thumbs.delete(it.id);
       dataWs.send(frame(CL_ACTION,0,str(JSON.stringify({
-        tag,kind:"delete",id:it.id,sig:it.sig}))));
+        tag,kind,id:it.id,sig:it.sig}))));
     }
     selected.clear();layout();
     // Scroll to the survivor at the deletion point (or the last
     // remaining image when the deleted block ran to the end).
-    const f=firstLiveAtOrAfter(at);
-    if(f>=0){focus=f;anchor=f;scrollToIndex(f);}
-    draw();
-  }
-  else if((e.key==="m"||e.key==="M")&&!e.ctrlKey&&!e.metaKey){
-    const at=selected.size?Math.min(...selected):focus;
-    for(const i of selected){
-      const it=items[i];if(!it||it.removed)continue;const tag=pendingTag++;
-      pendingActions.set(tag,"move");pendingIds.set(tag,it.id);
-      it.removed=true;thumbs.delete(it.id);
-      dataWs.send(frame(CL_ACTION,0,str(JSON.stringify({
-        tag,kind:"move",id:it.id,sig:it.sig}))));
-    }
-    selected.clear();layout();
     const f=firstLiveAtOrAfter(at);
     if(f>=0){focus=f;anchor=f;scrollToIndex(f);}
     draw();

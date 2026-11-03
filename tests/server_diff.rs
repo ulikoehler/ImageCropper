@@ -82,6 +82,116 @@ fn upsert_and_remove_broadcast_to_all_subscribers() {
 }
 
 #[test]
+fn marked_for_deletion_stays_out_of_rebuilds_and_upserts() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write_image(root.join("a.png"), &solid_image(10, 10, [1, 2, 3, 255]));
+    let path_a = root.join("a.png");
+
+    let state = ServerState::new(
+        vec![path_a.clone()],
+        vec![root.to_path_buf()],
+        ServeMode::Album,
+        imagecropper::cli::MouseSelectMode::Sequence,
+        1,
+        None,
+        4096,
+        None,
+    );
+    let mut rx = state.events.subscribe();
+
+    // Dispatch a delete and eagerly tombstone it, as the /data handler does.
+    let sig = imagecropper::fs_utils::previews::preview_sig_u64(&path_a).unwrap();
+    state
+        .actions
+        .dispatch(1, imagecropper::server::Action::Delete { id: 0, sig }, path_a.clone());
+    state.remove_path(&path_a);
+
+    assert!(state.actions.is_pending(&path_a));
+    {
+        let m = state.manifest.read().unwrap();
+        assert!(m.items[0].removed, "queued delete is tombstoned eagerly");
+        assert!(m.path_of(0).is_none());
+    }
+
+    // A rescan while the delete is still queued must not resurrect it.
+    state.rebuild_manifest(vec![path_a.clone()], &[root.to_path_buf()]);
+    {
+        let m = state.manifest.read().unwrap();
+        assert!(m.items.is_empty(), "pending deletes stay out of rebuilds");
+    }
+    // Nor may a (stray) upsert re-add it.
+    assert_eq!(state.upsert_files(vec![(path_a.clone(), None)]), 0);
+
+    // Once the worker finishes, the path is no longer marked pending.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let done = state.actions.poll();
+        if !done.is_empty() {
+            assert!(done[0].ok, "delete failed: {:?}", done[0].error);
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "action timed out");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(!state.actions.is_pending(&path_a));
+    assert!(!path_a.exists());
+    let _ = rx; // silence: subscription kept so events had a receiver
+}
+
+#[test]
+fn restore_path_revives_a_failed_delete() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write_image(root.join("a.png"), &solid_image(10, 10, [4, 5, 6, 255]));
+    let path_a = root.join("a.png");
+
+    let state = ServerState::new(
+        vec![path_a.clone()],
+        vec![root.to_path_buf()],
+        ServeMode::Album,
+        imagecropper::cli::MouseSelectMode::Sequence,
+        1,
+        None,
+        4096,
+        None,
+    );
+    let mut rx = state.events.subscribe();
+    state.remove_path(&path_a);
+    {
+        let m = state.manifest.read().unwrap();
+        assert!(m.items[0].removed);
+    }
+    let patch = recv_patch(&mut rx);
+    assert_eq!(patch.remove, vec![0], "tombstone broadcasts a remove patch");
+
+    // Failed action → the file is still there → the tombstone is undone
+    // and an upsert patch makes the item live again.
+    state.restore_path(&path_a);
+    {
+        let m = state.manifest.read().unwrap();
+        assert!(!m.items[0].removed, "restored item is live");
+        assert_eq!(m.path_of(0).unwrap(), path_a);
+        assert_eq!(m.position_of(&path_a), Some(0));
+    }
+    let patch = recv_patch(&mut rx);
+    assert_eq!(patch.upsert.len(), 1);
+    assert_eq!(patch.upsert[0].id, 0);
+    assert!(!patch.upsert[0].removed);
+
+    // Restoring a path that was compacted out by a rescan re-appends it.
+    state.remove_path(&path_a);
+    state.rebuild_manifest(vec![], &[root.to_path_buf()]);
+    state.restore_path(&path_a);
+    {
+        let m = state.manifest.read().unwrap();
+        assert_eq!(m.items.len(), 1, "restore re-adds a compacted slot");
+        assert!(!m.items[0].removed);
+        assert_eq!(m.path_of(0).unwrap(), path_a);
+    }
+}
+
+#[test]
 fn finish_scan_broadcasts_resync_patch() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();

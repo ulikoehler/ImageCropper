@@ -33,7 +33,8 @@ pub fn spawn(state: Arc<ServerState>, scan: ScanArgs) {
             notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
                 if let Ok(event) = res {
                     // Ignore churn inside our reserved dirs (trash/previews/tmp).
-                    let relevant = event.paths.iter().any(|p| !inside_reserved(p));
+                    let relevant = event_affects_listing(&event.kind)
+                        && event.paths.iter().any(|p| !inside_reserved(p));
                     if relevant {
                         let _ = tx.send(());
                     }
@@ -78,6 +79,24 @@ fn inside_reserved(p: &Path) -> bool {
             || s == crate::fs_utils::TEMP_DIR
             || s == crate::fs_utils::ORIGINALS_DIR
     })
+}
+
+/// Whether an fs event can change what the rescan would list. Read-side
+/// accesses are filtered out — the rescan itself opens and reads every
+/// image (dimension sniffing, signatures), so without this each rescan
+/// would emit enough inotify traffic to retrigger itself forever.
+pub fn event_affects_listing(kind: &notify::event::EventKind) -> bool {
+    use notify::event::{AccessKind, AccessMode, EventKind, ModifyKind};
+    match kind {
+        // A finished write can add/complete a file — relevant. Everything
+        // else under Access is read-side noise (read, open, close-read).
+        EventKind::Access(AccessKind::Close(mode)) => *mode != AccessMode::Read,
+        EventKind::Access(_) => false,
+        // chmod/chown/utime don't change the listing or file content.
+        EventKind::Modify(ModifyKind::Metadata(_)) => false,
+        // Creates, deletes, renames, content changes, unknown kinds.
+        _ => true,
+    }
 }
 
 /// Expose PathBuf helper for tests.

@@ -1,16 +1,21 @@
 //! ActionQueue: signature-checked destructive operations (delete, crop-save,
-//! resave) executed on a worker thread, results broadcast to all clients.
+//! resave). Crop/resave run on a serial worker (the `Saver` is not `Sync`);
+//! delete/move fan out on a parallel pool. Results broadcast to all clients.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use eframe::egui;
 use serde::{Deserialize, Serialize};
 
 use crate::app::saver::Saver;
-use crate::fs_utils::previews::{preview_sig_u64, remove_previews_for};
+use crate::fs_utils::previews::{preview_sig_u64, remove_previews_for, remove_previews_for_many};
 use crate::fs_utils::{move_with_unique_name, prepare_dir, TRASH_DIR};
 use crate::image_utils::{build_output_image, decode_image_bytes, OutputFormat, SaveRequest};
 use crate::selection::Selection;
@@ -129,32 +134,12 @@ pub fn execute(
 ) -> Result<(Option<u64>, Option<u64>)> {
     match action {
         Action::Delete { sig, .. } => {
-            verify_sig(path, *sig)?;
-            let bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-            let parent = path.parent().unwrap_or_else(|| Path::new("."));
-            let trash = prepare_dir(parent, TRASH_DIR)?;
-            move_with_unique_name(path, &trash)?;
+            let bytes = trash_one(path, *sig)?;
             remove_previews_for(path);
             Ok((None, Some(bytes)))
         }
         Action::Move { sig, .. } => {
-            let dest = move_dir.ok_or_else(|| anyhow!("no -m/--move directory configured"))?;
-            verify_sig(path, *sig)?;
-            if dest
-                .canonicalize()
-                .ok()
-                .zip(
-                    path.canonicalize()
-                        .ok()
-                        .and_then(|p| p.parent().map(|d| d.to_path_buf())),
-                )
-                .map(|(a, b)| a == b)
-                .unwrap_or(false)
-            {
-                return Err(anyhow!("file is already in the move directory"));
-            }
-            let bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-            move_with_unique_name(path, dest)?;
+            let bytes = move_one(path, *sig, move_dir)?;
             remove_previews_for(path);
             Ok((None, Some(bytes)))
         }
@@ -222,6 +207,38 @@ pub fn execute(
     }
 }
 
+/// Move `path` into the trash directory next to it. Returns bytes trashed.
+fn trash_one(path: &Path, sig: u64) -> Result<u64> {
+    verify_sig(path, sig)?;
+    let bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let trash = prepare_dir(parent, TRASH_DIR)?;
+    move_with_unique_name(path, &trash)?;
+    Ok(bytes)
+}
+
+/// Move `path` into `move_dir` (unique name on collision). Returns bytes moved.
+fn move_one(path: &Path, sig: u64, move_dir: Option<&Path>) -> Result<u64> {
+    let dest = move_dir.ok_or_else(|| anyhow!("no -m/--move directory configured"))?;
+    verify_sig(path, sig)?;
+    if dest
+        .canonicalize()
+        .ok()
+        .zip(
+            path.canonicalize()
+                .ok()
+                .and_then(|p| p.parent().map(|d| d.to_path_buf())),
+        )
+        .map(|(a, b)| a == b)
+        .unwrap_or(false)
+    {
+        return Err(anyhow!("file is already in the move directory"));
+    }
+    let bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    move_with_unique_name(path, dest)?;
+    Ok(bytes)
+}
+
 /// Serialized ACTION payload wrapper: tag is the client's correlation id.
 #[derive(Debug, Deserialize)]
 pub struct ActionEnvelope {
@@ -230,29 +247,129 @@ pub struct ActionEnvelope {
     pub action: Action,
 }
 
-/// Background worker executing actions serially (Saver is not Sync).
+/// One queued delete/move. Unlike crop/resave these never touch the
+/// `Saver`, so they run on a parallel pool instead of the serial thread.
+struct DestructiveJob {
+    tag: u32,
+    id: u32,
+    kind: ActionKind,
+    path: PathBuf,
+    sig: u64,
+}
+
+/// Bounded worker pool for delete/move actions. A bounded pool keeps a
+/// client from spawning one thread per request while still letting a bulk
+/// delete fan out.
+struct DestructivePool {
+    job_tx: Sender<DestructiveJob>,
+    result_rx: Mutex<Receiver<ActionDone>>,
+}
+
+impl DestructivePool {
+    fn new(workers: usize, move_dir: Option<PathBuf>) -> Self {
+        let (job_tx, job_rx) = mpsc::channel::<DestructiveJob>();
+        let job_rx = Arc::new(Mutex::new(job_rx));
+        let (result_tx, result_rx) = mpsc::channel::<ActionDone>();
+        for _ in 0..workers.max(1) {
+            let job_rx = job_rx.clone();
+            let result_tx = result_tx.clone();
+            let move_dir = move_dir.clone();
+            thread::spawn(move || loop {
+                let job = {
+                    let Ok(rx) = job_rx.lock() else { return };
+                    match rx.recv_timeout(Duration::from_millis(250)) {
+                        Ok(job) => job,
+                        Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                        Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                    }
+                };
+                let result = match job.kind {
+                    ActionKind::Delete => trash_one(&job.path, job.sig),
+                    ActionKind::Move => move_one(&job.path, job.sig, move_dir.as_deref()),
+                    ActionKind::Crop | ActionKind::Resave => unreachable!(),
+                };
+                let done = match result {
+                    Ok(bytes) => ActionDone {
+                        tag: job.tag,
+                        ok: true,
+                        id: job.id,
+                        kind: job.kind,
+                        src: job.path,
+                        new_path: None,
+                        error: None,
+                        new_sig: None,
+                        bytes: Some(bytes),
+                    },
+                    Err(e) => ActionDone {
+                        tag: job.tag,
+                        ok: false,
+                        id: job.id,
+                        kind: job.kind,
+                        src: job.path,
+                        new_path: None,
+                        error: Some(e.to_string()),
+                        new_sig: None,
+                        bytes: None,
+                    },
+                };
+                if result_tx.send(done).is_err() {
+                    return;
+                }
+            });
+        }
+        Self {
+            job_tx,
+            result_rx: Mutex::new(result_rx),
+        }
+    }
+
+    fn dispatch(&self, job: DestructiveJob) -> bool {
+        self.job_tx.send(job).is_ok()
+    }
+
+    fn poll(&self) -> Vec<ActionDone> {
+        let rx = self.result_rx.lock().unwrap();
+        let mut out = Vec::new();
+        while let Ok(done) = rx.try_recv() {
+            out.push(done);
+        }
+        out
+    }
+}
+
+/// Background worker executing crop/resave serially (Saver is not Sync).
+/// Delete/move bypass it on [`DestructivePool`] — they never touch the Saver.
 /// Jobs carry the client's tag so completions can be correlated.
 /// `in_flight` counts dispatched-but-unfinished actions so shutdown can
 /// preferentially drain destructive ops before exiting.
 pub struct ActionQueue {
     job_tx: Sender<(u32, Action, PathBuf)>,
-    result_rx: std::sync::Mutex<Receiver<ActionDone>>,
-    in_flight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    result_rx: Mutex<Receiver<ActionDone>>,
+    destructive_pool: DestructivePool,
+    /// Duplicate destructive dispatches, answered immediately without
+    /// touching the pending set (the original op is still in flight).
+    immediate: Mutex<Vec<ActionDone>>,
+    in_flight: Arc<AtomicUsize>,
+    /// Paths queued for delete/move. While a path is in this set it is
+    /// "marked for deletion": manifest rebuilds and upserts skip it so a
+    /// rescan or client reload cannot resurrect it before the op lands.
+    destructive: Mutex<HashSet<PathBuf>>,
+    /// Successfully deleted/moved paths whose cached previews still need
+    /// purging — batched until the queue drains.
+    cleanup: Mutex<Vec<PathBuf>>,
 }
 
 impl ActionQueue {
-    pub fn new(saver_threads: usize, move_dir: Option<PathBuf>) -> Self {
+    /// `delete_workers` bounds how many deletes/moves run at once.
+    pub fn new(saver_threads: usize, delete_workers: usize, move_dir: Option<PathBuf>) -> Self {
         let (job_tx, job_rx) = mpsc::channel::<(u32, Action, PathBuf)>();
         let (result_tx, result_rx) = mpsc::channel::<ActionDone>();
-        let in_flight = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let worker_in_flight = in_flight.clone();
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let serial_move_dir = move_dir.clone();
         thread::spawn(move || {
             let mut saver = Saver::new(saver_threads.max(1));
             // Async saves awaiting completion: (tag, kind, id, src, out).
             let mut pending: Vec<(u32, ActionKind, u32, PathBuf, PathBuf)> = Vec::new();
-            let dec = |in_flight: &std::sync::atomic::AtomicUsize| {
-                in_flight.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-            };
             loop {
                 // Drain completed saves → ActionDone with the new sig.
                 for (path, result, _sizes) in saver.check_completions() {
@@ -286,7 +403,6 @@ impl ActionQueue {
                         if result_tx.send(done).is_err() {
                             return;
                         }
-                        dec(&worker_in_flight);
                     }
                 }
                 match job_rx.try_recv() {
@@ -300,7 +416,7 @@ impl ActionQueue {
                             }
                             _ => None,
                         };
-                        match execute(&action, &path, &mut saver, move_dir.as_deref()) {
+                        match execute(&action, &path, &mut saver, serial_move_dir.as_deref()) {
                             Ok((new_sig, bytes)) => {
                                 if new_sig.is_some() || bytes.is_some() {
                                     if result_tx
@@ -319,7 +435,6 @@ impl ActionQueue {
                                     {
                                         return;
                                     }
-                                    dec(&worker_in_flight);
                                 } else {
                                     // Async save queued — completion arrives
                                     // via check_completions.
@@ -343,7 +458,6 @@ impl ActionQueue {
                                 {
                                     return;
                                 }
-                                dec(&worker_in_flight);
                             }
                         }
                     }
@@ -356,32 +470,106 @@ impl ActionQueue {
         });
         Self {
             job_tx,
-            result_rx: std::sync::Mutex::new(result_rx),
+            result_rx: Mutex::new(result_rx),
+            destructive_pool: DestructivePool::new(delete_workers, move_dir),
+            immediate: Mutex::new(Vec::new()),
             in_flight,
+            destructive: Mutex::new(HashSet::new()),
+            cleanup: Mutex::new(Vec::new()),
         }
     }
 
     /// Actions dispatched but not yet completed — shutdown waits on this.
     pub fn pending(&self) -> usize {
-        self.in_flight.load(std::sync::atomic::Ordering::SeqCst)
+        self.in_flight.load(Ordering::SeqCst)
+    }
+
+    /// `path` has a queued delete/move — it is "marked for deletion" and
+    /// must stay out of manifests/rebuilds until the op finishes.
+    pub fn is_pending(&self, path: &Path) -> bool {
+        self.destructive.lock().unwrap().contains(path)
     }
 
     pub fn dispatch(&self, tag: u32, action: Action, path: PathBuf) {
-        // Count before the send lands: the worker may finish the job
-        // before dispatch returns.
-        self.in_flight
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        if self.job_tx.send((tag, action, path)).is_err() {
-            self.in_flight
-                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        let id = action.id();
+        let kind = action.kind();
+        match action {
+            Action::Delete { sig, .. } | Action::Move { sig, .. } => {
+                let inserted = self.destructive.lock().unwrap().insert(path.clone());
+                if !inserted {
+                    // Already queued/in flight: answer the duplicate instead
+                    // of leaving the client waiting for a deduped job.
+                    self.immediate.lock().unwrap().push(ActionDone {
+                        tag,
+                        ok: false,
+                        id,
+                        kind,
+                        src: path,
+                        new_path: None,
+                        error: Some("action already pending".into()),
+                        new_sig: None,
+                        bytes: None,
+                    });
+                    return;
+                }
+                // Count before the send lands: a worker may finish the job
+                // before dispatch returns.
+                self.in_flight.fetch_add(1, Ordering::SeqCst);
+                let job = DestructiveJob {
+                    tag,
+                    id,
+                    kind,
+                    path: path.clone(),
+                    sig,
+                };
+                if !self.destructive_pool.dispatch(job) {
+                    self.destructive.lock().unwrap().remove(&path);
+                    self.in_flight.fetch_sub(1, Ordering::SeqCst);
+                }
+            }
+            other => {
+                self.in_flight.fetch_add(1, Ordering::SeqCst);
+                if self.job_tx.send((tag, other, path)).is_err() {
+                    self.in_flight.fetch_sub(1, Ordering::SeqCst);
+                }
+            }
         }
     }
 
     pub fn poll(&self) -> Vec<ActionDone> {
         let mut out = Vec::new();
+        let mut destructive = self.destructive.lock().unwrap();
+
+        // Duplicate-dispatch errors: the original op still owns the path.
+        out.extend(self.immediate.lock().unwrap().drain(..));
+
+        // Delete/move completions from the parallel pool.
+        for done in self.destructive_pool.poll() {
+            destructive.remove(&done.src);
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+            if done.ok {
+                self.cleanup.lock().unwrap().push(done.src.clone());
+            }
+            out.push(done);
+        }
+
+        // Crop/resave completions from the serial worker.
         let result_rx = self.result_rx.lock().unwrap();
-        while let Ok(d) = result_rx.try_recv() {
-            out.push(d);
+        while let Ok(done) = result_rx.try_recv() {
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+            out.push(done);
+        }
+        drop(result_rx);
+        drop(destructive);
+
+        // Batch preview cleanup once the queue drains: one scan per shared
+        // `.imagecropper-previews` dir instead of one per deleted file.
+        if self.pending() == 0 {
+            let mut cleanup = self.cleanup.lock().unwrap();
+            if !cleanup.is_empty() {
+                remove_previews_for_many(cleanup.iter().map(PathBuf::as_path));
+                cleanup.clear();
+            }
         }
         out
     }

@@ -13,7 +13,7 @@ use crate::{
 /// Re-exported for callers that used the old module-local helpers.
 pub use crate::fs_utils::previews::{
     preview_file_name, preview_file_prefix, previews_dir_for, remove_previews_for,
-    source_signature, THUMB_MAX_DIM,
+    remove_previews_for_many, source_signature, THUMB_MAX_DIM,
 };
 
 /// Result of a thumbnail job: the decoded preview, if it could be produced.

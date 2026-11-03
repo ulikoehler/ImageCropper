@@ -69,13 +69,35 @@ async fn handle(socket: WebSocket, state: Arc<ServerState>) {
     let events_task = {
         let out_tx = out_tx.clone();
         tokio::spawn(async move {
-            while let Ok(ServerEvent::Json(json)) = events_rx.recv().await {
-                if out_tx
-                    .send(Frame::new(EV_EVENT, 0, json.into_bytes()))
-                    .await
-                    .is_err()
-                {
-                    break;
+            loop {
+                match events_rx.recv().await {
+                    Ok(ServerEvent::Json(json)) => {
+                        if out_tx
+                            .send(Frame::new(EV_EVENT, 0, json.into_bytes()))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    // The ring overflowed (delete storms, big rescans) —
+                    // events were dropped. Stay alive and tell the client
+                    // to re-pull the manifest so missed tombstones/upserts
+                    // can't leave it permanently inconsistent.
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        if out_tx
+                            .send(Frame::new(
+                                EV_EVENT,
+                                0,
+                                b"{\"ev\":\"fs-changed\"}".to_vec(),
+                            ))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }
             }
         })
@@ -192,8 +214,40 @@ async fn handle(socket: WebSocket, state: Arc<ServerState>) {
             }
             CL_ACTION => {
                 if let Ok(env) = serde_json::from_slice::<ActionEnvelope>(&frame.payload) {
-                    if let Some(path) = state.path_of(env.action.id()) {
-                        state.actions.dispatch(env.tag, env.action, path);
+                    let kind = env.action.kind();
+                    let id = env.action.id();
+                    match state.path_of(id) {
+                        Some(path) => {
+                            state.actions.dispatch(env.tag, env.action, path.clone());
+                            // "Marked for deletion": tombstone queued
+                            // delete/move ops immediately so client reloads
+                            // and fs-watch rescans can't resurrect the file
+                            // before the worker lands the op. A failure
+                            // restores it via the completion path.
+                            if matches!(
+                                kind,
+                                super::actions::ActionKind::Delete
+                                    | super::actions::ActionKind::Move
+                            ) {
+                                state.remove_path(&path);
+                            }
+                        }
+                        // Gone/tombstoned — still ack, otherwise the
+                        // client's pending-action counter never clears.
+                        None => {
+                            if let Ok(json) = serde_json::to_string(&serde_json::json!({
+                                "ev": "action-done",
+                                "tag": env.tag,
+                                "ok": false,
+                                "id": id,
+                                "kind": kind,
+                                "error": "item no longer in manifest",
+                            })) {
+                                let _ = out_tx
+                                    .send(Frame::new(EV_EVENT, 0, json.into_bytes()))
+                                    .await;
+                            }
+                        }
                     }
                 }
             }

@@ -164,6 +164,10 @@ pub struct AlbumApp {
 impl AlbumApp {
     pub fn new(files: Vec<PathBuf>, options: AlbumOptions, scan: Option<ScanStream>) -> Self {
         let parallel = options.parallel.max(1);
+        // Trashing/moving is metadata-only, so it benefits from wider
+        // parallelism than preview decoding; the pool still probes down on
+        // HDD/remote mounts.
+        let destructive_parallel = parallel.max(32);
         let (scan_rx, scan_order, scan_inverse) = match scan {
             Some(s) => (Some(s.rx), s.order, s.inverse),
             None => (None, SortOrder::Filename, false),
@@ -172,8 +176,11 @@ impl AlbumApp {
             entries: files.into_iter().map(|p| Entry::new(p, 0)).collect(),
             positions: HashMap::new(),
             thumbnailer: Thumbnailer::new(parallel),
-            deleter: Deleter::new(parallel),
-            mover: options.move_dir.clone().map(|d| Mover::new(parallel, d)),
+            deleter: Deleter::new(destructive_parallel),
+            mover: options
+                .move_dir
+                .clone()
+                .map(|d| Mover::new(destructive_parallel, d)),
             selected: BTreeSet::new(),
             focus: 0,
             anchor: 0,
@@ -653,13 +660,6 @@ impl AlbumApp {
         self.drain_scan();
         self.drain_results();
 
-        // Delete/move worker counts track the preview pool's autotuned
-        // concurrency — same storage, same optimal parallelism.
-        let preview_workers = self.thumbnailer.workers();
-        self.deleter.set_workers(preview_workers);
-        if let Some(m) = &self.mover {
-            m.set_workers(preview_workers);
-        }
         // Keep polling so a Ctrl-C is noticed even on an idle grid.
         ctx.request_repaint_after(std::time::Duration::from_millis(200));
         if crate::fs_utils::sigint_received() && !self.is_exiting {
