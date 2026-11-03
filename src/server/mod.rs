@@ -60,6 +60,9 @@ pub struct ServerState {
     /// Client-first IO priority: live client requests mark it, background
     /// work (deletes/moves, crops, speculative preload) yields to it.
     pub io_gate: Arc<IoGate>,
+    /// Set when the manifest changed — the pinned (RAM-resident) thumbnail
+    /// set has to be recomputed.
+    pins_dirty: std::sync::atomic::AtomicBool,
 }
 
 impl ServerState {
@@ -107,7 +110,44 @@ impl ServerState {
             resync_seq: std::sync::atomic::AtomicU64::new(0),
             gone: std::sync::Mutex::new(std::collections::HashMap::new()),
             io_gate,
+            pins_dirty: std::sync::atomic::AtomicBool::new(true),
         })
+    }
+
+    /// Recompute which thumbnails must stay resident in RAM: the first
+    /// [`preview_store::PIN_LIMIT`] live items, skipping anything queued for
+    /// delete/move or already departed. Cheap enough to run on every manifest
+    /// change, but the pump throttles it.
+    pub fn refresh_pins(&self) {
+        self.pins_dirty
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        let pins: Vec<PathBuf> = {
+            let m = self.manifest.read().unwrap();
+            let mut pins = Vec::with_capacity(preview_store::PIN_LIMIT);
+            for i in 0..m.items.len() {
+                if pins.len() >= preview_store::PIN_LIMIT {
+                    break;
+                }
+                if m.items[i].removed {
+                    continue;
+                }
+                let Some(path) = m.path_of(i as u32) else {
+                    continue;
+                };
+                if self.actions.is_pending(&path) || self.is_gone(&path) {
+                    continue;
+                }
+                pins.push(path);
+            }
+            pins
+        };
+        self.previews.set_pins(pins);
+    }
+
+    /// Mark the pin set stale (manifest changed).
+    fn pins_changed(&self) {
+        self.pins_dirty
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// How long a departed path stays suppressed. Long enough to cover a
@@ -286,6 +326,9 @@ impl ServerState {
         if let Some(json) = patch_json {
             let _ = self.events.send(ServerEvent::Json(json));
         }
+        if !added.is_empty() {
+            self.pins_changed();
+        }
         added.len()
     }
 
@@ -324,6 +367,8 @@ impl ServerState {
         if let Some(json) = json {
             let _ = self.events.send(ServerEvent::Json(json));
         }
+        // The pinned set is "first N live items" — tombstones change it.
+        self.pins_changed();
     }
 
     /// Tombstone the item at `path` — safe to call across id reassignment:
@@ -433,7 +478,28 @@ impl ServerState {
     /// completions and forwards them as broadcast events.
     pub fn spawn_pumps(self: &Arc<Self>) {
         let state = self.clone();
-        std::thread::spawn(move || loop {
+        std::thread::spawn(move || {
+            let mut last_pin = std::time::Instant::now() - std::time::Duration::from_secs(1);
+            let mut last_fill = std::time::Instant::now();
+            loop {
+                // Keep the top of the album resident in RAM. The pin set is
+                // recomputed when the manifest changed; missing pinned
+                // previews are re-queued periodically so the set converges
+                // (a failed/evicted preview must not leave a hole).
+                if state
+                    .pins_dirty
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    && last_pin.elapsed() >= std::time::Duration::from_millis(250)
+                {
+                    state.refresh_pins();
+                    last_pin = std::time::Instant::now();
+                }
+                if last_fill.elapsed() >= std::time::Duration::from_secs(2) {
+                    for path in state.previews.missing_pins() {
+                        state.previews.request(path);
+                    }
+                    last_fill = std::time::Instant::now();
+                }
             // Preview completions → per-path ready events.
             for (path, preview) in state.previews.poll() {
                 if let Some(id) = state.position_of(&path) {
@@ -486,7 +552,8 @@ impl ServerState {
                     let _ = state.events.send(ServerEvent::Json(json));
                 }
             }
-            std::thread::sleep(std::time::Duration::from_millis(20));
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
         });
     }
 
@@ -531,6 +598,8 @@ impl ServerState {
         let fresh =
             Manifest::build_with(&files, roots, self.mode, self.mouse_select, version, sniff);
         *self.manifest.write().unwrap() = fresh;
+        // The album order/contents changed — re-pin the top of it.
+        self.pins_changed();
     }
 }
 

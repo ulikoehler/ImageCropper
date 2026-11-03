@@ -2,7 +2,7 @@
 //! resave). Crop/resave run on a serial worker (the `Saver` is not `Sync`);
 //! delete/move fan out on a parallel pool. Results broadcast to all clients.
 
-use std::collections::HashMap;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
@@ -257,26 +257,6 @@ struct DestructiveJob {
     sig: u64,
 }
 
-/// A dispatched action awaiting completion. Delete/move are tracked by path
-/// ("marked for deletion"), crop/resave by client tag.
-struct PendingOp {
-    tag: u32,
-    id: u32,
-    kind: ActionKind,
-    path: PathBuf,
-}
-
-impl PendingOp {
-    fn new(tag: u32, id: u32, kind: ActionKind, path: PathBuf) -> Self {
-        Self {
-            tag,
-            id,
-            kind,
-            path,
-        }
-    }
-}
-
 /// Bounded worker pool for delete/move actions. A bounded pool keeps a
 /// client from spawning one thread per request while still letting a bulk
 /// delete fan out.
@@ -366,9 +346,9 @@ impl DestructivePool {
 /// Background worker executing crop/resave serially (Saver is not Sync).
 /// Delete/move bypass it on [`DestructivePool`] — they never touch the Saver.
 /// Jobs carry the client's tag so completions can be correlated.
-/// Dispatched-but-unfinished actions are tracked in [`PendingOp`] maps so
-/// shutdown can drain them; they are never timed out — a queued delete is
-/// finished even if it is slow.
+/// Dispatched-but-unfinished actions are tracked by path/tag so shutdown can
+/// drain them; they are never timed out — a queued delete is finished even if
+/// it is slow.
 pub struct ActionQueue {
     job_tx: Sender<(u32, Action, PathBuf)>,
     result_rx: Mutex<Receiver<ActionDone>>,
@@ -376,12 +356,12 @@ pub struct ActionQueue {
     /// Duplicate destructive dispatches, answered immediately without
     /// touching the pending set (the original op is still in flight).
     immediate: Mutex<Vec<ActionDone>>,
-    /// Delete/move ops queued for a path. While a path is in this map it is
+    /// Delete/move ops queued for a path. While a path is in this set it is
     /// "marked for deletion": manifest rebuilds and upserts skip it so a
     /// rescan or client reload cannot resurrect it before the op lands.
-    destructive: Mutex<HashMap<PathBuf, PendingOp>>,
+    destructive: Mutex<HashSet<PathBuf>>,
     /// Crop/resave ops, keyed by client tag.
-    serial: Mutex<HashMap<u32, PendingOp>>,
+    serial: Mutex<HashSet<u32>>,
     /// Successfully deleted/moved paths whose cached previews still need
     /// purging — batched until the queue drains.
     cleanup: Mutex<Vec<PathBuf>>,
@@ -518,8 +498,8 @@ impl ActionQueue {
             result_rx: Mutex::new(result_rx),
             destructive_pool: DestructivePool::new(delete_workers, move_dir, Arc::clone(&gate)),
             immediate: Mutex::new(Vec::new()),
-            destructive: Mutex::new(HashMap::new()),
-            serial: Mutex::new(HashMap::new()),
+            destructive: Mutex::new(HashSet::new()),
+            serial: Mutex::new(HashSet::new()),
             cleanup: Mutex::new(Vec::new()),
             gate,
         }
@@ -538,7 +518,7 @@ impl ActionQueue {
     /// `path` has a queued delete/move — it is "marked for deletion" and
     /// must stay out of manifests/rebuilds until the op finishes.
     pub fn is_pending(&self, path: &Path) -> bool {
-        self.destructive.lock().unwrap().contains_key(path)
+        self.destructive.lock().unwrap().contains(path)
     }
 
     pub fn dispatch(&self, tag: u32, action: Action, path: PathBuf) {
@@ -546,17 +526,8 @@ impl ActionQueue {
         let kind = action.kind();
         match action {
             Action::Delete { sig, .. } | Action::Move { sig, .. } => {
-                let op = PendingOp::new(tag, id, kind, path.clone());
-                let duplicate = {
-                    let mut d = self.destructive.lock().unwrap();
-                    if d.contains_key(&path) {
-                        true
-                    } else {
-                        d.insert(path.clone(), op);
-                        false
-                    }
-                };
-                if duplicate {
+                let queued = self.destructive.lock().unwrap().insert(path.clone());
+                if !queued {
                     // Already queued/in flight: answer the duplicate instead
                     // of leaving the client waiting for a deduped job.
                     self.immediate.lock().unwrap().push(ActionDone {
@@ -584,10 +555,7 @@ impl ActionQueue {
                 }
             }
             other => {
-                self.serial
-                    .lock()
-                    .unwrap()
-                    .insert(tag, PendingOp::new(tag, id, kind, path.clone()));
+                self.serial.lock().unwrap().insert(tag);
                 if self.job_tx.send((tag, other, path)).is_err() {
                     self.serial.lock().unwrap().remove(&tag);
                 }
@@ -607,7 +575,7 @@ impl ActionQueue {
             let mut destructive = self.destructive.lock().unwrap();
             for done in self.destructive_pool.poll() {
                 // Absent → the duplicate-dispatch path already answered it.
-                if destructive.remove(&done.src).is_none() {
+                if !destructive.remove(&done.src) {
                     continue;
                 }
                 if done.ok {
@@ -622,7 +590,7 @@ impl ActionQueue {
             let mut serial = self.serial.lock().unwrap();
             let result_rx = self.result_rx.lock().unwrap();
             while let Ok(done) = result_rx.try_recv() {
-                if serial.remove(&done.tag).is_none() {
+                if !serial.remove(&done.tag) {
                     continue;
                 }
                 out.push(done);
