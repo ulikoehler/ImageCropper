@@ -107,9 +107,28 @@ pub fn decode_image_bytes_tagged(
             }
             Err(_e) => image::load_from_memory(bytes),
         };
-        (res, "cpu")
+        (res.map(|mut i| {
+            apply_exif_orientation(&mut i, bytes);
+            i
+        }), "cpu")
     } else {
         (image::load_from_memory(bytes), "cpu")
+    }
+}
+
+/// Apply the EXIF orientation tag (matching the GPU JPEG path, which
+/// orients in the upsample shader). No-op without a valid tag.
+fn apply_exif_orientation(img: &mut DynamicImage, bytes: &[u8]) {
+    let orient = exif::Reader::new()
+        .read_from_container(&mut std::io::Cursor::new(bytes))
+        .ok()
+        .and_then(|e| {
+            e.get_field(exif::Tag::Orientation, exif::In::PRIMARY)
+                .and_then(|f| f.value.get_uint(0))
+                .map(|v| v as u8)
+        });
+    if let Some(o) = orient.and_then(image::metadata::Orientation::from_exif) {
+        img.apply_orientation(o);
     }
 }
 

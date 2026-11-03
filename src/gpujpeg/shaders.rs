@@ -337,8 +337,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         b.pos = w.x; b.buf = 0u; b.cnt = 0; b.e_end = false;
         b.wpos = 0xFFFFFFFEu; b.wval = 0u; b.nval = 0u; b.pad = 0;
         pred = vec4<i32>(0);
-    } else {                                        // resume predecessor
-        let s = (idx - pc.n_iv) * 12u;
+    } else {
+        // 1: resume predecessor generation's state (idx - n_iv).
+        // 2: host-surveyed virtual-restart state in OUR OWN slot (idx).
+        var s = (idx - pc.n_iv) * 12u;
+        if (w.w == 2u) { s = idx * 12u; }
         b.pos = st[s]; b.buf = st[s + 1u]; b.cnt = i32(st[s + 2u]);
         b.e_end = st[s + 3u] != 0u;
         b.wpos = 0xFFFFFFFEu; b.wval = 0u; b.nval = 0u;
@@ -419,7 +422,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 pub const RECON: &str = r#"
 struct Comps { c: array<array<vec4<i32>, 4>, 4>, }
 struct Pc8 { w: u32, h: u32, mcus_x: u32, n_comp: u32, max_h: u32,
-             max_v: u32, n_iv: u32, scan_len: u32, tab_ofs: u32, }
+             max_v: u32, n_iv: u32, scan_len: u32, tab_ofs: u32,
+             orient: u32, uW: u32, uH: u32, }
 
 @group(0) @binding(2) var<storage, read> tab: array<vec4<u32>>;
 @group(0) @binding(4) var<uniform> comps: Comps;
@@ -555,7 +559,8 @@ fn main(@builtin(global_invocation_id) gid3: vec3<u32>) {
 pub const UPSAMPLE: &str = r#"
 struct Comps { c: array<array<vec4<i32>, 4>, 4>, }
 struct Pc8 { w: u32, h: u32, mcus_x: u32, n_comp: u32, max_h: u32,
-             max_v: u32, n_iv: u32, scan_len: u32, tab_ofs: u32, }
+             max_v: u32, n_iv: u32, scan_len: u32, tab_ofs: u32,
+             orient: u32, uW: u32, uH: u32, }
 
 @group(0) @binding(4) var<uniform> comps: Comps;
 @group(0) @binding(6) var<storage, read_write> planes: array<u32>;
@@ -614,19 +619,37 @@ fn usamp(c: u32, x: i32, y: i32) -> i32 {
     return smp(c, cx, cy);
 }
 
+// EXIF orientation: output (x,y) in oriented space -> source coords
+// in the un-oriented uW x uH plane layout.
+fn omap(x: i32, y: i32) -> vec2<i32> {
+    let uw = i32(pc.uW);
+    let uh = i32(pc.uH);
+    switch (pc.orient) {
+    case 2u:  { return vec2<i32>(uw - 1 - x, y); }
+    case 3u:  { return vec2<i32>(uw - 1 - x, uh - 1 - y); }
+    case 4u:  { return vec2<i32>(x, uh - 1 - y); }
+    case 5u:  { return vec2<i32>(y, x); }
+    case 6u:  { return vec2<i32>(y, uh - 1 - x); }
+    case 7u:  { return vec2<i32>(uw - 1 - y, uh - 1 - x); }
+    case 8u:  { return vec2<i32>(uw - 1 - y, x); }
+    default:  { return vec2<i32>(x, y); }
+    }
+}
+
 @compute @workgroup_size(16, 16)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let x = gid.x;
     let y = gid.y;
     if (x >= pc.w || y >= pc.h) { return; }
+    let uv = omap(i32(x), i32(y));
     var r: i32; var g: i32; var bl: i32;
     if (pc.n_comp == 1u) {
-        let v = usamp(0u, i32(x), i32(y));
+        let v = usamp(0u, uv.x, uv.y);
         r = v; g = v; bl = v;
     } else {
-        let yy = usamp(0u, i32(x), i32(y));
-        let cb = usamp(1u, i32(x), i32(y)) - 128;
-        let cr = usamp(2u, i32(x), i32(y)) - 128;
+        let yy = usamp(0u, uv.x, uv.y);
+        let cb = usamp(1u, uv.x, uv.y) - 128;
+        let cr = usamp(2u, uv.x, uv.y) - 128;
         r = clamp(yy + ((91881 * cr + 32768) >> 16u), 0, 255);
         g = clamp(yy + ((32768 - 22554 * cb - 46802 * cr) >> 16u), 0, 255);
         bl = clamp(yy + ((116130 * cb + 32768) >> 16u), 0, 255);

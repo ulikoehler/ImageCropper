@@ -102,7 +102,8 @@ pub fn probe(bytes: &[u8]) -> Option<(u32, u32, u32)> {
         .map(|s| s.dri.max(0) as u32)
         .max()
         .unwrap_or(0);
-    Some((j.w as u32, j.h as u32, dri))
+    let (w, h) = j.out_dims();
+    Some((w, h, dri))
 }
 
 fn canon(j: &mut Jpg<'_>) {
@@ -122,17 +123,13 @@ fn open_locked(bytes: &[u8]) -> Option<(GpuJpeg, &'static gpu::GpuCtx)> {
     if !parse_jpg(&mut j) {
         return None;
     }
-    // a file with no restart markers anywhere decodes serially — zune
-    // wins on CPU for those (this rejects DRI=0 baseline AND the common
-    // no-restart progressive file)
-    if !j.scans.iter().any(|s| s.dri > 0) {
-        return None;
-    }
-    let (w, h) = (j.w as u32, j.h as u32);
+    let (w, h) = j.out_dims();
     let ctx = gpu::ctx()?;
     canon(&mut j);
     let fg = pack_comps(&j);
-    let px = ctx.decode_into(&j, &fg);
+    // DRI=0 scans get host "survey" passes that synthesize virtual
+    // restart intervals — serial scans decode in parallel anyway.
+    let px = ctx.decode_into(&mut j, &fg);
     Some((
         GpuJpeg {
             px: Some(px),

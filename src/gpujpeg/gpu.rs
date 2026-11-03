@@ -3,7 +3,10 @@
 //! are managed by wgpu handles (no explicit session map needed).
 
 use super::coeffs;
-use super::jpeg::{pack_flut, pack_tables, scan_mode, FrameGpu, Jpg};
+use super::jpeg::{
+    pack_flut, pack_tables, scan_mode, survey_scan, FrameGpu, Interval, Jpg,
+    NoCoef, Scan, K_SURVEY_IV,
+};
 use super::shaders;
 use std::future::Future;
 use std::sync::OnceLock;
@@ -217,10 +220,34 @@ impl GpuCtx {
     /// Full JPEG decode -> RGBA u32 buffer on device (0xAABBGGRR words).
     /// Returns the output buffer; caller may keep it (session) or read it.
     /// Handles baseline (SOF0/1) and progressive (SOF2, multi-scan) files.
-    pub fn decode_into(&self, j: &Jpg<'_>, fg: &FrameGpu) -> wgpu::Buffer {
+    /// DRI=0 scans are parallelized by host "survey" passes that
+    /// synthesize virtual restart intervals (see jpeg::survey_scan).
+    pub fn decode_into(&self, j: &mut Jpg<'_>, fg: &FrameGpu) -> wgpu::Buffer {
         let dev = &self.device;
         let q = &self.queue;
         let n_scans = j.scans.len() as u32;
+
+        // ---- DRI=0 surveys -------------------------------------------------
+        // Serial scans above K_SURVEY_IV MCUs get split into virtual
+        // intervals by a CPU symbol-walk. AC-refine scans need prior
+        // coef state — their survey is deferred to dispatch time.
+        let needs_survey = |sc: &Scan| sc.dri == 0 && sc.total_mcus > K_SURVEY_IV;
+        let deferred = |sc: &Scan| needs_survey(sc) && scan_mode(sc) == 4;
+        let mut scans = std::mem::take(&mut j.scans);
+        for sc in scans.iter_mut() {
+            if !needs_survey(sc) || deferred(sc) {
+                continue;
+            }
+            if !survey_scan(j, sc, &NoCoef, fg) {
+                // fall back to a single serial interval
+                sc.surv_st.clear();
+                sc.intervals = vec![Interval {
+                    byte_start: 0,
+                    mcu_start: 0,
+                    n_mcu: sc.total_mcus,
+                }];
+            }
+        }
 
         // ---- one-time upload: scan data, chunk grid, state slots, tables ----
         // Whole file as scan buffer: interval byteStarts are file-absolute.
@@ -235,13 +262,28 @@ impl GpuCtx {
             q.write_buffer(&scan_buf, 0, &file_bytes);
         }
 
-        // per-scan chunk entries concatenated into one buffer
+        // per-scan chunk entries concatenated into one buffer.
+        // Surveyed scans emit flag=2 chunks (host-preloaded st[]);
+        // deferred-survey scans emit the fixed K_SURVEY_IV partition
+        // now — the survey only fills st[] at dispatch time.
         let mut ck_all: Vec<u32> = Vec::new();
         let mut ck_base = vec![0u32; n_scans as usize];
         let mut n_iv_v = Vec::with_capacity(n_scans as usize);
         let mut n_gen_v = Vec::with_capacity(n_scans as usize);
         let mut total_slots = 0u32;
-        for (si, sc) in j.scans.iter().enumerate() {
+        for (si, sc) in scans.iter().enumerate() {
+            ck_base[si] = total_slots;
+            if deferred(sc) {
+                let n_iv = sc.total_mcus.div_ceil(K_SURVEY_IV);
+                n_iv_v.push(n_iv);
+                n_gen_v.push(1);
+                for i in 0..n_iv {
+                    let nm = K_SURVEY_IV.min(sc.total_mcus - i * K_SURVEY_IV);
+                    ck_all.extend_from_slice(&[0, i * K_SURVEY_IV, nm, 2]);
+                }
+                total_slots += n_iv;
+                continue;
+            }
             let n_iv = sc.intervals.len() as u32;
             let n_gen = sc
                 .intervals
@@ -250,9 +292,9 @@ impl GpuCtx {
                 .max()
                 .unwrap_or(1)
                 .max(1);
-            ck_base[si] = total_slots;
             n_iv_v.push(n_iv);
             n_gen_v.push(n_gen);
+            let surveyed = !sc.surv_st.is_empty();
             for g_i in 0..n_gen {
                 for iv in &sc.intervals {
                     let ms = iv.mcu_start + g_i * CHUNK_MCUS;
@@ -266,7 +308,11 @@ impl GpuCtx {
                         },
                         ms,
                         nm,
-                        u32::from(g_i > 0),
+                        if surveyed {
+                            2
+                        } else {
+                            u32::from(g_i > 0)
+                        },
                     ]);
                 }
             }
@@ -281,8 +327,20 @@ impl GpuCtx {
         let st_buf = buf(
             dev,
             (total_slots * 12 * 4) as u64,
-            wgpu::BufferUsages::STORAGE,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         );
+        // preload surveyed states into each interval's own slot
+        {
+            let mut st_words = vec![0u32; total_slots as usize * 12];
+            for (si, sc) in scans.iter().enumerate() {
+                if sc.surv_st.is_empty() {
+                    continue;
+                }
+                let base = ck_base[si] as usize * 12;
+                st_words[base..base + sc.surv_st.len()].copy_from_slice(&sc.surv_st);
+            }
+            q.write_buffer(&st_buf, 0, &u32_bytes(&st_words));
+        }
 
         // per-scan Huffman/quant tables at region si*TAB_WORDS, plus one
         // recon region (final quant state) at n_scans*TAB_WORDS
@@ -293,7 +351,7 @@ impl GpuCtx {
         );
         {
             let mut words = Vec::with_capacity((n_scans as usize + 1) * super::jpeg::TAB_WORDS);
-            for sc in &j.scans {
+            for sc in &scans {
                 words.extend_from_slice(&pack_tables(sc));
             }
             let mut qt = vec![0i32; super::jpeg::TAB_WORDS];
@@ -316,7 +374,7 @@ impl GpuCtx {
         {
             let mut all = Vec::with_capacity(n_scans as usize * super::jpeg::FLUT_WORDS);
             let mut prev: Option<(&super::jpeg::Scan, Vec<u32>)> = None;
-            for sc in &j.scans {
+            for sc in &scans {
                 let fl = pack_flut(sc, prev.as_ref().map(|(s, f)| (*s, f.as_slice())));
                 all.extend_from_slice(&fl);
                 prev = Some((sc, fl));
@@ -333,16 +391,19 @@ impl GpuCtx {
         let coef_buf = buf(
             dev,
             (fg.total_blocks as u64) * 32 * 4,
-            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC, // deferred surveys read it
         );
         let plane_buf = buf(
             dev,
             (fg.plane_words as u64) * 4,
             wgpu::BufferUsages::STORAGE,
         );
+        let (ow, oh) = j.out_dims();
         let out_buf = buf(
             dev,
-            (j.w as u64) * (j.h as u64) * 4,
+            (ow as u64) * (oh as u64) * 4,
             wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
         );
 
@@ -372,7 +433,7 @@ impl GpuCtx {
         }
         let mut jobs = Vec::new();
         for si in 0..n_scans {
-            let sc = &j.scans[si as usize];
+            let sc = &scans[si as usize];
             for g in 0..n_gen_v[si as usize] {
                 let mut w = 0u64;
                 for iv in &sc.intervals {
@@ -387,13 +448,19 @@ impl GpuCtx {
                 });
             }
         }
-        // greedy grouping into ranges whose total MCUs stay under budget
+        // greedy grouping into ranges whose total MCUs stay under budget;
+        // a deferred survey begins a new submit — its coef readback needs
+        // all prior scans' dispatches complete first
         let mut submits: Vec<(u32, u32)> = Vec::new();
         {
             let mut acc = 0u32;
             let mut start = 0usize;
             for i in 0..=jobs.len() {
-                if i == jobs.len() || (acc > 0 && acc + jobs[i].mcus > SUBMIT_MCUS) {
+                if i == jobs.len()
+                    || (acc > 0
+                        && (acc + jobs[i].mcus > SUBMIT_MCUS
+                            || deferred(&scans[jobs[i].si as usize])))
+                {
                     submits.push((start as u32, i as u32));
                     start = i;
                     acc = 0;
@@ -415,8 +482,39 @@ impl GpuCtx {
         pc[7] = j.data.len() as u32;
 
         // 1) entropy decode: scan generations grouped by MCU budget
+        let coef_len = (fg.total_blocks as u64) * 32 * 4;
         let mut first = true;
         for &(j0, j1) in &submits {
+            // AC-refine surveys run between submits: the host reads the
+            // coef buffer only after all prior scans' dispatches land.
+            {
+                let si = jobs[j0 as usize].si as usize;
+                if deferred(&scans[si]) && scans[si].surv_st.is_empty() {
+                    let mut sc0 = std::mem::take(&mut scans[si]);
+                    let ok = if first {
+                        // coef buffer not yet filled — survey on zeros
+                        survey_scan(j, &mut sc0, &NoCoef, fg)
+                    } else {
+                        self.wait();
+                        let bytes = self.read_buf(&coef_buf, coef_len);
+                        let words: Vec<u32> = bytes
+                            .chunks_exact(4)
+                            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                            .collect();
+                        survey_scan(j, &mut sc0, &&*words.as_slice(), fg)
+                    };
+                    if ok {
+                        q.write_buffer(
+                            &st_buf,
+                            (ck_base[si] * 12 * 4) as u64,
+                            &u32_bytes(&sc0.surv_st),
+                        );
+                    } else {
+                        eprintln!("gpujpeg: deferred survey failed (scan {si})");
+                    }
+                    scans[si] = sc0;
+                }
+            }
             let mut enc = dev.create_command_encoder(&Default::default());
             if first {
                 enc.clear_buffer(&coef_buf, 0, None);
@@ -430,7 +528,7 @@ impl GpuCtx {
                 for ji in j0..j1 {
                     let jb = &jobs[ji as usize];
                     let si = jb.si;
-                    let sc = &j.scans[si as usize];
+                    let sc = &scans[si as usize];
                     let n_iv = n_iv_v[si as usize];
                     if si != last_si {
                         pc[6] = n_iv;
@@ -458,10 +556,12 @@ impl GpuCtx {
             q.submit([enc.finish()]);
         }
         self.wait();
-        // 2) + 3) reconstruction and upsample in one submit
-        let pc8: [u32; 9] = [
-            j.w as u32,
-            j.h as u32,
+        // 2) + 3) reconstruction and upsample in one submit. Upsample
+        // applies EXIF orientation: pc.w/h are the ORIENTED output dims
+        // (swapped for orient 5-8); uW/uH stay the source plane dims.
+        let pc8: [u32; 12] = [
+            ow,
+            oh,
             j.mcus_x as u32,
             j.n_comp as u32,
             j.max_h as u32,
@@ -469,6 +569,9 @@ impl GpuCtx {
             0,
             j.data.len() as u32,
             n_scans * (super::jpeg::TAB_WORDS as u32) / 4,
+            j.orient as u32,
+            j.w as u32,
+            j.h as u32,
         ];
         let mut enc = dev.create_command_encoder(&Default::default());
         {
@@ -483,10 +586,11 @@ impl GpuCtx {
             cp.set_pipeline(&self.p_upsample);
             cp.set_bind_group(0, &bg, &[]);
             cp.set_immediates(0, &pc_bytes(&pc8));
-            cp.dispatch_workgroups((j.w as u32).div_ceil(16), (j.h as u32).div_ceil(16), 1);
+            cp.dispatch_workgroups(ow.div_ceil(16), oh.div_ceil(16), 1);
         }
         q.submit([enc.finish()]);
         self.wait();
+        j.scans = scans;
         out_buf
     }
 

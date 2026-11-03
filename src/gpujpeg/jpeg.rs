@@ -74,12 +74,48 @@ pub struct Scan {
     pub data_off: u32,
     pub data_len: u32,
     pub intervals: Vec<Interval>,
+    /// Host-surveyed bit-reader states for virtual (DRI=0) intervals:
+    /// 12 u32 words per interval — pos, buf, cnt, end, pred[4], eobrun,
+    /// pad, 2 reserved. Loaded by flag-2 chunks instead of chaining.
+    pub surv_st: Vec<u32>,
     pub total_mcus: u32, // MCU count in this scan's units
     // Tables snapshot AS OF this scan — progressive files commonly
     // redefine DHT/DQT between scans (per-scan optimized tables).
     pub dctab: [HuffTable; 4],
     pub actab: [HuffTable; 4],
     pub qt: [[u16; 64]; 4],
+}
+
+impl Default for Scan {
+    fn default() -> Self {
+        Scan {
+            ns: 0,
+            sc: [ScanComp::default(); 4],
+            ss: 0,
+            se: 0,
+            ah: 0,
+            al: 0,
+            dri: 0,
+            data_off: 0,
+            data_len: 0,
+            intervals: Vec::new(),
+            surv_st: Vec::new(),
+            total_mcus: 0,
+            dctab: [
+                HuffTable::default(),
+                HuffTable::default(),
+                HuffTable::default(),
+                HuffTable::default(),
+            ],
+            actab: [
+                HuffTable::default(),
+                HuffTable::default(),
+                HuffTable::default(),
+                HuffTable::default(),
+            ],
+            qt: [[0; 64]; 4],
+        }
+    }
 }
 
 pub struct Jpg<'a> {
@@ -100,6 +136,8 @@ pub struct Jpg<'a> {
     pub scans: Vec<Scan>,
     pub total_mcus: i32,
     pub progressive: bool,
+    /// EXIF orientation 1..8 from APP1/TIFF tag 0x0112 (1 = none).
+    pub orient: i32,
 }
 
 impl<'a> Jpg<'a> {
@@ -132,6 +170,16 @@ impl<'a> Jpg<'a> {
             scans: Vec::new(),
             total_mcus: 0,
             progressive: false,
+            orient: 1,
+        }
+    }
+
+    /// Output dims after EXIF orientation (swapped for orient 5-8).
+    pub fn out_dims(&self) -> (u32, u32) {
+        if self.orient >= 5 {
+            (self.h as u32, self.w as u32)
+        } else {
+            (self.w as u32, self.h as u32)
         }
     }
 }
@@ -168,6 +216,57 @@ pub fn build_canon(t: &mut HuffTable) {
         code <<= 1;
         k += t.counts[l - 1] as i32;
     }
+}
+
+/// APP1 "Exif\0\0" payload -> TIFF orientation 1..8 (bounds-checked).
+fn parse_exif_orient(s: &[u8]) -> i32 {
+    if s.len() < 14 || !s.starts_with(b"Exif\0\0") {
+        return 1;
+    }
+    let t = &s[6..];
+    let le = t[0] == b'I';
+    if !le && !(t[0] == b'M' && t[1] == b'M') {
+        return 1;
+    }
+    let u16v = |o: usize| -> u32 {
+        if le {
+            t[o] as u32 | ((t[o + 1] as u32) << 8)
+        } else {
+            ((t[o] as u32) << 8) | t[o + 1] as u32
+        }
+    };
+    let u32v = |o: usize| -> u32 {
+        if le {
+            t[o] as u32
+                | ((t[o + 1] as u32) << 8)
+                | ((t[o + 2] as u32) << 16)
+                | ((t[o + 3] as u32) << 24)
+        } else {
+            ((t[o] as u32) << 24)
+                | ((t[o + 1] as u32) << 16)
+                | ((t[o + 2] as u32) << 8)
+                | t[o + 3] as u32
+        }
+    };
+    if u16v(2) != 42 {
+        return 1;
+    }
+    let ifd = u32v(4) as usize;
+    if ifd + 2 > t.len() {
+        return 1;
+    }
+    let cnt = u16v(ifd) as usize;
+    for i in 0..cnt {
+        let e = ifd + 2 + i * 12;
+        if e + 12 > t.len() {
+            break;
+        }
+        if u16v(e) == 0x0112 && u16v(e + 2) == 3 {
+            let v = u16v(e + 8) as i32;
+            return if (1..=8).contains(&v) { v } else { 1 };
+        }
+    }
+    1
 }
 
 pub fn parse_jpg(j: &mut Jpg<'_>) -> bool {
@@ -290,6 +389,10 @@ pub fn parse_jpg(j: &mut Jpg<'_>) -> bool {
                 }
                 have_sof = true;
             }
+            0xE1 => {
+                // APP1: EXIF orientation
+                j.orient = parse_exif_orient(s);
+            }
             0xDD => {
                 // DRI — takes effect for all scans that follow
                 j.dri = ((s[0] as i32) << 8) | s[1] as i32;
@@ -314,6 +417,7 @@ pub fn parse_jpg(j: &mut Jpg<'_>) -> bool {
                     data_off: 0,
                     data_len: 0,
                     intervals: Vec::new(),
+                    surv_st: Vec::new(),
                     total_mcus: 0,
                     dctab: j.dctab.clone(),
                     actab: j.actab.clone(),
@@ -597,4 +701,384 @@ pub fn pack_comps(j: &Jpg<'_>) -> FrameGpu {
     }
     f.plane_words = (plane_of / 4) as i32;
     f
+}
+
+// ============================================================
+//  Survey pass: virtual restart intervals for DRI=0 scans.
+//
+//  A serial Huffman-symbol walk over the entropy stream that mirrors
+//  the GPU kernel's consumption exactly — but only tracks decoder
+//  state (bit position, DC predictors, EOBRUN, pad), never pixels.
+//  Snapshots every K_SURVEY_IV MCUs become virtual restart intervals
+//  (flag-2 chunks): preloaded state turns the serial stream back into
+//  independent parallel work. AC-refine scans additionally need the
+//  coef buffer from prior scans — their survey is deferred until those
+//  scans' GPU dispatch completed (host reads coefBuf).
+// ============================================================
+pub const K_SURVEY_IV: u32 = 256;
+
+/// CPU mirror of the entropy shader's bit reader (identical semantics,
+/// including marker-prefetch `pad` tracking).
+struct SBit<'a> {
+    d: &'a [u8],
+    pos: u32,
+    buf: u32,
+    cnt: i32,
+    end: bool,
+    pad: i32,
+}
+
+impl<'a> SBit<'a> {
+    fn rd_byte(&mut self) -> u32 {
+        if self.end {
+            return 0xFF;
+        }
+        let v = self.d[self.pos as usize] as u32;
+        if v != 0xFF {
+            self.pos += 1;
+            return v;
+        }
+        let mut p = self.pos + 1;
+        let mut n = 0xFFu32;
+        while n == 0xFF && (p as usize) < self.d.len() {
+            n = self.d[p as usize] as u32;
+            if n == 0xFF {
+                p += 1;
+            }
+        }
+        if n == 0 {
+            self.pos = p + 1;
+            return 0xFF;
+        }
+        self.end = true;
+        0xFF
+    }
+    fn fill(&mut self) {
+        while self.cnt <= 24 {
+            let v = self.rd_byte();
+            self.buf = (self.buf << 8) | v;
+            self.cnt += 8;
+            if self.end {
+                self.pad += 8;
+            }
+        }
+    }
+    fn peek_n(&mut self, n: u32) -> u32 {
+        self.fill();
+        if self.cnt as u32 >= n {
+            return (self.buf >> (self.cnt as u32 - n)) & ((1 << n) - 1);
+        }
+        let real = self.cnt as u32;
+        let v = (self.buf & ((1 << real) - 1)) << (n - real);
+        v | ((1 << (n - real)) - 1)
+    }
+    fn eat(&mut self, n: u32) {
+        self.cnt = if self.cnt as u32 >= n {
+            self.cnt - n as i32
+        } else {
+            0
+        };
+        if self.pad > self.cnt {
+            self.pad = self.cnt;
+        }
+        self.buf &= if self.cnt >= 32 {
+            0xFFFF_FFFF
+        } else {
+            (1u32 << (self.cnt as u32)) - 1
+        };
+    }
+    fn get1(&mut self) -> u32 {
+        let v = self.peek_n(1);
+        self.eat(1);
+        v
+    }
+    fn rext(&mut self, s: i32) -> i32 {
+        if s == 0 {
+            return 0;
+        }
+        let i = self.peek_n(s as u32) as i32;
+        self.eat(s as u32);
+        if i < (1 << (s - 1)) {
+            i - (1 << s) + 1
+        } else {
+            i
+        }
+    }
+}
+
+/// Canonical Huffman decode (mincode/maxcode/valptr walk).
+fn hdec(b: &mut SBit<'_>, t: &HuffTable) -> i32 {
+    let mut code = 0i32;
+    for l in 0..16usize {
+        code = (code << 1) | b.get1() as i32;
+        if t.maxcode[l] >= 0 && code <= t.maxcode[l] {
+            return t.vals[(t.valptr[l] + code) as usize] as i32;
+        }
+    }
+    -1
+}
+
+/// Coef access for AC-refine surveys — same zigzag-pair packing as the
+/// GPU coef buffer. The null impl returns 0 (used for non-refine scans).
+pub trait SurvCoef {
+    fn get(&self, outp: u32, k: i32) -> i32;
+}
+pub struct NoCoef;
+impl SurvCoef for NoCoef {
+    fn get(&self, _o: u32, _k: i32) -> i32 {
+        0
+    }
+}
+impl SurvCoef for &[u32] {
+    fn get(&self, outp: u32, k: i32) -> i32 {
+        let w2 = self[(outp + (k >> 1) as u32) as usize];
+        let v = ((w2 >> ((k & 1) * 16)) & 0xFFFF) as i32;
+        if v >= 32768 {
+            v - 65536
+        } else {
+            v
+        }
+    }
+}
+
+/// One scan's entropy stream -> virtual interval table + per-interval
+/// preloaded state (12 u32 words each). Mirrors the shader's per-MCU
+/// symbol walk for all five modes; mode 4 reads coefs (nonzero walk).
+/// Tables must already be canonicalized (build_canon).
+/// Returns false on unrecoverable stream corruption.
+pub fn survey_scan(j: &Jpg<'_>, sc: &mut Scan, coef: &dyn SurvCoef, fg: &FrameGpu) -> bool {
+    let mode = scan_mode(sc);
+    let mut b = SBit {
+        d: j.data,
+        pos: sc.data_off,
+        buf: 0,
+        cnt: 0,
+        end: false,
+        pad: 0,
+    };
+    let mut pred = [0i32; 4];
+    let mut eobrun = 0u32;
+    sc.intervals.clear();
+    sc.surv_st.clear();
+    let total = sc.total_mcus;
+
+    macro_rules! snap {
+        ($mcu_start:expr) => {{
+            let mcu_start = $mcu_start;
+            if let Some(last) = sc.intervals.last_mut() {
+                last.n_mcu = mcu_start - last.mcu_start;
+            }
+            sc.intervals.push(Interval {
+                byte_start: b.pos - sc.data_off,
+                mcu_start,
+                n_mcu: 0,
+            });
+            sc.surv_st.extend_from_slice(&[
+                b.pos,
+                b.buf,
+                b.cnt as u32,
+                u32::from(b.end),
+                pred[0] as u32,
+                pred[1] as u32,
+                pred[2] as u32,
+                pred[3] as u32,
+                eobrun,
+                b.pad as u32,
+                0,
+                0,
+            ]);
+        }};
+    }
+
+    for mcu in 0..total {
+        if mcu % K_SURVEY_IV == 0 {
+            snap!(mcu);
+        }
+        if b.end && b.cnt <= b.pad {
+            continue; // nothing but marker padding — mirrors shader skip
+        }
+        if sc.ns > 1 {
+            let mx = (mcu as i32) % j.mcus_x;
+            let my = (mcu as i32) / j.mcus_x;
+            for ci in 0..sc.ns as usize {
+                let c = &j.comps[sc.sc[ci].comp as usize];
+                let dt = &sc.dctab[sc.sc[ci].td as usize];
+                let at = &sc.actab[sc.sc[ci].ta as usize];
+                let cofs = fg.comps[sc.sc[ci].comp as usize][9] as u32;
+                for v in 0..c.vs {
+                    for h in 0..c.hs {
+                        let bi = (my * c.vs + v) * c.bw + mx * c.hs + h;
+                        let outp = cofs + bi as u32 * 32;
+                        let _ = outp;
+                        match mode {
+                            0 => {
+                                let s = hdec(&mut b, dt);
+                                if s < 0 {
+                                    return false;
+                                }
+                                pred[ci] += b.rext(s);
+                                let mut k = 1;
+                                while k < 64 {
+                                    let sym = hdec(&mut b, at);
+                                    if sym < 0 {
+                                        return false;
+                                    }
+                                    let r = sym >> 4;
+                                    let s2 = sym & 15;
+                                    if s2 == 0 {
+                                        if r == 15 {
+                                            k += 16;
+                                            continue;
+                                        }
+                                        break;
+                                    }
+                                    k += r;
+                                    b.rext(s2); // consumed even OOB
+                                    k += 1;
+                                }
+                            }
+                            1 => {
+                                let s = hdec(&mut b, dt);
+                                if s < 0 {
+                                    return false;
+                                }
+                                pred[ci] += b.rext(s);
+                            }
+                            2 => {
+                                b.get1();
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        } else {
+            let comp = sc.sc[0].comp as usize;
+            let dt = &sc.dctab[sc.sc[0].td as usize];
+            let at = &sc.actab[sc.sc[0].ta as usize];
+            let wib1 = j.comps[comp].wib;
+            let bw = j.comps[comp].bw;
+            let cofs = fg.comps[comp][9] as u32;
+            let bx = (mcu as i32) % wib1;
+            let by = (mcu as i32) / wib1;
+            let outp = cofs + (by * bw + bx) as u32 * 32;
+            match mode {
+                0 | 1 => {
+                    let s = hdec(&mut b, dt);
+                    if s < 0 {
+                        return false;
+                    }
+                    pred[0] += b.rext(s);
+                    if mode == 0 {
+                        let mut k = 1;
+                        while k < 64 {
+                            let sym = hdec(&mut b, at);
+                            if sym < 0 {
+                                return false;
+                            }
+                            let r = sym >> 4;
+                            let s2 = sym & 15;
+                            if s2 == 0 {
+                                if r == 15 {
+                                    k += 16;
+                                    continue;
+                                }
+                                break;
+                            }
+                            k += r;
+                            b.rext(s2); // consumed even OOB
+                            k += 1;
+                        }
+                    }
+                }
+                2 => {
+                    b.get1();
+                }
+                3 => {
+                    if eobrun > 0 {
+                        eobrun -= 1;
+                    } else {
+                        let mut k = sc.ss;
+                        while k <= sc.se {
+                            let sym = hdec(&mut b, at);
+                            if sym < 0 {
+                                return false;
+                            }
+                            let r = sym >> 4;
+                            let s2 = sym & 15;
+                            if s2 != 0 {
+                                k += r;
+                                b.rext(s2); // consumed even OOB
+                                k += 1;
+                            } else if r == 15 {
+                                k += 16;
+                            } else {
+                                eobrun = 1u32 << r;
+                                if r > 0 {
+                                    eobrun += b.peek_n(r as u32);
+                                    b.eat(r as u32);
+                                }
+                                eobrun -= 1;
+                                break;
+                            }
+                        }
+                    }
+                }
+                _ => {
+                    // mode 4 — AC refinement: coef-dependent walk
+                    let mut k = sc.ss;
+                    if eobrun == 0 {
+                        while k <= sc.se {
+                            let sym = hdec(&mut b, at);
+                            if sym < 0 {
+                                return false;
+                            }
+                            let mut r = sym >> 4;
+                            let s2 = sym & 15;
+                            if s2 == 0 && r != 15 {
+                                eobrun = 1u32 << r;
+                                if r > 0 {
+                                    eobrun += b.peek_n(r as u32);
+                                    b.eat(r as u32);
+                                }
+                                break;
+                            }
+                            if s2 != 0 {
+                                b.get1(); // new-coef sign bit
+                            }
+                            loop {
+                                let v = coef.get(outp, k);
+                                if v != 0 {
+                                    b.get1(); // correction bit
+                                } else {
+                                    r -= 1;
+                                    if r < 0 {
+                                        break;
+                                    }
+                                }
+                                k += 1;
+                                if k > sc.se {
+                                    break;
+                                }
+                            }
+                            k += 1;
+                        }
+                    }
+                    if eobrun > 0 {
+                        while k <= sc.se {
+                            if coef.get(outp, k) != 0 {
+                                b.get1();
+                            }
+                            k += 1;
+                        }
+                        eobrun -= 1;
+                    }
+                }
+            }
+        }
+    }
+    if let Some(last) = sc.intervals.last_mut() {
+        last.n_mcu = total - last.mcu_start;
+    }
+    true
 }
