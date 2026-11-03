@@ -284,11 +284,11 @@ impl DestructivePool {
                         Err(mpsc::RecvTimeoutError::Disconnected) => return,
                     }
                 };
-                // Client work first: while the web client is waiting for
-                // images, background deletes/moves hold off so they don't
-                // compete for IO. The wait is bounded, so the queue always
-                // drains.
-                gate.yield_to_clients();
+                // Priority work first: while the web client is waiting for
+                // images — or while the early scan is still indexing — the
+                // delete/move workers hold off so they don't compete for IO.
+                // The wait is bounded, so the queue always drains.
+                gate.yield_to_priority(crate::server::io_gate::SCAN_HOLD_PAUSE);
                 let result = match job.kind {
                     ActionKind::Delete => trash_one(&job.path, job.sig),
                     ActionKind::Move => move_one(&job.path, job.sig, move_dir.as_deref()),
@@ -437,10 +437,12 @@ impl ActionQueue {
                             }
                             _ => None,
                         };
-                        // Client work first — a crop/resave reads and writes
-                        // whole images, so it must not compete with a client
-                        // that is waiting for thumbnails.
-                        serial_gate.yield_for(Duration::from_secs(2));
+                        // Priority work first — a crop/resave reads and
+                        // writes whole images, so it must not compete with
+                        // a client waiting for thumbnails or an early scan
+                        // still indexing the album.
+                        serial_gate
+                            .yield_to_priority(crate::server::io_gate::SCAN_HOLD_PAUSE);
                         match execute(&action, &path, &mut saver, serial_move_dir.as_deref()) {
                             Ok((new_sig, bytes)) => {
                                 if new_sig.is_some() || bytes.is_some() {

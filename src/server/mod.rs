@@ -606,8 +606,14 @@ impl ServerState {
 /// applied once the scan completes.
 pub fn spawn_scan_feeder(state: &Arc<ServerState>, stream: crate::cli::ScanStream) {
     use crate::fs_utils::ScanEvent;
-    const BATCH: usize = 64;
+    // Small batches so the client sees items appear smoothly instead of in
+    // big steps — a flush still caps the patch rate at FLUSH intervals.
+    const BATCH: usize = 8;
     const FLUSH: Duration = Duration::from_millis(200);
+    // While fewer than this many items are indexed (and the scan is still
+    // running), destructive work defers entirely: the album filling in is
+    // the priority, deletes/moves can wait.
+    const PRIORITY_UNTIL: usize = 2000;
 
     let state = state.clone();
     std::thread::spawn(move || {
@@ -617,6 +623,8 @@ pub fn spawn_scan_feeder(state: &Arc<ServerState>, stream: crate::cli::ScanStrea
         if crate::fs_utils::verbose() {
             eprintln!("scan: started");
         }
+        state.io_gate.set_hold(true);
+        let mut held = true;
         let mut batch: Vec<(PathBuf, Option<u64>)> = Vec::new();
         let mut found = 0usize;
         let t0 = std::time::Instant::now();
@@ -647,7 +655,17 @@ pub fn spawn_scan_feeder(state: &Arc<ServerState>, stream: crate::cli::ScanStrea
             }
             if batch.len() >= BATCH || (timed_out && !batch.is_empty()) {
                 state.upsert_files(std::mem::take(&mut batch));
+                if held && state.item_count() >= PRIORITY_UNTIL {
+                    state.io_gate.set_hold(false);
+                    held = false;
+                    if crate::fs_utils::verbose() {
+                        eprintln!("scan: {PRIORITY_UNTIL} items indexed — background work resumed");
+                    }
+                }
             }
+        }
+        if held {
+            state.io_gate.set_hold(false);
         }
         if !batch.is_empty() {
             state.upsert_files(batch);
