@@ -75,6 +75,38 @@ fn focus_boosts_neighborhood() {
 }
 
 #[test]
+fn sweep_preloads_at_most_2000_ids() {
+    let mut q = PushQueue::new(5000, 1_000_000_000);
+    let order = drain(&mut q);
+    assert_eq!(order.len(), 2000, "sweep capped at SWEEP_LIMIT");
+    assert!(order.iter().all(|&id| id < 2000));
+    assert!(q.is_drained());
+
+    // Explicit wants and boosts still reach ids beyond the limit.
+    q.want([4000]);
+    q.focus(4500);
+    let mut extra = Vec::new();
+    while let Some(id) = q.next_id() {
+        q.commit_send(id, 1);
+        extra.push(id);
+    }
+    assert_eq!(extra[0], 4000, "explicit want beats boost");
+    assert!(extra[1..].iter().all(|&id| (4498..=4502).contains(&id)));
+}
+
+#[test]
+fn reset_clears_stale_push_state() {
+    let mut q = PushQueue::new(10, 1_000_000);
+    q.want([1]);
+    q.focus(5);
+    drain(&mut q);
+    assert!(q.is_drained());
+    q.reset(10);
+    let order = drain(&mut q);
+    assert_eq!(order.len(), 10, "reset restarts the sweep on the new ids");
+}
+
+#[test]
 fn viewport_boosts_span_and_direction() {
     let mut q = PushQueue::new(20, 1_000_000);
     q.viewport(10, 12, 1); // forward scroll → lookahead after 12

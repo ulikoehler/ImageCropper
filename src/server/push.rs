@@ -5,6 +5,11 @@
 
 use std::collections::{BTreeMap, HashSet, VecDeque};
 
+/// The background sweep preloads only the first `SWEEP_LIMIT` manifest
+/// ids — enough thumbnails to scroll through before on-demand wants
+/// take over. Deeper items still arrive via explicit wants/boosts.
+pub const SWEEP_LIMIT: usize = 2000;
+
 /// One connected client's push state.
 pub struct PushQueue {
     /// Explicitly requested ids (highest priority).
@@ -141,7 +146,7 @@ impl PushQueue {
             self.boosts.remove(&id);
             return Some(id);
         }
-        while self.cursor < self.count {
+        while self.cursor < self.count.min(SWEEP_LIMIT) {
             let id = self.cursor as u32;
             self.cursor += 1;
             if !self.pushed.contains(&id) {
@@ -151,9 +156,10 @@ impl PushQueue {
         None
     }
 
-    /// True when every manifest id has been pushed.
+    /// True when every pushable id has been served (wants and boosts may
+    /// still carry ids beyond the sweep limit).
     pub fn is_drained(&self) -> bool {
-        self.pushed.len() >= self.count
+        self.pushed.len() >= self.count.min(SWEEP_LIMIT)
     }
 
     pub fn pushed_count(&self) -> usize {

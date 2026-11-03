@@ -325,11 +325,14 @@ function draw(){
   const want=[];
   for(const t of tileRects()){
     const y=t.y-scrollY;
+    // Prefetch one screen ahead (and a quarter behind) — scrolling into
+    // those rows finds thumbs already loaded instead of placeholders.
+    if(y+t.h>=-H/4&&y<=H*2&&!thumbs.has(t.i)&&!pending.has(t.i)){
+      pending.add(t.i);want.push(t.i)}
     if(y+t.h<0||y>H)continue;
     const bmp=thumbs.get(t.i);
     if(bmp)ctx.drawImage(bmp,t.x,y,t.w,t.h);
-    else{ctx.fillStyle="#1c1c1c";ctx.fillRect(t.x,y,t.w,t.h);
-      if(!pending.has(t.i)){pending.add(t.i);want.push(t.i)}}
+    else{ctx.fillStyle="#1c1c1c";ctx.fillRect(t.x,y,t.w,t.h);}
     if(selected.has(t.i)){ctx.strokeStyle="#4ea1ff";ctx.lineWidth=4;
       ctx.strokeRect(t.x+2,y+2,t.w-4,t.h-4);}
     if(t.i===focus){ctx.strokeStyle="#fff";ctx.lineWidth=2;
