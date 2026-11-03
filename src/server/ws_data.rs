@@ -188,6 +188,10 @@ async fn handle(socket: WebSocket, state: Arc<ServerState>) {
                     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                     continue;
                 }
+                // Thumbs go out in EV_THUMB_BATCH frames — one WS message
+                // per group instead of one per thumb cuts message dispatch
+                // and lets the client decode them in parallel off one Blob.
+                let mut batch: Vec<(u32, u64, Vec<u8>)> = Vec::new();
                 while let Some(done) = handles.next().await {
                     let Ok((id, path, sig, produced)) = done else {
                         continue;
@@ -209,14 +213,27 @@ async fn handle(socket: WebSocket, state: Arc<ServerState>) {
                             let bytes = p.jpeg.len() as u64;
                             q.commit_send(id, bytes);
                             drop(q);
-                            let _ = out_tx
-                                .send(Frame::new(EV_THUMB, 0, thumb_payload(id, sig, &p.jpeg)))
-                                .await;
+                            batch.push((id, sig, p.jpeg.as_ref().clone()));
+                            if batch.len() >= 4 {
+                                let _ = out_tx
+                                    .send(Frame::new(
+                                        EV_THUMB_BATCH,
+                                        0,
+                                        thumb_batch_payload(&batch),
+                                    ))
+                                    .await;
+                                batch.clear();
+                            }
                         }
                         None => {
                             q.mark_pushed(id);
                         }
                     }
+                }
+                if !batch.is_empty() {
+                    let _ = out_tx
+                        .send(Frame::new(EV_THUMB_BATCH, 0, thumb_batch_payload(&batch)))
+                        .await;
                 }
             }
         })

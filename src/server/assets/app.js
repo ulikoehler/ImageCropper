@@ -202,30 +202,49 @@ setInterval(()=>{
   // a blank viewport from staying blank after lost/dropped pushes.
   scheduleDraw();
 },1000);
+function onThumb(id,sig,jpeg,reqId){
+  pending.delete(id);
+  // Free the want-worker slot that asked for this id (sweep pushes carry
+  // req_id 0 and free nothing).
+  const slot=wantSlots.get(reqId);
+  if(slot){slot.left.delete(id);if(!slot.left.size){wantSlots.delete(reqId);pumpWants();}}
+  const it=items[id];
+  // Drop pushes for a known item whose content no longer matches —
+  // the id was reassigned mid-flight, tombstoned, or the file changed.
+  // Unknown ids (manifest still loading) are kept: ids are positional
+  // from that same manifest, and resyncs clear thumbs anyway.
+  // A dropped frame must still trigger a redraw: the tile is missing and
+  // `pending` was just cleared, so the next draw re-requests it. Without
+  // this the page can go idle on a viewport full of blank tiles.
+  if(it&&(it.removed||(sig!=="0"&&it.sig!==sig))){scheduleDraw();return}
+  if(sig!=="0"&&thumbs.has(id)){scheduleDraw();return}   // exact duplicate
+  createImageBitmap(jpeg).then(bmp=>{
+    thumbs.set(id,bmp); scheduleDraw();},
+    ()=>{pending.delete(id);scheduleDraw()});   // undecodable: retry later
+}
+
 function onData(f){
   if(f.type===EV_THUMB){
     const v=new DataView(f.payload.buffer,f.payload.byteOffset);
-    const id=v.getUint32(0,true);
-    const sig=v.getBigUint64(4,true).toString();   // manifest sigs are strings
-    const jpeg=f.payload.subarray(12);
-    pending.delete(id);
-    // Free the want-worker slot that asked for this id (sweep pushes carry
-    // req_id 0 and free nothing).
-    const slot=wantSlots.get(f.reqId);
-    if(slot){slot.left.delete(id);if(!slot.left.size){wantSlots.delete(f.reqId);pumpWants();}}
-    const it=items[id];
-    // Drop pushes for a known item whose content no longer matches —
-    // the id was reassigned mid-flight, tombstoned, or the file changed.
-    // Unknown ids (manifest still loading) are kept: ids are positional
-    // from that same manifest, and resyncs clear thumbs anyway.
-    // A dropped frame must still trigger a redraw: the tile is missing and
-    // `pending` was just cleared, so the next draw re-requests it. Without
-    // this the page can go idle on a viewport full of blank tiles.
-    if(it&&(it.removed||(sig!=="0"&&it.sig!==sig))){scheduleDraw();return}
-    if(sig!=="0"&&thumbs.has(id)){scheduleDraw();return}   // exact duplicate
-    createImageBitmap(new Blob([jpeg],{type:"image/jpeg"})).then(bmp=>{
-      thumbs.set(id,bmp); scheduleDraw();},
-      ()=>{pending.delete(id);scheduleDraw()});   // undecodable: retry later
+    onThumb(v.getUint32(0,true),v.getBigUint64(4,true).toString(),
+      new Blob([f.payload.subarray(12)],{type:"image/jpeg"}),f.reqId);
+  } else if(f.type===EV_THUMB_BATCH){
+    // One WS message, N thumbnails: [u16 count][u32 id,u64 sig,u32 len,
+    // jpeg]×N. One Blob backing the whole frame — each thumb decodes off
+    // a lazy slice (zero copies) and all N createImageBitmap calls run in
+    // parallel instead of trickling one-per-message.
+    const buf=f.payload.buffer,base=f.payload.byteOffset;
+    const v=new DataView(buf,base);
+    const n=v.getUint16(0,true);
+    const blob=new Blob([f.payload],{type:"application/octet-stream"});
+    let off=2;
+    for(let i=0;i<n;i++){
+      const id=v.getUint32(off,true),sig=v.getBigUint64(off+4,true).toString();
+      const len=v.getUint32(off+12,true);off+=16;
+      const slice=blob.slice(off,off+len,"image/jpeg");
+      off+=len;
+      onThumb(id,sig,slice,f.reqId);
+    }
   } else if(f.type===EV_EVENT){
     const ev=JSON.parse(new TextDecoder().decode(f.payload));
     if(ev.ev==="action-queued"){
