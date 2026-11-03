@@ -250,6 +250,13 @@ test.describe("album grid", () => {
     );
     expect(tombstonedEarly).toBe(true);
 
+    // Focus scrolls to the survivor at the deletion point.
+    const nextLive = await page.evaluate(
+      (i) => items.findIndex((it, j) => j >= i && it && !it.removed),
+      grayIdx,
+    );
+    expect(await page.evaluate(() => focus)).toBe(nextLive);
+
     // Server moves the file into .imagecropper-trash.
     const trashed = path.join(FIXTURE_DIR, ".imagecropper-trash", "gray.png");
     await expect

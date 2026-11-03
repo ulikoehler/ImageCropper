@@ -194,6 +194,18 @@ function tileRects(){
   return out;
 }
 
+// After a bulk remove, land on the first live tile at/after `i`
+// (falls back to the last live tile — the "last non deleted image").
+function firstLiveAtOrAfter(i){
+  for(let j=i;j<items.length;j++)if(items[j]&&!items[j].removed)return j;
+  for(let j=Math.min(i,items.length-1);j>=0;j--)if(items[j]&&!items[j].removed)return j;
+  return -1;
+}
+function scrollToIndex(i){
+  const r=tileRects().find(t=>t.i===i);
+  if(r)scrollY=Math.max(0,r.y-8*devicePixelRatio);
+}
+
 // ---- drag-select state (mode comes from the manifest) ----
 let mouseSelect="sequence", drag=null, suppressClick=false;
 const tileAt=(x,y)=>{
@@ -287,6 +299,7 @@ addEventListener("keydown",e=>{
   else if(e.key==="-"){zoom/=1.1;layout();draw()}
   else if(e.key==="w"){tileH*=e.shiftKey?1.25:0.8;layout();draw()}
   else if(e.key==="Delete"){
+    const at=selected.size?Math.min(...selected):focus;
     for(const i of selected){
       const it=items[i];if(!it||it.removed)continue;const tag=pendingTag++;
       pendingActions.set(tag,"delete");pendingIds.set(tag,it.id);
@@ -295,9 +308,15 @@ addEventListener("keydown",e=>{
       dataWs.send(frame(CL_ACTION,0,str(JSON.stringify({
         tag,kind:"delete",id:it.id,sig:it.sig}))));
     }
-    selected.clear();layout();draw();
+    selected.clear();layout();
+    // Scroll to the survivor at the deletion point (or the last
+    // remaining image when the deleted block ran to the end).
+    const f=firstLiveAtOrAfter(at);
+    if(f>=0){focus=f;anchor=f;scrollToIndex(f);}
+    draw();
   }
   else if((e.key==="m"||e.key==="M")&&!e.ctrlKey&&!e.metaKey){
+    const at=selected.size?Math.min(...selected):focus;
     for(const i of selected){
       const it=items[i];if(!it||it.removed)continue;const tag=pendingTag++;
       pendingActions.set(tag,"move");pendingIds.set(tag,it.id);
@@ -305,7 +324,10 @@ addEventListener("keydown",e=>{
       dataWs.send(frame(CL_ACTION,0,str(JSON.stringify({
         tag,kind:"move",id:it.id,sig:it.sig}))));
     }
-    selected.clear();layout();draw();
+    selected.clear();layout();
+    const f=firstLiveAtOrAfter(at);
+    if(f>=0){focus=f;anchor=f;scrollToIndex(f);}
+    draw();
   }
   else if((e.key==="f"||e.key==="F")&&!e.ctrlKey&&!e.metaKey){
     fHeld=true;if(screenIdx!==focus)fetchScreen(focus);draw();

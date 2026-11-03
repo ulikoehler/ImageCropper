@@ -512,6 +512,7 @@ impl AlbumApp {
         }
 
         let remove: std::collections::HashSet<&PathBuf> = paths.iter().collect();
+        let first_gone = targets.iter().min().copied().unwrap_or(0);
         self.entries.retain(|e| !remove.contains(&e.path));
         self.selected.clear();
         self.rebuild_index();
@@ -519,8 +520,12 @@ impl AlbumApp {
             self.focus = 0;
             self.anchor = 0;
         } else {
-            self.focus = self.focus.min(self.entries.len() - 1);
+            // Land on the first surviving tile at the deletion point — or,
+            // when the deleted block ran to the end, the last remaining
+            // image — and scroll the viewport to it.
+            self.focus = first_gone.min(self.entries.len() - 1);
             self.anchor = self.focus;
+            self.scroll_to_focus = true;
         }
     }
 
@@ -553,6 +558,7 @@ impl AlbumApp {
         }
 
         let remove: std::collections::HashSet<&PathBuf> = paths.iter().collect();
+        let first_gone = targets.iter().min().copied().unwrap_or(0);
         self.entries.retain(|e| !remove.contains(&e.path));
         self.selected.clear();
         self.rebuild_index();
@@ -560,8 +566,9 @@ impl AlbumApp {
             self.focus = 0;
             self.anchor = 0;
         } else {
-            self.focus = self.focus.min(self.entries.len() - 1);
+            self.focus = first_gone.min(self.entries.len() - 1);
             self.anchor = self.focus;
+            self.scroll_to_focus = true;
         }
     }
 
