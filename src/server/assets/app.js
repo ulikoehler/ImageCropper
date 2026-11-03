@@ -66,34 +66,62 @@ function onBulk(f){
   }
 }
 
+// Thumbs are keyed by positional id — a resync renumbers everything.
+// Key them by content (dir+name+sig) so unchanged images survive a
+// resync instead of being refetched.
+function snapshotThumbs(){
+  const m=new Map();
+  if(manifest&&manifest.dirs)for(let i=0;i<items.length;i++){
+    const it=items[i],b=thumbs.get(i);
+    if(it&&b)m.set(`${manifest.dirs[it.dir_index]}|${it.name}|${it.sig}`,b);
+  }
+  return m;
+}
+function restoreThumbs(snap){
+  for(let i=0;i<items.length;i++){
+    const it=items[i];
+    if(!it||it.removed)continue;
+    const b=snap.get(`${manifest.dirs[it.dir_index]}|${it.name}|${it.sig}`);
+    if(b)thumbs.set(i,b);
+  }
+}
+
 async function refreshManifest(){
+  const snap=snapshotThumbs();
   const {body}=await bulkRequest(BK_GET_MANIFEST,u32s(1,0));
   manifest=JSON.parse(new TextDecoder().decode(body));
   mouseSelect=manifest.mouse_select||"sequence";
   items=manifest.items;
   thumbs.clear();pending.clear();
+  restoreThumbs(snap);
   selected=new Set();focus=0;anchor=0;scanning=false;
   // Completions may have been lost on the way — the re-pulled manifest is
   // now authoritative, so stale pending counters must not linger.
   pendingActions.clear();
   screenBmp=null;screenIdx=-1;
-  layout();draw();
+  layout();scheduleDraw();
 }
 
 // ids are positional (items[id]); tombstoned entries keep their slot.
 function applyPatch(p){
   if(p.resync){
+    const snap=snapshotThumbs();
     items=[];manifest.dirs=[];thumbs.clear();pending.clear();
     selected=new Set();focus=0;anchor=0;scanning=false;
     screenBmp=null;screenIdx=-1;
     manifest.dirs=(p.dirs_added||[]).slice();
-  }else{
-    (p.dirs_added||[]).forEach(d=>manifest.dirs.push(d));
+    (p.upsert||[]).forEach(it=>{items[it.id]=it});
+    (p.remove||[]).forEach(id=>{if(items[id])items[id].removed=true;thumbs.delete(id)});
+    manifest.version=p.version;
+    restoreThumbs(snap);
+    layout();scheduleDraw();
+    return;
   }
+  (p.dirs_added||[]).forEach(d=>manifest.dirs.push(d));
   (p.upsert||[]).forEach(it=>{items[it.id]=it});
   (p.remove||[]).forEach(id=>{if(items[id])items[id].removed=true;thumbs.delete(id)});
   manifest.version=p.version;
-  layout();draw();
+  layout();scheduleDraw();
 }
 
 async function boot(){
@@ -127,10 +155,18 @@ function onData(f){
   if(f.type===EV_THUMB){
     const v=new DataView(f.payload.buffer,f.payload.byteOffset);
     const id=v.getUint32(0,true);
+    const sig=v.getBigUint64(4,true).toString();   // manifest sigs are strings
     const jpeg=f.payload.subarray(12);
     pending.delete(id);
+    const it=items[id];
+    // Drop pushes for a known item whose content no longer matches —
+    // the id was reassigned mid-flight, tombstoned, or the file changed.
+    // Unknown ids (manifest still loading) are kept: ids are positional
+    // from that same manifest, and resyncs clear thumbs anyway.
+    if(it&&(it.removed||(sig!=="0"&&it.sig!==sig)))return;
+    if(sig!=="0"&&thumbs.has(id))return;   // exact duplicate
     createImageBitmap(new Blob([jpeg],{type:"image/jpeg"})).then(bmp=>{
-      thumbs.set(id,bmp); draw();});
+      thumbs.set(id,bmp); scheduleDraw();});
   } else if(f.type===EV_EVENT){
     const ev=JSON.parse(new TextDecoder().decode(f.payload));
     if(ev.ev==="action-done"){
@@ -141,10 +177,10 @@ function onData(f){
         // ahead of the ack) — the ack only runs the pending counter and
         // surfaces failures.
         if(!ev.ok)statusEl.textContent=`${kind} failed: ${ev.error||"?"}`;
-        draw();
+        scheduleDraw();
       }
     }
-    if(ev.ev==="scan-start"){scanning=true;draw();}
+    if(ev.ev==="scan-start"){scanning=true;scheduleDraw();}
     if(ev.ev==="manifest-patch"){applyPatch(ev.patch||{});}
     if(ev.ev==="fs-changed"){refreshManifest();}
     if(ev.ev==="progress") statusEl.textContent=
@@ -243,8 +279,18 @@ async function fetchScreen(i){
     v.setUint8(12,2);v.setUint8(13,80);   // fmt=2: ≤1920 screen preview
     const {body}=await bulkRequest(BK_GET_FULL,b);
     const bmp=await createImageBitmap(new Blob([body],{type:"image/jpeg"}));
-    screenBmp=bmp;screenIdx=i;if(fsMode)draw();
+    screenBmp=bmp;screenIdx=i;if(fsMode)scheduleDraw();
   }finally{screenFetching.delete(i)}
+}
+
+// draw() is O(items) — during delete storms hundreds of patches and
+// thumb pushes arrive per second, so calls are coalesced to one redraw
+// per frame instead of one per event.
+let drawQueued=false;
+function scheduleDraw(){
+  if(drawQueued)return;
+  drawQueued=true;
+  requestAnimationFrame(()=>{drawQueued=false;draw()});
 }
 
 function draw(){
@@ -318,12 +364,12 @@ let dataWs=null;
 let pendingTagBase=Math.floor(Math.random()*0x1000)*0x100000, pendingCtr=0,
     pendingActions=new Map();
 const nextTag=()=>pendingTagBase+((pendingCtr++)&0xfffff);
-addEventListener("wheel",e=>{if(fsMode)return;scrollY=Math.max(0,scrollY+e.deltaY*devicePixelRatio);draw()});
+addEventListener("wheel",e=>{if(fsMode)return;scrollY=Math.max(0,scrollY+e.deltaY*devicePixelRatio);scheduleDraw()});
 addEventListener("keydown",e=>{
   const cols=()=>Math.max(1,Math.floor(canvas.width/(tileH*zoom)));
-  if(e.key==="+"||e.key==="="){zoom*=1.1;layout();draw()}
-  else if(e.key==="-"){zoom/=1.1;layout();draw()}
-  else if(e.key.toLowerCase()==="w"&&!e.ctrlKey&&!e.metaKey){viewW=e.shiftKey?Math.min(1,viewW*1.25):Math.max(0.05,viewW/1.25);layout();draw()}
+  if(e.key==="+"||e.key==="="){zoom*=1.1;layout();scheduleDraw()}
+  else if(e.key==="-"){zoom/=1.1;layout();scheduleDraw()}
+  else if(e.key.toLowerCase()==="w"&&!e.ctrlKey&&!e.metaKey){viewW=e.shiftKey?Math.min(1,viewW*1.25):Math.max(0.05,viewW/1.25);layout();scheduleDraw()}
   else if(e.key==="Delete"||(e.key.toLowerCase()==="m"&&!e.ctrlKey&&!e.metaKey)){
     const kind=e.key==="Delete"?"delete":"move";
     // No selection → the focused tile is the target (native parity).
@@ -349,7 +395,7 @@ addEventListener("keydown",e=>{
       const r=tileRects().find(t=>t.i===f);
       if(!(r&&r.y+r.h>scrollY&&r.y<scrollY+canvas.height))scrollToIndex(f);
     }
-    draw();
+    scheduleDraw();
   }
   else if((e.key==="f"||e.key==="F")&&!e.ctrlKey&&!e.metaKey&&!e.repeat){
     // Toggle fullscreen preview. Hover picks the entry image once;
@@ -360,9 +406,9 @@ addEventListener("keydown",e=>{
       const h=tileAt(mouseX*devicePixelRatio,mouseY*devicePixelRatio+scrollY);
       if(h>=0){focus=h;anchor=h}
     }
-    draw();
+    scheduleDraw();
   }
-  else if(e.key==="Escape"&&fsMode){fsMode=false;draw()}
+  else if(e.key==="Escape"&&fsMode){fsMode=false;scheduleDraw()}
   else if(e.key==="c"||e.key==="Escape"){}
   else if(e.key.startsWith("Arrow")){
     if(fsMode){
@@ -372,7 +418,7 @@ addEventListener("keydown",e=>{
         const dir=e.key==="ArrowLeft"?-1:1;
         for(let j=focus+dir;j>=0&&j<items.length;j+=dir)
           if(items[j]&&!items[j].removed){focus=j;anchor=j;break}
-        draw();
+        scheduleDraw();
       }
       e.preventDefault();return;
     }
@@ -385,7 +431,7 @@ addEventListener("keydown",e=>{
     else if(e.shiftKey){const[a,b]=[Math.min(anchor,nf),Math.max(anchor,nf)];
       for(let i=a;i<=b;i++)selected.add(i);focus=nf}
     else{focus=nf;anchor=nf;selected=new Set([nf])}
-    draw();
+    scheduleDraw();
   }
   else if(e.key==="Home"||e.key==="End"){
     // Jump to the first/last live image — selection stays untouched.
@@ -399,10 +445,10 @@ addEventListener("keydown",e=>{
         else if(r.y+r.h>scrollY+H)scrollY=r.y+r.h+m-H;   // below → bottom-align
       }
     }
-    draw();e.preventDefault();
+    scheduleDraw();e.preventDefault();
   }
-  else if(e.key===" "){selected.has(focus)?selected.delete(focus):selected.add(focus);draw();e.preventDefault()}
-  else if(e.key==="a"&&e.ctrlKey){for(let i=0;i<items.length;i++)selected.add(i);draw();e.preventDefault()}
+  else if(e.key===" "){selected.has(focus)?selected.delete(focus):selected.add(focus);scheduleDraw();e.preventDefault()}
+  else if(e.key==="a"&&e.ctrlKey){for(let i=0;i<items.length;i++)selected.add(i);scheduleDraw();e.preventDefault()}
 });
 canvas.addEventListener("mousedown",e=>{
   if(fsMode||e.button!==0)return;
@@ -443,12 +489,12 @@ addEventListener("mousemove",e=>{
       ?new Set([...b].filter(i=>!hits.has(i))
         .concat([...hits].filter(i=>!b.has(i))))
       :hits;
-  draw();
+  scheduleDraw();
 });
 addEventListener("mouseup",e=>{
   if(e.button!==0)return;
   if(drag&&drag.rect)suppressClick=true;
-  drag=null;draw();
+  drag=null;scheduleDraw();
 });
 document.addEventListener("mouseleave",()=>{mouseX=mouseY=-1});
 canvas.addEventListener("click",e=>{
@@ -461,11 +507,11 @@ canvas.addEventListener("click",e=>{
         for(let i=a;i<=b;i++)selected.add(i)}
       else if(e.ctrlKey||e.metaKey){selected.has(t.i)?selected.delete(t.i):selected.add(t.i);anchor=t.i}
       else{selected=new Set([t.i]);anchor=t.i}
-      focus=t.i;draw();break;
+      focus=t.i;scheduleDraw();break;
     }
   }
 });
-addEventListener("resize",()=>{layout();draw()});
+addEventListener("resize",()=>{layout();scheduleDraw()});
 
 boot().catch(e=>{
   // WS upgrade refused — most likely auth (--auth=token / -p password).

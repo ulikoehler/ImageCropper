@@ -563,12 +563,15 @@ impl ActionQueue {
         drop(destructive);
 
         // Batch preview cleanup once the queue drains: one scan per shared
-        // `.imagecropper-previews` dir instead of one per deleted file.
+        // `.imagecropper-previews` dir instead of one per deleted file. Runs
+        // on its own thread — poll() sits on the server's event pump, and a
+        // slow-mount directory scan must not stall event delivery.
         if self.pending() == 0 {
-            let mut cleanup = self.cleanup.lock().unwrap();
-            if !cleanup.is_empty() {
-                remove_previews_for_many(cleanup.iter().map(PathBuf::as_path));
-                cleanup.clear();
+            let purge: Vec<PathBuf> = self.cleanup.lock().unwrap().drain(..).collect();
+            if !purge.is_empty() {
+                thread::spawn(move || {
+                    remove_previews_for_many(purge.iter().map(PathBuf::as_path));
+                });
             }
         }
         out

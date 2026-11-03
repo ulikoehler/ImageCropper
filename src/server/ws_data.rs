@@ -50,10 +50,19 @@ async fn handle(socket: WebSocket, state: Arc<ServerState>) {
         return;
     }
 
-    // Outbound channel: push/ev/event producers → sink.
+    // Two outbound channels: events (small, latency-critical) and thumbs
+    // (bulk). The send task drains events first — a flood of thumbnail
+    // pushes must not delay action-done acks or manifest patches.
+    let (ev_tx, mut ev_rx) = mpsc::channel::<Frame>(256);
     let (out_tx, mut out_rx) = mpsc::channel::<Frame>(256);
     let send_task = tokio::spawn(async move {
-        while let Some(frame) = out_rx.recv().await {
+        loop {
+            let frame = tokio::select! {
+                biased;
+                f = ev_rx.recv() => f,
+                f = out_rx.recv() => f,
+            };
+            let Some(frame) = frame else { break };
             if sink
                 .send(Message::Binary(frame.encode().into()))
                 .await
@@ -67,7 +76,7 @@ async fn handle(socket: WebSocket, state: Arc<ServerState>) {
     // Broadcast events → EVENT frames.
     let mut events_rx = state.events.subscribe();
     let events_task = {
-        let out_tx = out_tx.clone();
+        let out_tx = ev_tx.clone();
         tokio::spawn(async move {
             loop {
                 match events_rx.recv().await {
@@ -110,13 +119,23 @@ async fn handle(socket: WebSocket, state: Arc<ServerState>) {
         let queue = queue.clone();
         let state = state.clone();
         tokio::spawn(async move {
+            let mut last_resync = state
+                .resync_seq
+                .load(std::sync::atomic::Ordering::Relaxed);
             loop {
                 let id = {
                     let mut q = queue.lock().await;
-                    // The manifest may still be growing (streaming scan) —
-                    // let the sweep pick up newly appended ids.
-                    q.set_count(state.item_count());
-                    if !q.may_send() {
+                    // A resync reassigned every id — queued wants/boosts and
+                    // the pushed-set now name different files. Restart fresh.
+                    let seq = state.resync_seq.load(std::sync::atomic::Ordering::Relaxed);
+                    if seq != last_resync {
+                        last_resync = seq;
+                        q.reset(state.item_count());
+                    }
+                    // While destructive actions drain, the listing is in flux
+                    // — sweeping thumbs for about-to-vanish files is wasted
+                    // work competing with action-done delivery.
+                    if state.actions.pending() > 0 || !q.may_send() {
                         None
                     } else {
                         q.next_id()
@@ -126,27 +145,40 @@ async fn handle(socket: WebSocket, state: Arc<ServerState>) {
                     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                     continue;
                 };
-                let Some(path) = state.path_of(id) else {
+                // Path + sig under one read so the pushed frame can be
+                // labelled consistently — ids shift on resync.
+                let found = {
+                    let m = state.manifest.read().unwrap();
+                    m.path_of(id)
+                        .map(|p| (p, m.items.get(id as usize).map(|i| i.sig).unwrap_or(0)))
+                };
+                let Some((path, sig)) = found else {
                     queue.lock().await.mark_pushed(id);
                     continue;
                 };
                 let previews = state.previews.clone();
-                let produced = tokio::task::spawn_blocking(move || previews.get_or_produce(&path))
-                    .await
-                    .ok()
-                    .flatten();
+                let produce_path = path.clone();
+                let produced = tokio::task::spawn_blocking(move || {
+                    previews.get_or_produce(&produce_path)
+                })
+                .await
+                .ok()
+                .flatten();
                 let mut q = queue.lock().await;
                 match produced {
                     Some(p) => {
+                        // Re-verify the id still names the produced file —
+                        // a resync/upsert mid-produce would make this push a
+                        // wrong thumbnail for the client's current item.
+                        let still_current = {
+                            let m = state.manifest.read().unwrap();
+                            m.path_of(id).as_deref() == Some(path.as_path())
+                                && m.items.get(id as usize).map(|i| i.sig) == Some(sig)
+                        };
+                        if !still_current {
+                            continue;
+                        }
                         let bytes = p.jpeg.len() as u64;
-                        let sig = state
-                            .manifest
-                            .read()
-                            .unwrap()
-                            .items
-                            .get(id as usize)
-                            .map(|i| i.sig)
-                            .unwrap_or(0);
                         q.commit_send(id, bytes);
                         drop(q);
                         let _ = out_tx
@@ -174,8 +206,17 @@ async fn handle(socket: WebSocket, state: Arc<ServerState>) {
                 if let Some(ids) = decode_want(&frame.payload) {
                     for id in ids {
                         queue.lock().await.mark_pushed(id);
-                        let Some(path) = state.path_of(id) else {
-                            continue;
+                        // Path + sig under one read — the frame must be
+                        // labelled consistently (ids shift on resync).
+                        let (path, sig) = {
+                            let m = state.manifest.read().unwrap();
+                            match m.path_of(id) {
+                                Some(p) => (
+                                    p,
+                                    m.items.get(id as usize).map(|i| i.sig).unwrap_or(0),
+                                ),
+                                None => continue,
+                            }
                         };
                         let previews = state.previews.clone();
                         let out_tx = out_tx.clone();
@@ -190,7 +231,7 @@ async fn handle(socket: WebSocket, state: Arc<ServerState>) {
                                     .send(Frame::new(
                                         EV_THUMB,
                                         frame.req_id,
-                                        thumb_payload(id, 0, &p.jpeg),
+                                        thumb_payload(id, sig, &p.jpeg),
                                     ))
                                     .await;
                             }
@@ -239,7 +280,7 @@ async fn handle(socket: WebSocket, state: Arc<ServerState>) {
                                 "kind": kind,
                                 "error": "item no longer in manifest",
                             })) {
-                                let _ = out_tx
+                                let _ = ev_tx
                                     .send(Frame::new(EV_EVENT, 0, json.into_bytes()))
                                     .await;
                             }

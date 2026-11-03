@@ -101,6 +101,25 @@ impl Manifest {
         mouse_select: MouseSelectMode,
         version: u32,
     ) -> Self {
+        Self::build_with(files, roots, mode, mouse_select, version, |path| {
+            let (w, h) = image::image_dimensions(path).unwrap_or((0, 0));
+            let bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+            let sig = preview_sig_u64(path).unwrap_or(0);
+            (w, h, bytes, sig)
+        })
+    }
+
+    /// Like [`Self::build`] but the caller decides how each file's
+    /// `(w, h, bytes, sig)` is obtained — a rescan can reuse stored metadata
+    /// for unchanged files instead of re-parsing every header.
+    pub fn build_with(
+        files: &[PathBuf],
+        roots: &[PathBuf],
+        mode: ServeMode,
+        mouse_select: MouseSelectMode,
+        version: u32,
+        sniff: impl Fn(&Path) -> (u32, u32, u64, u64),
+    ) -> Self {
         let mut dir_index: HashMap<PathBuf, u32> = HashMap::new();
         let mut dirs: Vec<String> = Vec::new();
         let mut items = Vec::with_capacity(files.len());
@@ -114,9 +133,7 @@ impl Manifest {
                 dirs.push(parent.to_string_lossy().into_owned());
                 (dirs.len() - 1) as u32
             });
-            let (w, h) = image::image_dimensions(path).unwrap_or((0, 0));
-            let bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-            let sig = preview_sig_u64(path).unwrap_or(0);
+            let (w, h, bytes, sig) = sniff(path);
             items.push(ManifestItem {
                 id: i as u32,
                 name: path

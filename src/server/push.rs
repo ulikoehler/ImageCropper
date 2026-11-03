@@ -79,6 +79,17 @@ impl PushQueue {
         self.count = count;
     }
 
+    /// A manifest resync reassigned every id — queued wants/boosts and the
+    /// pushed-set are stale (they name files that no longer exist at those
+    /// ids). Restart the sweep on the new id space; credit is untouched.
+    pub fn reset(&mut self, count: usize) {
+        self.wants.clear();
+        self.boosts.clear();
+        self.pushed.clear();
+        self.cursor = 0;
+        self.count = count;
+    }
+
     pub fn add_credit(&mut self, bytes: u64) {
         self.credit = self.credit.saturating_add(bytes);
     }

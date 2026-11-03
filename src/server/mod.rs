@@ -47,6 +47,9 @@ pub struct ServerState {
     pub mouse_select: crate::cli::MouseSelectMode,
     pub token: Option<String>,
     pub initial_credit: u64,
+    /// Bumped on every resync broadcast — per-client push queues reset on it
+    /// because the resync reassigned all manifest ids.
+    pub resync_seq: std::sync::atomic::AtomicU64,
 }
 
 impl ServerState {
@@ -83,6 +86,7 @@ impl ServerState {
             mouse_select,
             token,
             initial_credit: push_credit_kb as u64 * 1024,
+            resync_seq: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -332,6 +336,8 @@ impl ServerState {
 
     /// Broadcast the current manifest as a `resync` patch event.
     pub fn broadcast_resync(&self) {
+        self.resync_seq
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let patch = self.manifest.read().unwrap().full_patch();
         if let Ok(json) = serde_json::to_string(&serde_json::json!({
             "ev": "manifest-patch",
@@ -411,8 +417,35 @@ impl ServerState {
             .into_iter()
             .filter(|p| !self.actions.is_pending(p))
             .collect();
-        let version = self.manifest.read().unwrap().version + 1;
-        let fresh = Manifest::build(&files, roots, self.mode, self.mouse_select, version);
+        // Reuse stored dims/sig for files whose (size, mtime) signature is
+        // unchanged — a rescan then stats each file instead of re-parsing
+        // every image header, which matters a lot on slow/remote mounts.
+        let (version, prior) = {
+            let m = self.manifest.read().unwrap();
+            let prior: std::collections::HashMap<PathBuf, (u32, u32, u64, u64)> = (0..m
+                .items
+                .len())
+                .filter_map(|i| {
+                    let it = &m.items[i];
+                    m.path_of(i as u32)
+                        .map(|p| (p, (it.w, it.h, it.bytes, it.sig)))
+                })
+                .collect();
+            (m.version + 1, prior)
+        };
+        let sniff = move |path: &Path| {
+            let sig = crate::fs_utils::previews::preview_sig_u64(path).unwrap_or(0);
+            if let Some(&(w, h, bytes, old_sig)) = prior.get(path) {
+                if sig == old_sig && sig != 0 {
+                    return (w, h, bytes, sig);
+                }
+            }
+            let (w, h) = image::image_dimensions(path).unwrap_or((0, 0));
+            let bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+            (w, h, bytes, sig)
+        };
+        let fresh =
+            Manifest::build_with(&files, roots, self.mode, self.mouse_select, version, sniff);
         *self.manifest.write().unwrap() = fresh;
     }
 }
