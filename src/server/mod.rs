@@ -707,6 +707,10 @@ pub fn build_router(state: Arc<ServerState>) -> Router {
 /// the user's work and it must land. A second Ctrl-C abandons the drain.
 async fn shutdown(state: &ServerState) {
     state.previews.stop();
+    // Refuse new GPU work too: in-flight decodes/resizes still finish,
+    // but nothing submits after this point — required for a quiescent
+    // device at process exit.
+    crate::gpujpeg::stop();
     let mut last = usize::MAX;
     let mut last_report = std::time::Instant::now();
     loop {
@@ -728,6 +732,24 @@ async fn shutdown(state: &ServerState) {
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
+    // No GPU call may be in flight when the process exits: shared-library
+    // destructors (the Vulkan driver) run during exit() and segfault if a
+    // detached worker is still inside a driver call. Wait for the
+    // counted GPU scopes to drain — bounded: a genuinely wedged driver
+    // call must not hang shutdown forever.
+    let gpu_t0 = std::time::Instant::now();
+    loop {
+        if crate::gpujpeg::wait_idle(std::time::Duration::from_millis(200)) {
+            break;
+        }
+        if crate::fs_utils::sigint_count() > 1 {
+            break;
+        }
+        if gpu_t0.elapsed() >= std::time::Duration::from_secs(30) {
+            eprintln!("shutdown: GPU work did not drain in 30s — exiting anyway");
+            break;
+        }
+    }
 }
 
 /// Serve on `addr`. Blocks; used by the `--serve` paths in main.rs.
@@ -741,7 +763,7 @@ pub fn run_server(
     on_ready: impl FnOnce() + Send + 'static,
 ) -> Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(async move {
+    let result = rt.block_on(async move {
         let listener = tokio::net::TcpListener::bind(addr).await?;
         let bound = listener.local_addr()?;
         // A wildcard bind (0.0.0.0) isn't a useful browser address — open
@@ -771,5 +793,12 @@ pub fn run_server(
             }
         }
         Ok(())
-    })
+    });
+    // Bound the teardown wait: a `spawn_blocking` task stuck on a
+    // dead-mount read must not hold process exit forever. Detached
+    // leftovers are safe: gpujpeg::stop() means they can no longer start
+    // a driver call, and a normal exit() is then race-free — shutdown()
+    // already waited for GPU_ACTIVE == 0.
+    rt.shutdown_timeout(std::time::Duration::from_secs(2));
+    result
 }

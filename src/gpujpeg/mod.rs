@@ -17,12 +17,62 @@ mod shaders;
 use crate::image_utils::fit_dims;
 use image::DynamicImage;
 use jpeg::{build_canon, pack_comps, parse_jpg, Jpg};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 /// Serializes GPU work (queue submissions are internally synchronized
 /// in wgpu, but this keeps decode+resize batches atomic and bounds
 /// device memory pressure like the C++ version did).
 pub static GPU_LOCK: Mutex<()> = Mutex::new(());
+
+/// Shutdown tracking: `stop()` refuses new GPU work (callers fall back
+/// to CPU paths) and `wait_idle()` waits for `GPU_ACTIVE` to reach zero.
+/// Every scope that can touch the driver — decode, resize, read-back —
+/// holds a [`GpuActive`] guard, so "no driver calls in flight" is
+/// checkable, and at process exit the driver's own teardown runs on a
+/// quiescent device instead of racing a worker mid-submission.
+static GPU_STOPPED: AtomicBool = AtomicBool::new(false);
+static GPU_ACTIVE: AtomicUsize = AtomicUsize::new(0);
+
+/// Refuse all new GPU work; in-flight calls still finish. Idempotent.
+pub fn stop() {
+    GPU_STOPPED.store(true, Ordering::SeqCst);
+}
+
+/// True once [`stop`] has run — GPU work must not start.
+pub fn stopped() -> bool {
+    GPU_STOPPED.load(Ordering::SeqCst)
+}
+
+/// Wait until no thread is inside a GPU call. Returns `false` on
+/// timeout (a wedged driver call) — the caller decides how fatal that is.
+pub fn wait_idle(max: std::time::Duration) -> bool {
+    let t0 = std::time::Instant::now();
+    while GPU_ACTIVE.load(Ordering::SeqCst) > 0 {
+        if t0.elapsed() >= max {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    true
+}
+
+/// RAII in-flight marker: enter returns None once stopped.
+struct GpuActive(());
+impl GpuActive {
+    fn enter() -> Option<Self> {
+        if stopped() {
+            return None;
+        }
+        GPU_ACTIVE.fetch_add(1, Ordering::SeqCst);
+        Some(Self(()))
+    }
+}
+impl Drop for GpuActive {
+    fn drop(&mut self) {
+        GPU_ACTIVE.fetch_sub(1, Ordering::SeqCst);
+    }
+}
 
 const FILTER_LANCZOS: i32 = coeffs::LANCZOS;
 
@@ -35,7 +85,7 @@ fn disabled() -> bool {
 /// wgpu device + pipelines are usable (adapter found, push constants
 /// supported, WGSL compiled). Lazily initializes on first call.
 pub fn available() -> bool {
-    !disabled() && gpu::ctx().is_some()
+    !disabled() && !stopped() && gpu::ctx().is_some()
 }
 
 /// Returns (width, height, dri) if bytes parse as a baseline JPEG we can
@@ -73,7 +123,7 @@ fn open_locked(bytes: &[u8]) -> Option<(GpuJpeg, &'static gpu::GpuCtx)> {
     let px = ctx.decode_into(&j, &fg);
     Some((
         GpuJpeg {
-            px,
+            px: Some(px),
             width: w,
             height: h,
         },
@@ -84,35 +134,49 @@ fn open_locked(bytes: &[u8]) -> Option<(GpuJpeg, &'static gpu::GpuCtx)> {
 /// Full decode -> RGBA (0xAABBGGRR word order, little-endian
 /// R,G,B,0xFF per pixel). Falls back to None on anything unsupported.
 pub fn decode_rgba(bytes: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
+    let _active = GpuActive::enter()?;
     let _guard = GPU_LOCK.lock().ok()?;
     let (sj, ctx) = open_locked(bytes)?;
     let size = u64::from(sj.width) * u64::from(sj.height) * 4;
-    let rgba = ctx.read_buf(&sj.px, size);
+    let rgba = ctx.read_buf(sj.px.as_ref()?, size);
     Some((rgba, sj.width, sj.height))
 }
 
-/// GPU-resident decoded JPEG. Dropping frees the device buffer.
+/// GPU-resident decoded JPEG. Dropping frees the device buffer — unless
+/// [`stop`] ran: a buffer release is a driver call, and during process
+/// teardown the driver may already be destructing itself, so the buffer
+/// is leaked instead (the device dies with the process regardless).
 pub struct GpuJpeg {
-    px: wgpu::Buffer,
+    px: Option<wgpu::Buffer>,
     pub width: u32,
     pub height: u32,
 }
 
+impl Drop for GpuJpeg {
+    fn drop(&mut self) {
+        if stopped() {
+            std::mem::forget(self.px.take());
+        }
+    }
+}
+
 /// Open a baseline JPEG into a GPU-resident RGBA buffer. Returns None
-/// for unsupported JPEGs (progressive, non-8-bit, DRI=0) or when no
-/// suitable GPU adapter exists.
+/// for unsupported JPEGs (progressive, non-8-bit, DRI=0), when no
+/// suitable GPU adapter exists, or after [`stop`].
 pub fn open(bytes: &[u8]) -> Option<GpuJpeg> {
+    let _active = GpuActive::enter()?;
     let _guard = GPU_LOCK.lock().ok()?;
     open_locked(bytes).map(|(j, _)| j)
 }
 
 impl GpuJpeg {
     fn resize_packed(&self, max_w: u32, max_h: u32, n_comp: u32) -> Option<(Vec<u8>, u32, u32)> {
+        let _active = GpuActive::enter()?;
         let (ow, oh) = fit_dims(self.width, self.height, max_w, max_h);
         let ctx = gpu::ctx()?;
         let _guard = GPU_LOCK.lock().ok()?;
         let out = ctx.resize_pack(
-            &self.px,
+            self.px.as_ref()?,
             self.width,
             self.height,
             ow,
