@@ -25,10 +25,11 @@ use std::time::{Duration, Instant};
 /// How long a background worker holds off while client work is in flight.
 pub const CLIENT_PAUSE: Duration = Duration::from_millis(500);
 
-/// How long tier-3 work may be held off by the early-scan hold before it
-/// proceeds anyway — a failsafe for a stuck scanner, not the normal path
-/// (the hold is released at the priority item count or at scan end).
-pub const SCAN_HOLD_PAUSE: Duration = Duration::from_secs(30);
+/// How long tier-3 work staggers per job while a higher tier is active —
+/// "paused shortly", not "wait for the whole scan". The scan-priority
+/// phase can last minutes on a slow mount; a per-job delay this size lets
+/// actions trickle through instead of appearing frozen.
+pub const SCAN_HOLD_PAUSE: Duration = Duration::from_millis(500);
 
 /// Poll interval used while waiting for client work to drain.
 const POLL: Duration = Duration::from_millis(10);
@@ -68,6 +69,16 @@ impl IoGate {
         self.hold.store(held, Ordering::SeqCst);
     }
 
+    /// RAII hold: clears on drop, so a feeder thread that panics or exits
+    /// unexpectedly can never leave the flag set — a stuck hold would tax
+    /// every action job forever.
+    pub fn scan_hold(self: &Arc<Self>) -> ScanHold {
+        self.set_hold(true);
+        ScanHold {
+            gate: Arc::clone(self),
+        }
+    }
+
     /// True while the early-scan hold is set.
     pub fn held(&self) -> bool {
         self.hold.load(Ordering::SeqCst)
@@ -105,6 +116,18 @@ impl IoGate {
             thread::sleep(POLL);
         }
         self.yield_for(CLIENT_PAUSE);
+    }
+}
+
+/// RAII early-scan hold: dropping it clears the flag, whichever way the
+/// owner thread ended.
+pub struct ScanHold {
+    gate: Arc<IoGate>,
+}
+
+impl Drop for ScanHold {
+    fn drop(&mut self) {
+        self.gate.set_hold(false);
     }
 }
 

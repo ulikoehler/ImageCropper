@@ -289,11 +289,18 @@ impl DestructivePool {
                 // delete/move workers hold off so they don't compete for IO.
                 // The wait is bounded, so the queue always drains.
                 gate.yield_to_priority(crate::server::io_gate::SCAN_HOLD_PAUSE);
-                let result = match job.kind {
-                    ActionKind::Delete => trash_one(&job.path, job.sig),
-                    ActionKind::Move => move_one(&job.path, job.sig, move_dir.as_deref()),
-                    ActionKind::Crop | ActionKind::Resave => unreachable!(),
-                };
+                // A panic must still produce an ActionDone — otherwise the
+                // job vanishes with the path stuck in `destructive` and the
+                // client's counter never drains. The worker also survives
+                // to take the next job.
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    match job.kind {
+                        ActionKind::Delete => trash_one(&job.path, job.sig),
+                        ActionKind::Move => move_one(&job.path, job.sig, move_dir.as_deref()),
+                        ActionKind::Crop | ActionKind::Resave => unreachable!(),
+                    }
+                }))
+                .unwrap_or_else(|_| Err(anyhow!("worker panicked")));
                 let done = match result {
                     Ok(bytes) => ActionDone {
                         tag: job.tag,
@@ -443,7 +450,14 @@ impl ActionQueue {
                         // still indexing the album.
                         serial_gate
                             .yield_to_priority(crate::server::io_gate::SCAN_HOLD_PAUSE);
-                        match execute(&action, &path, &mut saver, serial_move_dir.as_deref()) {
+                        // Panic containment: a caught panic becomes a failed
+                        // ActionDone instead of silently losing the job (the
+                        // tag would sit in `serial` forever).
+                        let exec = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            execute(&action, &path, &mut saver, serial_move_dir.as_deref())
+                        }))
+                        .unwrap_or_else(|_| Err(anyhow!("worker panicked")));
+                        match exec {
                             Ok((new_sig, bytes)) => {
                                 if new_sig.is_some() || bytes.is_some() {
                                     if result_tx

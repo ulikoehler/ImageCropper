@@ -623,8 +623,9 @@ pub fn spawn_scan_feeder(state: &Arc<ServerState>, stream: crate::cli::ScanStrea
         if crate::fs_utils::verbose() {
             eprintln!("scan: started");
         }
-        state.io_gate.set_hold(true);
-        let mut held = true;
+        // RAII: the flag clears itself if this thread exits by any path —
+        // a stuck hold would tax every action job for the rest of the run.
+        let mut hold = Some(state.io_gate.scan_hold());
         let mut batch: Vec<(PathBuf, Option<u64>)> = Vec::new();
         let mut found = 0usize;
         let t0 = std::time::Instant::now();
@@ -655,18 +656,15 @@ pub fn spawn_scan_feeder(state: &Arc<ServerState>, stream: crate::cli::ScanStrea
             }
             if batch.len() >= BATCH || (timed_out && !batch.is_empty()) {
                 state.upsert_files(std::mem::take(&mut batch));
-                if held && state.item_count() >= PRIORITY_UNTIL {
-                    state.io_gate.set_hold(false);
-                    held = false;
+                if hold.is_some() && state.item_count() >= PRIORITY_UNTIL {
+                    hold.take(); // drops the guard → flag cleared
                     if crate::fs_utils::verbose() {
                         eprintln!("scan: {PRIORITY_UNTIL} items indexed — background work resumed");
                     }
                 }
             }
         }
-        if held {
-            state.io_gate.set_hold(false);
-        }
+        drop(hold);
         if !batch.is_empty() {
             state.upsert_files(batch);
         }
