@@ -3,6 +3,7 @@
 // a stub that always reports "unsupported" so decode_image_bytes
 // transparently falls back to the CPU decoder.
 fn main() {
+    println!("cargo::rustc-check-cfg=cfg(gpujpeg)");
     println!("cargo:rerun-if-changed=native/gpujpegdec.cpp");
     println!("cargo:rerun-if-changed=native/vkmini.hpp");
     println!("cargo:rerun-if-changed=native/gpujpeg_stub.c");
