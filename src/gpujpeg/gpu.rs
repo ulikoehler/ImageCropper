@@ -18,6 +18,10 @@ const CHUNK_MCUS: u32 = 2048;
 const SUBMIT_MCUS: u32 = 32768;
 
 pub struct GpuCtx {
+    /// Largest bindable storage-buffer range on this device
+    /// (`max_storage_buffer_binding_size`). Callers must check every
+    /// bound buffer against this — oversized work falls back to CPU.
+    pub max_bind: u64,
     device: wgpu::Device,
     queue: wgpu::Queue,
     d_bgl: wgpu::BindGroupLayout,
@@ -118,6 +122,30 @@ impl GpuCtx {
         if !adapter.features().contains(wgpu::Features::IMMEDIATES) {
             return None;
         }
+        // Software rasterizers (llvmpipe/lavapipe, SwiftShader, softpipe)
+        // report DeviceType::Cpu — compute work there IS the CPU, slower
+        // than the native zune path and capped by a tiny binding limit.
+        // Disable GPU processing entirely; IC_GPUJPEG_SW=1 overrides
+        // (testing the WGSL path on GPU-less machines).
+        {
+            let info = adapter.get_info();
+            let name = info.name.to_ascii_lowercase();
+            let sw = info.device_type == wgpu::DeviceType::Cpu
+                || name.contains("llvmpipe")
+                || name.contains("lavapipe")
+                || name.contains("swiftshader")
+                || name.contains("softpipe");
+            if sw && std::env::var("IC_GPUJPEG_SW").is_err() {
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| {
+                    eprintln!(
+                        "gpujpeg: software adapter '{}' — disabled (IC_GPUJPEG_SW=1 to force)",
+                        info.name
+                    );
+                });
+                return None;
+            }
+        }
         let mut limits = wgpu::Limits::default();
         limits.max_immediate_size = 128;
         limits.max_storage_buffer_binding_size = adapter.limits().max_storage_buffer_binding_size;
@@ -187,6 +215,7 @@ impl GpuCtx {
             })
         };
         let ctx = GpuCtx {
+            max_bind: u64::from(device.limits().max_storage_buffer_binding_size),
             p_entropy: mk(shaders::ENTROPY, &d_layout, "main"),
             p_recon: mk(shaders::RECON, &d_layout, "main"),
             p_upsample: mk(shaders::UPSAMPLE, &d_layout, "main"),
