@@ -220,16 +220,12 @@ const tileNearest=(x,y)=>{
     if(d<bd){bd=d;b=t.i}}
   return b};
 
-// ---- hold-`f` fullscreen preview (1920-class JPEG from /bulk) ----
-let fHeld=false, screenBmp=null, screenIdx=-1;
-// Last mouse position in client coords (-1 = outside). The hold-`f`
-// loupe uses the tile under it, falling back to `focus` when the
-// pointer isn't over the grid.
+// ---- `f` fullscreen preview (1920-class JPEG from /bulk) ----
+let fsMode=false, screenBmp=null, screenIdx=-1;
+// Last mouse position in client coords (-1 = outside). Consulted once
+// when `f` mode is entered — the fullscreen preview does not follow
+// the pointer; Left/Right arrows navigate instead.
 let mouseX=-1, mouseY=-1;
-const fsIdx=()=>{
-  const t=tileAt(mouseX*devicePixelRatio,mouseY*devicePixelRatio+scrollY);
-  return t>=0?t:focus;
-};
 const formatSize=b=>{
   const u=["B","KB","MB","GB","TB"];let i=0,v=b;
   while(v>=1024&&i<u.length-1){v/=1024;i++}
@@ -247,7 +243,7 @@ async function fetchScreen(i){
     v.setUint8(12,2);v.setUint8(13,80);   // fmt=2: ≤1920 screen preview
     const {body}=await bulkRequest(BK_GET_FULL,b);
     const bmp=await createImageBitmap(new Blob([body],{type:"image/jpeg"}));
-    screenBmp=bmp;screenIdx=i;if(fHeld)draw();
+    screenBmp=bmp;screenIdx=i;if(fsMode)draw();
   }finally{screenFetching.delete(i)}
 }
 
@@ -264,9 +260,9 @@ function draw(){
   canvas.style.width=innerWidth+"px";canvas.style.height=innerHeight+"px";
   ctx.fillStyle="#111";ctx.fillRect(0,0,W,H);
 
-  if(fHeld){
+  if(fsMode){
     ctx.fillStyle="#000";ctx.fillRect(0,0,W,H);
-    const fi=fsIdx(),it=items[fi];
+    const fi=focus,it=items[fi];
     if(screenIdx===fi&&screenBmp){
       const s=Math.min(W/screenBmp.width,H/screenBmp.height),
             w=screenBmp.width*s,h=screenBmp.height*s;
@@ -322,7 +318,7 @@ let dataWs=null;
 let pendingTagBase=Math.floor(Math.random()*0x1000)*0x100000, pendingCtr=0,
     pendingActions=new Map();
 const nextTag=()=>pendingTagBase+((pendingCtr++)&0xfffff);
-addEventListener("wheel",e=>{scrollY=Math.max(0,scrollY+e.deltaY*devicePixelRatio);draw()});
+addEventListener("wheel",e=>{if(fsMode)return;scrollY=Math.max(0,scrollY+e.deltaY*devicePixelRatio);draw()});
 addEventListener("keydown",e=>{
   const cols=()=>Math.max(1,Math.floor(canvas.width/(tileH*zoom)));
   if(e.key==="+"||e.key==="="){zoom*=1.1;layout();draw()}
@@ -355,11 +351,31 @@ addEventListener("keydown",e=>{
     }
     draw();
   }
-  else if((e.key==="f"||e.key==="F")&&!e.ctrlKey&&!e.metaKey){
-    fHeld=true;const i=fsIdx();if(screenIdx!==i)fetchScreen(i);draw();
+  else if((e.key==="f"||e.key==="F")&&!e.ctrlKey&&!e.metaKey&&!e.repeat){
+    // Toggle fullscreen preview. Hover picks the entry image once;
+    // from then on only Left/Right move the viewed image.
+    if(fsMode)fsMode=false;
+    else{
+      fsMode=true;
+      const h=tileAt(mouseX*devicePixelRatio,mouseY*devicePixelRatio+scrollY);
+      if(h>=0){focus=h;anchor=h}
+    }
+    draw();
   }
+  else if(e.key==="Escape"&&fsMode){fsMode=false;draw()}
   else if(e.key==="c"||e.key==="Escape"){}
   else if(e.key.startsWith("Arrow")){
+    if(fsMode){
+      // Fullscreen mode: Left/Right step through live images, skipping
+      // tombstones; Up/Down do nothing.
+      if(e.key==="ArrowLeft"||e.key==="ArrowRight"){
+        const dir=e.key==="ArrowLeft"?-1:1;
+        for(let j=focus+dir;j>=0&&j<items.length;j+=dir)
+          if(items[j]&&!items[j].removed){focus=j;anchor=j;break}
+        draw();
+      }
+      e.preventDefault();return;
+    }
     const n=items.length;let nf=focus;
     if(e.key==="ArrowRight")nf=Math.min(n-1,focus+1);
     if(e.key==="ArrowLeft")nf=Math.max(0,focus-1);
@@ -388,11 +404,8 @@ addEventListener("keydown",e=>{
   else if(e.key===" "){selected.has(focus)?selected.delete(focus):selected.add(focus);draw();e.preventDefault()}
   else if(e.key==="a"&&e.ctrlKey){for(let i=0;i<items.length;i++)selected.add(i);draw();e.preventDefault()}
 });
-addEventListener("keyup",e=>{
-  if(e.key==="f"||e.key==="F"){fHeld=false;draw()}
-});
 canvas.addEventListener("mousedown",e=>{
-  if(e.button!==0)return;
+  if(fsMode||e.button!==0)return;
   const x=e.clientX*devicePixelRatio,y=e.clientY*devicePixelRatio+scrollY;
   const a=tileAt(x,y);
   drag={x0:x,y0:y,anchor:a>=0?a:tileNearest(x,y),
@@ -402,7 +415,7 @@ canvas.addEventListener("mousedown",e=>{
 });
 addEventListener("mousemove",e=>{
   mouseX=e.clientX;mouseY=e.clientY;
-  if(fHeld){draw();return}
+  if(fsMode)return;   // fullscreen view does not follow the pointer
   if(!drag)return;
   const x=e.clientX*devicePixelRatio,y=e.clientY*devicePixelRatio+scrollY;
   const dx=x-drag.x0,dy=y-drag.y0;
@@ -437,8 +450,9 @@ addEventListener("mouseup",e=>{
   if(drag&&drag.rect)suppressClick=true;
   drag=null;draw();
 });
-document.addEventListener("mouseleave",()=>{mouseX=mouseY=-1;if(fHeld)draw()});
+document.addEventListener("mouseleave",()=>{mouseX=mouseY=-1});
 canvas.addEventListener("click",e=>{
+  if(fsMode)return;
   if(suppressClick){suppressClick=false;return}
   const mx=e.clientX*devicePixelRatio,my=e.clientY*devicePixelRatio+scrollY;
   for(const t of tileRects()){

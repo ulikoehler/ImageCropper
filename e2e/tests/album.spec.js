@@ -211,12 +211,12 @@ test.describe("album grid", () => {
     expect(span(restored)).toBeGreaterThan(span(narrower) * 1.2);
   });
 
-  test("holding f shows the focused image fullscreen", async ({ page }) => {
+  test("f toggles the focused image fullscreen", async ({ page }) => {
     await openApp(page);
     await waitAllCached(page);
 
-    // Focus the purple tile and hold f — the ≤1920 preview is fetched
-    // over /bulk (fmt=2) and drawn fullscreen.
+    // Focus the purple tile and press f — the ≤1920 preview is fetched
+    // over /bulk (fmt=2) and drawn fullscreen until toggled off.
     const purpleIdx = await page.evaluate(
       () => items.findIndex((it) => it.name === "purple.png"),
     );
@@ -225,8 +225,8 @@ test.describe("album grid", () => {
       draw();
     }, purpleIdx);
 
-    await page.keyboard.down("f");
-    await page.waitForFunction(() => fHeld && screenBmp, null, {
+    await page.keyboard.press("f");
+    await page.waitForFunction(() => fsMode && screenBmp, null, {
       timeout: 15_000,
     });
 
@@ -238,13 +238,13 @@ test.describe("album grid", () => {
     const px = await pixelAt(page, cx, cy);
     expect(colorClose(px, EXPECTED["purple"]), `got ${px}`).toBeTruthy();
 
-    // Releasing restores the grid.
-    await page.keyboard.up("f");
+    // Pressing f again restores the grid.
+    await page.keyboard.press("f");
     await expect(page.locator("#top")).toContainText("images");
-    await page.waitForFunction(() => !fHeld);
+    await page.waitForFunction(() => !fsMode);
   });
 
-  test("holding f loupes the hovered tile; no hover falls back to focus", async ({
+  test("f picks the hovered tile once; arrows navigate; hover ignored", async ({
     page,
   }) => {
     await openApp(page);
@@ -252,9 +252,10 @@ test.describe("album grid", () => {
     const rects = await tileRects(page);
     const redIdx = SORTED.indexOf("red");
     const purpleIdx = SORTED.indexOf("purple");
+    const yellowIdx = SORTED.indexOf("yellow");
 
-    // Focus is purple (keyboard-style) while the mouse parks over red —
-    // the loupe must show the hovered tile, not the focus.
+    // Focus is purple while the mouse parks over red — entering f mode
+    // shows the hovered tile.
     await page.evaluate((i) => {
       focus = i;
       draw();
@@ -262,10 +263,12 @@ test.describe("album grid", () => {
     const r = rects.find((t) => t.i === redIdx);
     await page.mouse.move(r.x + r.w / 2, r.y + r.h / 2);
 
-    await page.keyboard.down("f");
-    await page.waitForFunction(() => fHeld && screenBmp, null, {
-      timeout: 15_000,
-    });
+    await page.keyboard.press("f");
+    await page.waitForFunction(
+      (i) => fsMode && screenIdx === i && screenBmp,
+      redIdx,
+      { timeout: 15_000 },
+    );
     const centre = await page.evaluate(() => [
       (innerWidth * devicePixelRatio) / 2,
       (innerHeight * devicePixelRatio) / 2,
@@ -273,18 +276,36 @@ test.describe("album grid", () => {
     let px = await pixelAt(page, centre[0], centre[1]);
     expect(colorClose(px, EXPECTED["red"]), `got ${px}`).toBeTruthy();
 
-    // Park the mouse below the last row (over no tile) while still
-    // holding f — the loupe falls back to the focused image.
-    const vp = page.viewportSize();
-    await page.mouse.move(vp.width / 2, vp.height - 4);
-    await page.waitForFunction((i) => screenIdx === i, purpleIdx, {
-      timeout: 15_000,
-    });
+    // Moving the mouse over a different tile must NOT switch the preview.
+    const p = rects.find((t) => t.i === purpleIdx);
+    await page.mouse.move(p.x + p.w / 2, p.y + p.h / 2);
+    await page.waitForTimeout(300);
     px = await pixelAt(page, centre[0], centre[1]);
-    expect(colorClose(px, EXPECTED["purple"]), `got ${px}`).toBeTruthy();
+    expect(
+      colorClose(px, EXPECTED["red"]),
+      `hover switched preview: ${px}`,
+    ).toBeTruthy();
 
-    await page.keyboard.up("f");
-    await page.waitForFunction(() => !fHeld);
+    // ArrowRight steps to the next live image (yellow); Left steps back.
+    await page.keyboard.press("ArrowRight");
+    await page.waitForFunction(
+      (i) => screenIdx === i && screenBmp,
+      yellowIdx,
+      { timeout: 15_000 },
+    );
+    px = await pixelAt(page, centre[0], centre[1]);
+    expect(colorClose(px, EXPECTED["yellow"]), `got ${px}`).toBeTruthy();
+
+    await page.keyboard.press("ArrowLeft");
+    await page.waitForFunction(
+      (i) => screenIdx === i && screenBmp,
+      redIdx,
+      { timeout: 15_000 },
+    );
+
+    // Escape exits fullscreen mode.
+    await page.keyboard.press("Escape");
+    await page.waitForFunction(() => !fsMode);
   });
 
   test("Delete trashes the selected file and removes its tile", async ({ page }) => {
