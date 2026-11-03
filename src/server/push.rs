@@ -156,6 +156,20 @@ impl PushQueue {
         None
     }
 
+    /// JSON snapshot for `/debugz` — what the pump sees right now.
+    pub fn dbg_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "wants": self.wants.len(),
+            "boosts": self.boosts.len(),
+            "cursor": self.cursor,
+            "count": self.count,
+            "sweep_cap": self.count.min(SWEEP_LIMIT),
+            "pushed": self.pushed.len(),
+            "credit": self.credit,
+            "paused": self.paused,
+        })
+    }
+
     /// True when every pushable id has been served (wants and boosts may
     /// still carry ids beyond the sweep limit).
     pub fn is_drained(&self) -> bool {

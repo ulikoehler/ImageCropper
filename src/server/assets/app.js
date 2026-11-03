@@ -195,6 +195,7 @@ const wantSlots=new Map();   // reqId -> {left:Set(ids), at:ms}
 function pumpWants(){
   while(wantSlots.size<WANT_WORKERS&&wantQ.length&&dataWs&&dataWs.readyState===1){
     const chunk=wantQ.splice(0,WANT_CHUNK);
+    icStats.wantSent+=chunk.length;
     const reqId=++wantCtr;
     const b=new Uint8Array(2+4*chunk.length),v=new DataView(b.buffer);
     v.setUint16(0,chunk.length,true);
@@ -246,13 +247,16 @@ try{
 let decRR=0;
 function decodeThumb(id,jpeg){
   if(decPool.length){
-    const w=decPool[decRR=(decRR+1)%decPool.length];
+    const wi=decRR=(decRR+1)%decPool.length,w=decPool[wi];
+    decJobs.set(id,{w:wi,at:Date.now()});
     w.postMessage({id,b:jpeg});   // Blob clones by reference — no copy
   }else{
+    decJobs.set(id,{w:-1,at:Date.now()});
     createImageBitmap(jpeg).then(bmp=>onDecoded(id,bmp),()=>onDecoded(id,null));
   }
 }
 function onDecoded(id,bmp){
+  decJobs.delete(id);
   if(bmp)thumbs.set(id,bmp);else pending.delete(id);   // null → retry later
   scheduleDraw();
 }
@@ -271,13 +275,16 @@ function onThumb(id,sig,jpeg,reqId){
   // A dropped frame must still trigger a redraw: the tile is missing and
   // `pending` was just cleared, so the next draw re-requests it. Without
   // this the page can go idle on a viewport full of blank tiles.
-  if(it&&(it.removed||(sig!=="0"&&it.sig!==sig))){scheduleDraw();return}
-  if(sig!=="0"&&thumbs.has(id)){scheduleDraw();return}   // exact duplicate
+  if(it&&(it.removed||(sig!=="0"&&it.sig!==sig))){icStats.thumbDrop++;scheduleDraw();return}
+  if(sig!=="0"&&thumbs.has(id)){icStats.thumbDup++;scheduleDraw();return}   // exact duplicate
   decodeThumb(id,jpeg);
 }
 
 function onData(f){
+  icStats.frames[f.type]=(icStats.frames[f.type]||0)+1;
+  icStats.lastFrameAt=Date.now();icStats.lastFrameType=f.type;
   if(f.type===EV_THUMB){
+    icStats.thumbRecv++;
     const v=new DataView(f.payload.buffer,f.payload.byteOffset);
     onThumb(v.getUint32(0,true),v.getBigUint64(4,true).toString(),
       new Blob([f.payload.subarray(12)],{type:"image/jpeg"}),f.reqId);
@@ -289,6 +296,7 @@ function onData(f){
     const buf=f.payload.buffer,base=f.payload.byteOffset;
     const v=new DataView(buf,base);
     const n=v.getUint16(0,true);
+    icStats.thumbRecv+=n;icStats.batchRecv++;
     const blob=new Blob([f.payload],{type:"application/octet-stream"});
     let off=2;
     for(let i=0;i<n;i++){
@@ -300,6 +308,7 @@ function onData(f){
     }
   } else if(f.type===EV_EVENT){
     const ev=JSON.parse(new TextDecoder().decode(f.payload));
+    icStats.lastEventAt=Date.now();icStats.lastEventEv=ev.ev;
     if(ev.ev==="action-queued"){
       const act=pendingActions.get(ev.tag);
       // The op is in the server's queue — it will finish in its own time.
@@ -693,6 +702,48 @@ canvas.addEventListener("click",e=>{
   }
 });
 addEventListener("resize",()=>{layoutDirty=true;scheduleDraw()});
+
+// ---- debug instrumentation (ic() / icServer() in the JS console) ----
+const icStats={wantSent:0,thumbRecv:0,thumbDrop:0,thumbDup:0,batchRecv:0,
+  lastFrameAt:0,lastFrameType:0,lastEventAt:0,lastEventEv:"",frames:{},errs:[]};
+const decJobs=new Map();   // thumb id -> {w:workerIdx,at:ms} in decode
+window.addEventListener("error",e=>{
+  icStats.errs.push(`${Date.now()}: ${e.message} @${e.lineno}`);
+  if(icStats.errs.length>50)icStats.errs.shift()});
+window.addEventListener("unhandledrejection",e=>{
+  icStats.errs.push(`${Date.now()}: rejection ${e.reason}`);
+  if(icStats.errs.length>50)icStats.errs.shift()});
+// Snapshot of everything that can stall the thumbnail pipeline.
+window.ic=function(){
+  const now=Date.now(),s={
+    items:items.length,
+    live:items.reduce((n,i)=>n+(i&&!i.removed?1:0),0),
+    manifestVersion:manifest&&manifest.version,
+    dirs:manifest?manifest.dirs.length:0,
+    thumbs:thumbs.size,
+    pending:pending.size,
+    pendingOldestMs:pending.size?Math.max(...[...pending.values()].map(at=>now-at)):0,
+    pendingIds:[...pending.keys()],
+    wantQ:wantQ.length,
+    wantSlots:[...wantSlots].map(([id,sl])=>({req:id,left:sl.left.size,
+      ids:[...sl.left],ageMs:now-sl.at})),
+    scanning,scanErrs,reloading,
+    ws:{data:dataWs&&dataWs.readyState,bulk:bulkWs&&bulkWs.readyState},
+    stats:icStats,
+    decJobs:[...decJobs].map(([id,j])=>({id,w:j.w,ageMs:now-j.at})),
+    decWorkers:decPool.length,
+    fsMode,focus,screenIdx,screenFetching:[...screenFetching],
+    pendingActions:[...pendingActions].map(([t,a])=>({tag:t,kind:a.kind,
+      queued:a.queued,ids:a.ids,ageMs:now-a.at})),
+    layout:{rows:rows.length,scrollY,tileH,zoom},
+  };
+  console.log(s);
+  return s;
+};
+// Server-side counters (/debugz) — resolves "is the server still pushing?".
+window.icServer=function(){
+  return fetch("/debugz").then(r=>r.json()).then(j=>{console.log(j);return j});
+};
 
 boot().catch(e=>{
   // A socket-close already scheduled a reload — don't prompt on top of it.

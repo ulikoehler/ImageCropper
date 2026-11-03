@@ -63,6 +63,36 @@ pub struct ServerState {
     /// Set when the manifest changed — the pinned (RAM-resident) thumbnail
     /// set has to be recomputed.
     pins_dirty: std::sync::atomic::AtomicBool,
+    /// Counters behind `/debugz` — the web client only sees its own state;
+    /// this answers "is the server still scanning/pushing/producing?".
+    pub dbg: DbgStats,
+}
+
+/// Lightweight instrumentation for `/debugz`. Everything is cheap (atomics
+/// or a small mutexed map) — it must never gate the hot path.
+#[derive(Default)]
+pub struct DbgStats {
+    /// Thumbnails pushed by the sweep path / WANT replies, and their bytes.
+    pub sweep_sent: std::sync::atomic::AtomicU64,
+    pub sweep_bytes: std::sync::atomic::AtomicU64,
+    pub want_sent: std::sync::atomic::AtomicU64,
+    /// CL_WANT ids received across all connections.
+    pub want_recv: std::sync::atomic::AtomicU64,
+    /// Produces that returned `None` (unsupported/corrupt/stopped).
+    pub produce_none: std::sync::atomic::AtomicU64,
+    /// Produces abandoned by the 30 s wait bound (hung reads).
+    pub produce_timeout: std::sync::atomic::AtomicU64,
+    /// Pushes dropped by the stale-id guard (resync/upsert mid-produce).
+    pub stale_skip: std::sync::atomic::AtomicU64,
+    /// CL_CREDIT bytes granted by clients.
+    pub credit_recv: std::sync::atomic::AtomicU64,
+    /// Scan feeder progress (mirrors the stderr counters).
+    pub scan_found: std::sync::atomic::AtomicU64,
+    pub scan_done: std::sync::atomic::AtomicBool,
+    /// Per-connection PushQueue snapshots keyed by connection id.
+    pub queues: std::sync::Mutex<std::collections::HashMap<u64, serde_json::Value>>,
+    /// Connection id allocator (debug output only).
+    pub next_conn: std::sync::atomic::AtomicU64,
 }
 
 impl ServerState {
@@ -111,6 +141,7 @@ impl ServerState {
             gone: std::sync::Mutex::new(std::collections::HashMap::new()),
             io_gate,
             pins_dirty: std::sync::atomic::AtomicBool::new(true),
+            dbg: DbgStats::default(),
         })
     }
 
@@ -663,6 +694,10 @@ pub fn spawn_scan_feeder(state: &Arc<ServerState>, stream: crate::cli::ScanStrea
             }
             if batch.len() >= BATCH || (timed_out && !batch.is_empty()) {
                 state.upsert_files(std::mem::take(&mut batch));
+                state
+                    .dbg
+                    .scan_found
+                    .store(found as u64, std::sync::atomic::Ordering::Relaxed);
                 if hold.is_some() && state.item_count() >= PRIORITY_UNTIL {
                     hold.take(); // drops the guard → flag cleared
                     if crate::fs_utils::verbose() {
@@ -690,6 +725,14 @@ pub fn spawn_scan_feeder(state: &Arc<ServerState>, stream: crate::cli::ScanStrea
         let _ = state.events.send(ServerEvent::Json(format!(
             "{{\"ev\":\"scan-end\",\"count\":{found}}}"
         )));
+        state
+            .dbg
+            .scan_found
+            .store(found as u64, std::sync::atomic::Ordering::Relaxed);
+        state
+            .dbg
+            .scan_done
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     });
 }
 
@@ -707,6 +750,7 @@ pub fn build_router(state: Arc<ServerState>) -> Router {
         .route("/app.js", get(http::app_js))
         .route("/favicon.ico", get(http::favicon))
         .route("/healthz", get(http::healthz))
+        .route("/debugz", get(http::debugz))
         .route("/data", get(ws_data::handler))
         .route("/bulk", get(ws_bulk::handler))
         .with_state(state)

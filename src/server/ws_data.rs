@@ -16,6 +16,10 @@ use tokio::sync::{mpsc, Mutex};
 
 use super::{proto::*, ActionEnvelope, PushQueue, ServerEvent, ServerState};
 
+/// Bound on how long the pump waits for one thumbnail produce — a wedged
+/// read (network mount) must not stall pushes for every other image.
+const PRODUCE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 pub async fn handler(
     ws: WebSocketUpgrade,
     State(state): State<Arc<ServerState>>,
@@ -112,6 +116,11 @@ async fn handle(socket: WebSocket, state: Arc<ServerState>) {
         state.manifest.read().unwrap().items.len(),
         state.initial_credit,
     )));
+    let conn_id = state
+        .dbg
+        .next_conn
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        + 1;
 
     // Background push pump: drains queue while credit lasts.
     let pump = {
@@ -146,6 +155,19 @@ async fn handle(socket: WebSocket, state: Arc<ServerState>) {
                             }
                         }
                     }
+                    // /debugz snapshot: what the pump sees right now.
+                    let mut snap = q.dbg_json();
+                    snap["idle"] = ids.is_empty().into();
+                    snap["t_ms"] = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| serde_json::json!(d.as_millis() as u64))
+                        .unwrap_or_default();
+                    state
+                        .dbg
+                        .queues
+                        .lock()
+                        .unwrap()
+                        .insert(conn_id, snap);
                 }
                 if ids.is_empty() {
                     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -178,8 +200,26 @@ async fn handle(socket: WebSocket, state: Arc<ServerState>) {
                 for (id, path, sig) in jobs {
                     let previews = previews.clone();
                     let produce_path = path.clone();
-                    handles.push(tokio::task::spawn_blocking(move || {
-                        (id, path, sig, previews.get_or_produce(&produce_path))
+                    let state = state.clone();
+                    // One hung produce (wedged mount read, poisoned file)
+                    // must not stall the whole sweep: the drain below waits
+                    // for every handle. The detached blocking call keeps
+                    // running — only the wait is bounded.
+                    handles.push(tokio::spawn(async move {
+                        let res = tokio::time::timeout(
+                            PRODUCE_TIMEOUT,
+                            tokio::task::spawn_blocking(move || {
+                                previews.get_or_produce(&produce_path)
+                            }),
+                        )
+                        .await;
+                        if res.is_err() {
+                            state.dbg.produce_timeout.fetch_add(
+                                1,
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
+                        }
+                        (id, path, sig, res.ok().and_then(|r| r.ok()).flatten())
                     }));
                 }
                 if handles.is_empty() {
@@ -208,10 +248,22 @@ async fn handle(socket: WebSocket, state: Arc<ServerState>) {
                                     && m.items.get(id as usize).map(|i| i.sig) == Some(sig)
                             };
                             if !still_current {
+                                state.dbg.stale_skip.fetch_add(
+                                    1,
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
                                 continue;
                             }
                             let bytes = p.jpeg.len() as u64;
                             q.commit_send(id, bytes);
+                            state
+                                .dbg
+                                .sweep_sent
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            state
+                                .dbg
+                                .sweep_bytes
+                                .fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
                             drop(q);
                             batch.push((id, sig, p.jpeg.as_ref().clone()));
                             if batch.len() >= 4 {
@@ -227,6 +279,10 @@ async fn handle(socket: WebSocket, state: Arc<ServerState>) {
                         }
                         None => {
                             q.mark_pushed(id);
+                            state.dbg.produce_none.fetch_add(
+                                1,
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
                         }
                     }
                 }
@@ -250,6 +306,10 @@ async fn handle(socket: WebSocket, state: Arc<ServerState>) {
         match frame.msg_type {
             CL_WANT => {
                 if let Some(ids) = decode_want(&frame.payload) {
+                    state
+                        .dbg
+                        .want_recv
+                        .fetch_add(ids.len() as u64, std::sync::atomic::Ordering::Relaxed);
                     for id in ids {
                         queue.lock().await.mark_pushed(id);
                         // Path + sig under one read — the frame must be
@@ -265,13 +325,28 @@ async fn handle(socket: WebSocket, state: Arc<ServerState>) {
                         };
                         let previews = state.previews.clone();
                         let out_tx = out_tx.clone();
+                        let state = state.clone();
                         tokio::spawn(async move {
+                            let res = tokio::time::timeout(
+                                PRODUCE_TIMEOUT,
+                                tokio::task::spawn_blocking(move || {
+                                    previews.get_or_produce(&path)
+                                }),
+                            )
+                            .await;
+                            if res.is_err() {
+                                state.dbg.produce_timeout.fetch_add(
+                                    1,
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
+                            }
                             let produced =
-                                tokio::task::spawn_blocking(move || previews.get_or_produce(&path))
-                                    .await
-                                    .ok()
-                                    .flatten();
+                                res.ok().and_then(|r| r.ok()).flatten();
                             if let Some(p) = produced {
+                                state
+                                    .dbg
+                                    .want_sent
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 let _ = out_tx
                                     .send(Frame::new(
                                         EV_THUMB,
@@ -279,6 +354,11 @@ async fn handle(socket: WebSocket, state: Arc<ServerState>) {
                                         thumb_payload(id, sig, &p.jpeg),
                                     ))
                                     .await;
+                            } else {
+                                state.dbg.produce_none.fetch_add(
+                                    1,
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
                             }
                         });
                     }
@@ -347,6 +427,10 @@ async fn handle(socket: WebSocket, state: Arc<ServerState>) {
             }
             CL_CREDIT => {
                 if let Some(bytes) = decode_credit(&frame.payload) {
+                    state
+                        .dbg
+                        .credit_recv
+                        .fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
                     queue.lock().await.add_credit(bytes);
                 }
             }
@@ -364,4 +448,5 @@ async fn handle(socket: WebSocket, state: Arc<ServerState>) {
     pump.abort();
     events_task.abort();
     send_task.abort();
+    state.dbg.queues.lock().unwrap().remove(&conn_id);
 }
