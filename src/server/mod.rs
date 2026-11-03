@@ -136,7 +136,11 @@ impl ServerState {
                 let dir_idx = *dir_index.entry(parent.clone()).or_insert_with(|| {
                     // Intern into the manifest's dir table (existing or new).
                     let parent_str = parent.to_string_lossy();
-                    match m.dirs.iter().position(|d| d.as_str() == parent_str.as_ref()) {
+                    match m
+                        .dirs
+                        .iter()
+                        .position(|d| d.as_str() == parent_str.as_ref())
+                    {
                         Some(i) => i as u32,
                         None => {
                             m.dirs.push(parent.to_string_lossy().into_owned());

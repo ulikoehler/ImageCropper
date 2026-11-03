@@ -95,7 +95,9 @@ imagecropper album test-images
 imagecropper album -r -o exif- test-images
 ```
 
-All previews are actively generated in the background for **all** images (prioritizing what is on screen) and persisted in `.imagecropper-previews/` next to each image, so subsequent runs start instantly. The preview file names encode the source file's size and modification time — change a file and its preview is regenerated automatically; stale previews are cleaned up.
+All previews are actively generated in the background for **all** images (prioritizing what is on screen) and persisted in `.imagecropper-previews/` next to each image, so subsequent runs start instantly. A fullscreen-size (≤1920px) JPEG tier is generated alongside and persisted in `~/.cache/imagecropper/f/…` (honors `$XDG_CACHE_HOME`) for instant hold-**f** fullscreen views. The preview file names encode the source file's size and modification time — change a file and its preview is regenerated automatically; stale previews are cleaned up. Preview worker counts self-tune to the storage device (few/sequential on HDDs and network mounts, up to `-j` on SSDs).
+
+Directory listing runs in the background and streams results in filesystem order — tiles appear and previews generate while the scan is still in flight, which matters on slow SMB/network mounts. The `-o` ordering is applied once the scan completes.
 
 Album mode accepts the same scanning options as `crop`: `-r/--recursive`, `--whitelist`, `--blacklist`, `--filter-syntax`, `-o/--order`, `-i/--inverse-order`, `-j/--parallel`, `-d/--dry-run` and `-v/--verbose`.
 
@@ -116,9 +118,27 @@ imagecropper album -m ~/keep -r ~/incoming-photos
 *   **Ctrl + A**: Select all images.
 *   **Delete**: Move all selected images to `.imagecropper-trash` via a background deletion queue.
 *   **m**: Move all selected images to the `-m/--move` directory via a background queue; they disappear from the grid. (No-op with a status hint when `-m` was not given.)
+*   **f (hold)**: Show the focused image fullscreen using the preloaded ≤1920px preview; release to return to the grid. Arrow keys still work while held.
 *   **+ / -**: Fine-grained zoom of the tile size.
 *   **W / w** (Shift+W / w): Increase / decrease the tile width in coarse steps.
 *   **Esc**: Clear the selection; with no selection, exit.
+
+## Web UI (`--serve` / `-G`)
+
+Both subcommands can serve a browser UI over two WebSocket channels instead of opening a native window:
+
+```sh
+imagecropper album --serve=0.0.0.0:12345 -r /photos   # album grid in the browser
+imagecropper crop  --serve=127.0.0.1:8737 test-images # web crop session
+imagecropper album --serve=127.0.0.1:8737 -G /photos  # serve, no browser auto-open
+imagecropper album -G /photos                          # headless: pregenerate previews
+imagecropper crop  -G --resave /photos                 # headless: batch resave
+```
+
+*   `/data` carries controls, events and pushed thumbnails; `/bulk` carries the manifest and full/screen-size images. Multiple clients can connect simultaneously — found/changed/deleted files arrive as differential `manifest-patch` updates with stable positional ids (no reloads).
+*   Files stream into the manifest as the background scan discovers them; clients show partial lists immediately.
+*   The web client mirrors the native album controls (click/ctrl/shift selection, arrows, `+/-`, `w/W`, `Delete`, `m`, hold-`f` fullscreen).
+*   `-v/--verbose` prints scan progress, preview cache hits/generation and actions to stderr.
 
 ## Features
 

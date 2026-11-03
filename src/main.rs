@@ -99,11 +99,10 @@ fn run_album(args: AlbumArgs) -> Result<()> {
         "ImageCropper Album",
         fullscreen_window(),
         Box::new(move |_cc| {
-            Ok(Box::new(AlbumCropApp::new(
-                Vec::new(),
-                options,
-                scan_slot.take(),
-            )) as Box<dyn eframe::App>)
+            Ok(
+                Box::new(AlbumCropApp::new(Vec::new(), options, scan_slot.take()))
+                    as Box<dyn eframe::App>,
+            )
         }),
     )?;
 
@@ -183,7 +182,10 @@ fn pregenerate_stream(stream: ScanStream, parallel: usize) {
         }
     }
     if queued > 0 {
-        eprintln!("\rPregenerated previews {done}/{queued} ({} worker(s))", pool.workers());
+        eprintln!(
+            "\rPregenerated previews {done}/{queued} ({} worker(s))",
+            pool.workers()
+        );
     }
 }
 

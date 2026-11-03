@@ -148,7 +148,10 @@ pub fn walk_images(
 ) {
     for path in paths {
         if !path.exists() {
-            emit(ScanEvent::Error(format!("{} does not exist", path.display())));
+            emit(ScanEvent::Error(format!(
+                "{} does not exist",
+                path.display()
+            )));
             continue;
         }
 

@@ -252,12 +252,12 @@ impl AlbumApp {
         let mut paths: Vec<PathBuf> = self.entries.iter().map(|e| e.path.clone()).collect();
         sort_files(&mut paths, self.scan_order, self.scan_inverse);
 
-        let mut by_path: HashMap<PathBuf, Entry> =
-            self.entries.drain(..).map(|e| (e.path.clone(), e)).collect();
-        self.entries = paths
-            .iter()
-            .filter_map(|p| by_path.remove(p))
+        let mut by_path: HashMap<PathBuf, Entry> = self
+            .entries
+            .drain(..)
+            .map(|e| (e.path.clone(), e))
             .collect();
+        self.entries = paths.iter().filter_map(|p| by_path.remove(p)).collect();
         self.rebuild_index();
         self.selected = sel_paths
             .iter()

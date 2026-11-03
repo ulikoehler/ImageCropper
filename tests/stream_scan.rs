@@ -3,9 +3,7 @@
 //! for bad roots, and respect filters.
 
 use imagecropper::cli::{spawn_scan_stream, ScanArgs, SortOrder};
-use imagecropper::fs_utils::{
-    spawn_image_scan, FilterSyntax, PathFilter, ScanEvent,
-};
+use imagecropper::fs_utils::{spawn_image_scan, FilterSyntax, PathFilter, ScanEvent};
 use std::fs;
 use std::path::PathBuf;
 use tempfile::tempdir;
@@ -69,12 +67,8 @@ fn stream_respects_filters() {
     let root = tmp.path();
     fs::write(root.join("keep.png"), []).unwrap();
     fs::write(root.join("drop.png"), []).unwrap();
-    let filter = PathFilter::compile(
-        FilterSyntax::Glob,
-        &["**/keep.png".to_string()],
-        &[],
-    )
-    .unwrap();
+    let filter =
+        PathFilter::compile(FilterSyntax::Glob, &["**/keep.png".to_string()], &[]).unwrap();
     let (found, errors) = drain(spawn_image_scan(vec![root.to_path_buf()], false, filter));
     assert!(errors.is_empty());
     assert_eq!(found, vec![root.join("keep.png")]);
@@ -87,7 +81,11 @@ fn stream_recurses_and_skips_reserved() {
     fs::create_dir(root.join("sub")).unwrap();
     fs::write(root.join("sub/deep.png"), []).unwrap();
     fs::create_dir(root.join(imagecropper::fs_utils::TRASH_DIR)).unwrap();
-    fs::write(root.join(imagecropper::fs_utils::TRASH_DIR).join("x.png"), []).unwrap();
+    fs::write(
+        root.join(imagecropper::fs_utils::TRASH_DIR).join("x.png"),
+        [],
+    )
+    .unwrap();
 
     let (found, _) = drain(spawn_image_scan(vec![root.to_path_buf()], true, None));
     assert_eq!(found, vec![root.join("sub/deep.png")]);

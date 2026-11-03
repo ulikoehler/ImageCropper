@@ -19,10 +19,13 @@ async function openApp(page) {
 }
 
 async function waitAllCached(page) {
-  // The shared server's manifest may shrink after delete/move tests, so key
-  // off whatever the page actually loaded.
+  // The shared server's manifest may shrink after delete/move tests, and
+  // tombstoned items keep their slot — count only live tiles.
   await page.waitForFunction(
-    () => items.length > 0 && thumbs.size >= items.length,
+    () => {
+      const live = items.filter((it) => it && !it.removed).length;
+      return live > 0 && thumbs.size >= live;
+    },
     null,
     { timeout: 30_000 },
   );
@@ -144,6 +147,39 @@ test.describe("album grid", () => {
     expect(wider[0].w).toBeGreaterThan(narrower[0].w);
   });
 
+  test("holding f shows the focused image fullscreen", async ({ page }) => {
+    await openApp(page);
+    await waitAllCached(page);
+
+    // Focus the purple tile and hold f — the ≤1920 preview is fetched
+    // over /bulk (fmt=2) and drawn fullscreen.
+    const purpleIdx = await page.evaluate(
+      () => items.findIndex((it) => it.name === "purple.png"),
+    );
+    await page.evaluate((i) => {
+      focus = i;
+      draw();
+    }, purpleIdx);
+
+    await page.keyboard.down("f");
+    await page.waitForFunction(() => fHeld && screenBmp, null, {
+      timeout: 15_000,
+    });
+
+    // Canvas centre must show the purple preview, not the grid.
+    const [cx, cy] = await page.evaluate(() => [
+      (innerWidth * devicePixelRatio) / 2,
+      (innerHeight * devicePixelRatio) / 2,
+    ]);
+    const px = await pixelAt(page, cx, cy);
+    expect(colorClose(px, EXPECTED["purple"]), `got ${px}`).toBeTruthy();
+
+    // Releasing restores the grid.
+    await page.keyboard.up("f");
+    await expect(page.locator("#top")).toContainText("images");
+    await page.waitForFunction(() => !fHeld);
+  });
+
   test("Delete trashes the selected file and removes its tile", async ({ page }) => {
     await openApp(page);
     await waitAllCached(page);
@@ -151,7 +187,7 @@ test.describe("album grid", () => {
     const grayIdx = await page.evaluate(
       () => items.findIndex((it) => it.name === "gray.png"),
     );
-    const rect = rects[grayIdx];
+    const rect = rects.find((r) => r.i === grayIdx);
 
     await page.mouse.click(rect.x + rect.w / 2, rect.y + rect.h / 2);
     await page.keyboard.press("Delete");
@@ -163,10 +199,10 @@ test.describe("album grid", () => {
       .toBe(true);
     expect(fs.existsSync(path.join(FIXTURE_DIR, "gray.png"))).toBe(false);
 
-    // The tile disappears from the grid (the manifest is shared across
-    // tests, so assert absence of this tile rather than an absolute count).
+    // The tile disappears from the grid — the item stays as a tombstone
+    // (removed:true) so positional ids remain stable for every client.
     await page.waitForFunction(
-      () => !items.some((it) => it.name === "gray.png"),
+      () => items.every((it) => !it || it.name !== "gray.png" || it.removed),
       null,
       { timeout: 10_000 },
     );
@@ -181,7 +217,7 @@ test.describe("album grid", () => {
     const cyanIdx = await page.evaluate(
       () => items.findIndex((it) => it.name === "cyan.png"),
     );
-    const rect = rects[cyanIdx];
+    const rect = rects.find((r) => r.i === cyanIdx);
 
     await page.mouse.click(rect.x + rect.w / 2, rect.y + rect.h / 2);
     await page.keyboard.press("m");
@@ -193,9 +229,9 @@ test.describe("album grid", () => {
       .toBe(true);
     expect(fs.existsSync(path.join(FIXTURE_DIR, "cyan.png"))).toBe(false);
 
-    // The tile disappears from the grid.
+    // The tile disappears from the grid (tombstoned, like deletes).
     await page.waitForFunction(
-      () => !items.some((it) => it.name === "cyan.png"),
+      () => items.every((it) => !it || it.name !== "cyan.png" || it.removed),
       null,
       { timeout: 10_000 },
     );

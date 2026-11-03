@@ -96,9 +96,7 @@ pub fn screen_dir_for(source: &Path) -> PathBuf {
 /// Stale variants (different signature) are pruned on write.
 pub fn screen_preview_path(source: &Path) -> Option<PathBuf> {
     let sig = preview_sig_u64(source)?;
-    Some(
-        screen_dir_for(source).join(format!("{sig}-f{SCREEN_MAX_DIM}.jpg")),
-    )
+    Some(screen_dir_for(source).join(format!("{sig}-f{SCREEN_MAX_DIM}.jpg")))
 }
 
 /// Read the cached fullscreen preview, generating + persisting it if

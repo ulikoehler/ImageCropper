@@ -2,8 +2,8 @@
 //! `manifest-patch` events for upserts, tombstone removals and resyncs —
 //! the mechanism that keeps simultaneous clients coherent without reloads.
 
-use imagecropper::server::{ServeMode, ServerState};
 use imagecropper::server::manifest::ManifestPatch;
+use imagecropper::server::{ServeMode, ServerState};
 
 mod common;
 use common::{solid_image, write_image};
