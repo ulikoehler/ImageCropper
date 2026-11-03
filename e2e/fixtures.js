@@ -35,8 +35,11 @@ module.exports = { writeFixtures, FIXTURES, EXPECTED };
 if (require.main === module) {
   const dir = process.argv[2] || path.join(__dirname, ".fixtures");
   const names = writeFixtures(dir);
-  // Also reset the -m target dir: the server creates it via resolve_move_dir,
-  // and any stale files from earlier runs would change the landing name.
-  fs.rmSync(path.join(__dirname, ".move-target"), { recursive: true, force: true });
+  // Reset the -m target dir only for the default fixtures run — the
+  // rubber-band server's invocation would otherwise wipe the dir the main
+  // server already created.
+  if (!process.argv[2]) {
+    fs.rmSync(path.join(__dirname, ".move-target"), { recursive: true, force: true });
+  }
   console.log(`fixtures: wrote ${names.join(", ")} to ${dir}`);
 }

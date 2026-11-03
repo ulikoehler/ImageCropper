@@ -193,7 +193,9 @@ pub fn find_cached_preview(dir: &Path, source: &Path, expected_name: &str) -> Op
     cached
 }
 
-/// Remove every cached preview for a source file (e.g. after it was deleted).
+/// Remove every cached preview for a source file (e.g. after it was
+/// deleted or moved away): the local `.imagecropper-previews` thumbnails
+/// and the whole per-source fullscreen dir in the global cache.
 pub fn remove_previews_for(source: &Path) {
     let Some(source_name) = source.file_name() else {
         return;
@@ -207,6 +209,9 @@ pub fn remove_previews_for(source: &Path) {
             }
         }
     }
+    // Global fullscreen cache: `f/<path-hash>/` holds only this file's
+    // signature variants, so the whole dir goes.
+    let _ = std::fs::remove_dir_all(screen_dir_for(source));
 }
 
 /// Load the cached preview or generate, persist and return a fresh one.

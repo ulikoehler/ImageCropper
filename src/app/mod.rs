@@ -16,7 +16,8 @@ use wgpu;
 use crate::{
     fs_utils::{
         format_deletion_summary, format_overall_summary, format_savings_summary, format_size,
-        move_with_unique_name, prepare_dir, ConversionStats, TRASH_DIR,
+        move_with_unique_name, prepare_dir, previews::remove_previews_for, ConversionStats,
+        TRASH_DIR,
     },
     image_utils::{
         build_output_image, combine_crops, to_color_image, OutputFormat, PreloadedImage,
@@ -553,6 +554,7 @@ impl ImageCropperApp {
             self.status = format!("Failed to delete: {err:#}");
             return;
         }
+        remove_previews_for(&path);
 
         self.status = format!("Moved {} to {}", path.display(), TRASH_DIR);
         self.canvas.clear();

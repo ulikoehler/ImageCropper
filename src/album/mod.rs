@@ -46,6 +46,8 @@ pub struct AlbumOptions {
     pub parallel: usize,
     /// Target dir for `m` moves; `None` disables the move key.
     pub move_dir: Option<PathBuf>,
+    /// Drag-select behavior: contiguous sequence vs rectangle intersect.
+    pub mouse_select: crate::cli::MouseSelectMode,
     /// Options used when launching the embedded crop UI via `c`.
     pub crop: AppOptions,
 }
@@ -136,6 +138,19 @@ pub struct AlbumApp {
     /// FIFO of entries holding a decoded fullscreen preview — bounded so
     /// arrowing through many images while holding `f` can't grow memory.
     full_loaded: std::collections::VecDeque<PathBuf>,
+    /// Rubber-band drag selection: press origin (screen coords), the
+    /// selection snapshot at press, the modifier mode (0 replace, 1 add,
+    /// 2 toggle), the sequence-mode anchor tile and whether the drag has
+    /// passed the threshold.
+    drag_start: Option<Pos2>,
+    drag_base: Option<BTreeSet<usize>>,
+    drag_mode: u8,
+    drag_anchor: Option<usize>,
+    drag_active: bool,
+    /// Drag-select mode (`sequence` default / `rubber-band`).
+    mouse_select: crate::cli::MouseSelectMode,
+    /// Screen-space rects of the tiles painted this frame (hit-testing).
+    painted: Vec<(usize, Rect)>,
 }
 
 impl AlbumApp {
@@ -180,6 +195,13 @@ impl AlbumApp {
             fs_tex: None,
             fs_path: None,
             full_loaded: std::collections::VecDeque::new(),
+            drag_start: None,
+            drag_base: None,
+            drag_mode: 0,
+            drag_anchor: None,
+            drag_active: false,
+            mouse_select: options.mouse_select,
+            painted: Vec::new(),
         }
         .reindex()
     }
@@ -397,6 +419,20 @@ impl AlbumApp {
             return;
         }
         self.thumbnailer.request(entry.path.clone());
+    }
+
+    /// Painted tile whose center is closest to `p` — the sequence-mode
+    /// anchor/cursor when the pointer sits in a gutter.
+    fn painted_nearest(&self, p: Pos2) -> Option<usize> {
+        self.painted
+            .iter()
+            .min_by(|(_, a), (_, b)| {
+                a.center()
+                    .distance_sq(p)
+                    .partial_cmp(&b.center().distance_sq(p))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|(i, _)| *i)
     }
 
     fn select_range(&mut self, a: usize, b: usize) {
@@ -712,6 +748,49 @@ impl AlbumApp {
                 }
             }
 
+            // Rubber-band drag selection. Pointer is sampled before the
+            // tiles run so `drag_active` also suppresses the stray click
+            // egui reports on the release frame.
+            let pointer = ctx.input(|i| i.pointer.clone());
+            if pointer.primary_pressed() {
+                // Only start a band inside the content area, not on the
+                // scrollbar strip.
+                let inside = pointer
+                    .press_origin()
+                    .map(|p| p.x < panel_rect.right() - 14.0 && panel_rect.contains(p))
+                    .unwrap_or(false);
+                if inside {
+                    let origin = pointer.press_origin().unwrap();
+                    self.drag_start = Some(origin);
+                    // Sequence mode anchors at the tile the press landed on
+                    // (nearest center when pressing into a gap).
+                    self.drag_anchor = self
+                        .painted
+                        .iter()
+                        .find(|(_, r)| r.contains(origin))
+                        .map(|(i, _)| *i)
+                        .or_else(|| self.painted_nearest(origin));
+                    self.drag_base = Some(self.selected.clone());
+                    self.drag_mode = if modifiers.command {
+                        2
+                    } else if modifiers.shift {
+                        1
+                    } else {
+                        0
+                    };
+                }
+            }
+            let mut drag_rect: Option<Rect> = None;
+            if pointer.primary_down() {
+                if let (Some(start), Some(cur)) = (self.drag_start, pointer.latest_pos()) {
+                    if self.drag_active || start.distance(cur) > 6.0 {
+                        self.drag_active = true;
+                        drag_rect = Some(Rect::from_two_pos(start, cur));
+                    }
+                }
+            }
+
+            self.painted.clear();
             let mut new_visible = 0..0;
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
@@ -737,6 +816,7 @@ impl AlbumApp {
                     for i in new_visible.clone() {
                         let tile = layout.tiles[i];
                         let rect = tile.translate(origin.to_vec2());
+                        self.painted.push((i, rect));
 
                         let texture_id = {
                             let entry = &mut self.entries[i];
@@ -804,7 +884,7 @@ impl AlbumApp {
                             ui.scope_id().with("tile").with(i),
                             egui::Sense::click_and_drag(),
                         );
-                        if tile_response.clicked() {
+                        if tile_response.clicked() && !self.drag_active {
                             if modifiers.shift {
                                 self.select_range(self.anchor, i);
                             } else if modifiers.command {
@@ -839,6 +919,61 @@ impl AlbumApp {
                         }
                     }
                 });
+
+            // Apply the drag selection live. Rubber-band mode hits every
+            // painted tile the rect intersects; sequence mode selects the
+            // contiguous index range between anchor and cursor tile.
+            if let Some(rect) = drag_rect {
+                // Cursor tile under the drag point (or its nearest neighbor
+                // in a gutter) — also drives the focus.
+                let cur = self
+                    .painted
+                    .iter()
+                    .find(|(_, r)| r.contains(rect.max))
+                    .map(|(i, _)| *i)
+                    .or_else(|| self.painted_nearest(rect.max));
+                let hits: BTreeSet<usize> = match self.mouse_select {
+                    crate::cli::MouseSelectMode::Sequence => {
+                        match (self.drag_anchor, cur) {
+                            (Some(a), Some(c)) => (a.min(c)..=a.max(c)).collect(),
+                            _ => Default::default(),
+                        }
+                    }
+                    crate::cli::MouseSelectMode::RubberBand => self
+                        .painted
+                        .iter()
+                        .filter(|(_, r)| r.intersects(rect))
+                        .map(|(i, _)| *i)
+                        .collect(),
+                };
+                let base = self.drag_base.clone().unwrap_or_default();
+                self.selected = match self.drag_mode {
+                    1 => base.union(&hits).copied().collect(),
+                    2 => base.symmetric_difference(&hits).copied().collect(),
+                    _ => hits,
+                };
+                if let Some(i) = cur {
+                    self.focus = i;
+                }
+                let painter = ui.painter().clone();
+                painter.rect_filled(
+                    rect,
+                    0.0,
+                    Color32::from_rgba_unmultiplied(78, 161, 255, 38),
+                );
+                painter.rect_stroke(
+                    rect,
+                    0.0,
+                    egui::Stroke::new(1.5, Color32::from_rgb(78, 161, 255)),
+                    egui::StrokeKind::Outside,
+                );
+            }
+            if !pointer.primary_down() {
+                self.drag_start = None;
+                self.drag_base = None;
+                self.drag_anchor = None;
+                self.drag_active = false;
+            }
 
             let painter = ui.painter().clone();
 

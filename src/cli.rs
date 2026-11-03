@@ -116,6 +116,29 @@ pub enum ServeAuth {
     Password,
 }
 
+/// How mouse-drag selection behaves in the album grid. Serialized into the
+/// manifest so the web client uses the same mode as the native UI.
+#[derive(
+    clap::ValueEnum,
+    serde::Serialize,
+    serde::Deserialize,
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+)]
+#[serde(rename_all = "kebab-case")]
+pub enum MouseSelectMode {
+    /// Drag picks the contiguous sequence in list order between the tile
+    /// the drag started on and the tile under the cursor.
+    #[default]
+    Sequence,
+    /// Drag selects every tile the drag rectangle intersects.
+    RubberBand,
+}
+
 /// Headless/web-serving flags shared by `crop` and `album`.
 #[derive(Args, Debug, Clone, Default)]
 pub struct HeadlessArgs {
@@ -186,6 +209,12 @@ pub struct AlbumArgs {
     /// (created if missing; must be a directory)
     #[arg(short = 'm', long = "move", value_name = "DIR")]
     pub move_dir: Option<PathBuf>,
+
+    /// Mouse drag selection mode: `sequence` (default) selects the
+    /// contiguous run between the drag anchor and the cursor tile;
+    /// `rubber-band` selects every tile the drag rectangle intersects.
+    #[arg(long = "mouse-select-mode", value_enum, default_value_t = MouseSelectMode::Sequence)]
+    pub mouse_select: MouseSelectMode,
 
     #[command(flatten)]
     pub headless: HeadlessArgs,

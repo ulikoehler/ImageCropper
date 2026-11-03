@@ -44,6 +44,7 @@ pub struct ServerState {
     pub actions: Arc<ActionQueue>,
     pub events: broadcast::Sender<ServerEvent>,
     pub mode: ServeMode,
+    pub mouse_select: crate::cli::MouseSelectMode,
     pub token: Option<String>,
     pub initial_credit: u64,
 }
@@ -53,12 +54,13 @@ impl ServerState {
         files: Vec<PathBuf>,
         roots: Vec<PathBuf>,
         mode: ServeMode,
+        mouse_select: crate::cli::MouseSelectMode,
         parallel: usize,
         token: Option<String>,
         push_credit_kb: u32,
         move_dir: Option<PathBuf>,
     ) -> Arc<Self> {
-        let manifest = Manifest::build(&files, &roots, mode, 1);
+        let manifest = Manifest::build(&files, &roots, mode, mouse_select, 1);
         let previews = Arc::new(PreviewStore::new(parallel, 2048));
         previews.request_all(files.iter());
         let (events, _) = broadcast::channel(256);
@@ -69,6 +71,7 @@ impl ServerState {
             actions: Arc::new(ActionQueue::new(parallel.max(1).min(4), move_dir)),
             events,
             mode,
+            mouse_select,
             token,
             initial_credit: push_credit_kb as u64 * 1024,
         })
@@ -310,7 +313,7 @@ impl ServerState {
     /// Returns the new manifest for broadcast/patch purposes.
     pub fn rebuild_manifest(&self, files: Vec<PathBuf>, roots: &[PathBuf]) {
         let version = self.manifest.read().unwrap().version + 1;
-        let fresh = Manifest::build(&files, roots, self.mode, version);
+        let fresh = Manifest::build(&files, roots, self.mode, self.mouse_select, version);
         *self.manifest.write().unwrap() = fresh;
     }
 }

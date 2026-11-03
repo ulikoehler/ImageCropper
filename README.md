@@ -112,12 +112,13 @@ imagecropper album -m ~/keep -r ~/incoming-photos
 *   **Mouse Click**: Select a single image.
 *   **Ctrl + Click**: Toggle an image's selection.
 *   **Shift + Click**: Select the range from the anchor to the clicked image.
+*   **Mouse Drag**: Select a contiguous **sequence** of images (list order from the drag-start tile to the cursor tile — `--mouse-select-mode=sequence`, the default). `--mouse-select-mode=rubber-band` instead selects every tile the drag rectangle intersects. Shift-drag adds to the selection, Ctrl/Cmd-drag toggles it.
 *   **Double Click / c**: Open the image in crop mode. **Esc** leaves crop mode and returns to the album.
 *   **Arrow Keys**: Move the focused tile (plain arrows select it, **Shift** extends the selection, **Ctrl** moves without changing the selection).
 *   **Space**: Toggle the focused image's selection.
 *   **Ctrl + A**: Select all images.
-*   **Delete**: Move all selected images to `.imagecropper-trash` via a background deletion queue.
-*   **m**: Move all selected images to the `-m/--move` directory via a background queue; they disappear from the grid. (No-op with a status hint when `-m` was not given.)
+*   **Delete**: Selected tiles vanish immediately; the actual move to `.imagecropper-trash` runs on a background deletion queue.
+*   **m**: Same flow for the `-m/--move` directory — tiles vanish at keypress, the move completes in the background. (No-op with a status hint when `-m` was not given.)
 *   **f (hold)**: Show the focused image fullscreen using the preloaded ≤1920px preview; release to return to the grid. Arrow keys still work while held.
 *   **+ / -**: Fine-grained zoom of the tile size.
 *   **W / w** (Shift+W / w): Increase / decrease the tile width in coarse steps.

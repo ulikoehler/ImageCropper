@@ -32,7 +32,14 @@ fn fullscreen_window() -> eframe::NativeOptions {
 fn run_crop(args: CropArgs) -> Result<()> {
     imagecropper::fs_utils::set_verbose(args.scan.verbose);
     if let Some(addr) = args.headless.serve {
-        return serve(args.scan, addr, &args.headless, ServeMode::Crop, None);
+        return serve(
+            args.scan,
+            addr,
+            &args.headless,
+            ServeMode::Crop,
+            imagecropper::cli::MouseSelectMode::Sequence,
+            None,
+        );
     }
     let scan = spawn_scan_stream(&args.scan)?;
     if args.headless.no_gui {
@@ -71,7 +78,14 @@ fn run_album(args: AlbumArgs) -> Result<()> {
     imagecropper::fs_utils::set_verbose(args.scan.verbose);
     let move_dir = imagecropper::cli::resolve_move_dir(&args.move_dir)?;
     if let Some(addr) = args.headless.serve {
-        return serve(args.scan, addr, &args.headless, ServeMode::Album, move_dir);
+        return serve(
+            args.scan,
+            addr,
+            &args.headless,
+            ServeMode::Album,
+            args.mouse_select,
+            move_dir,
+        );
     }
     let scan = spawn_scan_stream(&args.scan)?;
     if args.headless.no_gui {
@@ -82,6 +96,7 @@ fn run_album(args: AlbumArgs) -> Result<()> {
         verbose: args.scan.verbose,
         parallel: args.scan.parallel,
         move_dir,
+        mouse_select: args.mouse_select,
         crop: AppOptions {
             dry_run: args.scan.dry_run,
             quality: args.quality,
@@ -116,6 +131,7 @@ fn serve(
     addr: std::net::SocketAddr,
     headless: &HeadlessArgs,
     mode: ServeMode,
+    mouse_select: imagecropper::cli::MouseSelectMode,
     move_dir: Option<PathBuf>,
 ) -> Result<()> {
     let stream = spawn_scan_stream(&scan)?;
@@ -132,6 +148,7 @@ fn serve(
         Vec::new(),
         scan.paths.clone(),
         mode,
+        mouse_select,
         scan.parallel,
         token,
         headless.push_credit_kb,

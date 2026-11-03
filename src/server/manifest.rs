@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+use crate::cli::MouseSelectMode;
 use crate::fs_utils::previews::preview_sig_u64;
 
 /// u64 signatures cross into JS-land — serialize as strings to survive
@@ -65,6 +66,9 @@ pub struct Manifest {
     pub dirs: Vec<String>,
     /// Scan roots as passed on the command line.
     pub roots: Vec<String>,
+    /// Drag-selection mode the UI applies (`sequence` default).
+    #[serde(default)]
+    pub mouse_select: MouseSelectMode,
     pub items: Vec<ManifestItem>,
     /// Server-side lookup: absolute path → item id. Not serialized.
     #[serde(skip)]
@@ -90,7 +94,13 @@ pub struct ManifestPatch {
 impl Manifest {
     /// Build a manifest from a sorted file list. Header-sniffs dimensions in
     /// parallel-friendly order (cheap: metadata read only).
-    pub fn build(files: &[PathBuf], roots: &[PathBuf], mode: ServeMode, version: u32) -> Self {
+    pub fn build(
+        files: &[PathBuf],
+        roots: &[PathBuf],
+        mode: ServeMode,
+        mouse_select: MouseSelectMode,
+        version: u32,
+    ) -> Self {
         let mut dir_index: HashMap<PathBuf, u32> = HashMap::new();
         let mut dirs: Vec<String> = Vec::new();
         let mut items = Vec::with_capacity(files.len());
@@ -136,6 +146,7 @@ impl Manifest {
                 .iter()
                 .map(|p| p.to_string_lossy().into_owned())
                 .collect(),
+            mouse_select,
             items,
             positions,
         }

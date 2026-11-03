@@ -2,7 +2,8 @@
 //! (or `$XDG_CACHE_HOME`), signature-named, capped at 1920px.
 
 use imagecropper::fs_utils::previews::{
-    cache_root, produce_screen_jpeg, screen_preview_path, SCREEN_MAX_DIM,
+    cache_root, produce_screen_jpeg, remove_previews_for, screen_dir_for, screen_preview_path,
+    SCREEN_MAX_DIM,
 };
 use std::sync::Mutex;
 use tempfile::tempdir;
@@ -74,5 +75,27 @@ fn screen_preview_sig_names_invalidate_on_change() {
         write_image(&src, &solid_image(128, 128, [255, 0, 255, 255]));
         let second = screen_preview_path(&src).unwrap();
         assert_ne!(first, second);
+    });
+}
+
+#[test]
+fn remove_previews_for_purges_fullscreen_cache() {
+    with_xdg_cache(|| {
+        let tmp = tempdir().unwrap();
+        let src = tmp.path().join("p.png");
+        write_image(&src, &solid_image(64, 64, [0, 0, 255, 255]));
+
+        // Generate the cached fullscreen preview, then delete the source's
+        // previews as the delete/move queues do.
+        let (jpeg, _, _) = produce_screen_jpeg(&src).expect("screen jpeg");
+        assert!(!jpeg.is_empty());
+        assert!(screen_dir_for(&src).exists());
+
+        remove_previews_for(&src);
+
+        assert!(
+            !screen_dir_for(&src).exists(),
+            "fullscreen cache dir must be removed with the previews"
+        );
     });
 }

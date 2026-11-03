@@ -13,7 +13,13 @@ fn manifest_build_interns_dirs_and_sniffs_dims() {
         write_image(sub.join("b.png"), &solid_image(20, 30, [0, 255, 0, 255]));
 
         let files = vec![root.join("a.png"), sub.join("b.png")];
-        let m = Manifest::build(&files, &[root.to_path_buf()], ServeMode::Album, 1);
+        let m = Manifest::build(
+            &files,
+            &[root.to_path_buf()],
+            ServeMode::Album,
+            imagecropper::cli::MouseSelectMode::Sequence,
+            1,
+        );
 
         assert_eq!(m.items.len(), 2);
         assert_eq!(m.dirs.len(), 2); // interned
@@ -31,7 +37,13 @@ fn manifest_sig_serializes_as_string() {
     with_temp_workdir(|root| {
         write_image(root.join("a.png"), &solid_image(10, 10, [0, 0, 0, 255]));
         let files = vec![root.join("a.png")];
-        let m = Manifest::build(&files, &[root.to_path_buf()], ServeMode::Crop, 1);
+        let m = Manifest::build(
+            &files,
+            &[root.to_path_buf()],
+            ServeMode::Crop,
+            imagecropper::cli::MouseSelectMode::Sequence,
+            1,
+        );
         let json = serde_json::to_value(&m.items[0]).unwrap();
         assert!(json["sig"].is_string(), "sig must be a JSON string");
         assert_eq!(
@@ -62,6 +74,7 @@ fn manifest_patch_upsert_and_remove() {
         generated_ms: 0,
         dirs: vec!["/d".into()],
         roots: vec![],
+        mouse_select: imagecropper::cli::MouseSelectMode::Sequence,
         items: vec![mk(0, "a"), mk(1, "b"), mk(2, "c")],
         positions: Default::default(),
     };

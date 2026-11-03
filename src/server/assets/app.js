@@ -69,6 +69,7 @@ function onBulk(f){
 async function refreshManifest(){
   const {body}=await bulkRequest(BK_GET_MANIFEST,u32s(1,0));
   manifest=JSON.parse(new TextDecoder().decode(body));
+  mouseSelect=manifest.mouse_select||"sequence";
   items=manifest.items;
   thumbs.clear();pending.clear();
   selected=new Set();focus=0;anchor=0;scanning=false;
@@ -104,6 +105,7 @@ async function boot(){
   // /bulk: manifest (chunked)
   const {body}=await bulkRequest(BK_GET_MANIFEST,u32s(1,0));
   manifest=JSON.parse(new TextDecoder().decode(body));
+  mouseSelect=manifest.mouse_select||"sequence";
   items=manifest.items;
   layout(); draw();
 
@@ -130,8 +132,8 @@ function onData(f){
     const ev=JSON.parse(new TextDecoder().decode(f.payload));
     if(ev.ev==="action-done"){
       const kind=pendingActions.get(ev.tag);
+      const id=pendingIds.get(ev.tag);
       if(kind!=null&&ev.ok){
-        const id=pendingIds.get(ev.tag);
         pendingActions.delete(ev.tag);pendingIds.delete(ev.tag);
         // Optimistic tombstone — the server's manifest-patch remove
         // arrives too; both are idempotent and keep ids positional.
@@ -140,7 +142,10 @@ function onData(f){
         layout();draw();
       } else if(kind!=null){
         pendingActions.delete(ev.tag);pendingIds.delete(ev.tag);
+        // Undo the optimistic tombstone — the file is still there.
+        if(items[id]){items[id].removed=false;layout();}
         statusEl.textContent=`${kind} failed: ${ev.error||"?"}`;
+        draw();
       }
     }
     if(ev.ev==="scan-start"){scanning=true;draw();}
@@ -188,6 +193,19 @@ function tileRects(){
   }
   return out;
 }
+
+// ---- drag-select state (mode comes from the manifest) ----
+let mouseSelect="sequence", drag=null, suppressClick=false;
+const tileAt=(x,y)=>{
+  for(const t of tileRects())
+    if(x>=t.x&&x<t.x+t.w&&y>=t.y&&y<t.y+t.h)return t.i;
+  return -1};
+const tileNearest=(x,y)=>{
+  let b=-1,bd=Infinity;
+  for(const t of tileRects()){
+    const dx=t.x+t.w/2-x,dy=t.y+t.h/2-y,d=dx*dx+dy*dy;
+    if(d<bd){bd=d;b=t.i}}
+  return b};
 
 // ---- hold-`f` fullscreen preview (1920-class JPEG from /bulk) ----
 let fHeld=false, screenBmp=null, screenIdx=-1;
@@ -244,6 +262,11 @@ function draw(){
     if(t.i===focus){ctx.strokeStyle="#fff";ctx.lineWidth=2;
       ctx.strokeRect(t.x+5,y+5,t.w-10,t.h-10);}
   }
+  if(drag&&drag.rect){
+    const r=drag.rect,y=r.y-scrollY;
+    ctx.fillStyle="rgba(78,161,255,0.22)";ctx.fillRect(r.x,y,r.w,r.h);
+    ctx.strokeStyle="#4ea1ff";ctx.lineWidth=2;ctx.strokeRect(r.x,y,r.w,r.h);
+  }
   if(want.length&&dataWs&&dataWs.readyState===1){
     const b=new Uint8Array(2+4*want.length),v=new DataView(b.buffer);
     v.setUint16(0,want.length,true);
@@ -265,21 +288,24 @@ addEventListener("keydown",e=>{
   else if(e.key==="w"){tileH*=e.shiftKey?1.25:0.8;layout();draw()}
   else if(e.key==="Delete"){
     for(const i of selected){
-      const it=items[i],tag=pendingTag++;
+      const it=items[i];if(!it||it.removed)continue;const tag=pendingTag++;
       pendingActions.set(tag,"delete");pendingIds.set(tag,it.id);
+      // Optimistic: the tile vanishes now, the FS delete lands async.
+      it.removed=true;thumbs.delete(it.id);
       dataWs.send(frame(CL_ACTION,0,str(JSON.stringify({
         tag,kind:"delete",id:it.id,sig:it.sig}))));
     }
-    selected.clear();draw();
+    selected.clear();layout();draw();
   }
   else if((e.key==="m"||e.key==="M")&&!e.ctrlKey&&!e.metaKey){
     for(const i of selected){
-      const it=items[i],tag=pendingTag++;
+      const it=items[i];if(!it||it.removed)continue;const tag=pendingTag++;
       pendingActions.set(tag,"move");pendingIds.set(tag,it.id);
+      it.removed=true;thumbs.delete(it.id);
       dataWs.send(frame(CL_ACTION,0,str(JSON.stringify({
         tag,kind:"move",id:it.id,sig:it.sig}))));
     }
-    selected.clear();draw();
+    selected.clear();layout();draw();
   }
   else if((e.key==="f"||e.key==="F")&&!e.ctrlKey&&!e.metaKey){
     fHeld=true;if(screenIdx!==focus)fetchScreen(focus);draw();
@@ -303,7 +329,52 @@ addEventListener("keydown",e=>{
 addEventListener("keyup",e=>{
   if(e.key==="f"||e.key==="F"){fHeld=false;draw()}
 });
+canvas.addEventListener("mousedown",e=>{
+  if(e.button!==0)return;
+  const x=e.clientX*devicePixelRatio,y=e.clientY*devicePixelRatio+scrollY;
+  const a=tileAt(x,y);
+  drag={x0:x,y0:y,anchor:a>=0?a:tileNearest(x,y),
+    mode:(e.ctrlKey||e.metaKey)?2:(e.shiftKey?1:0),
+    base:new Set(selected),rect:null};
+  e.preventDefault();
+});
+addEventListener("mousemove",e=>{
+  if(!drag)return;
+  const x=e.clientX*devicePixelRatio,y=e.clientY*devicePixelRatio+scrollY;
+  const dx=x-drag.x0,dy=y-drag.y0;
+  if(!drag.rect&&dx*dx+dy*dy<36)return;   // <6px = still a click
+  drag.rect={x:Math.min(drag.x0,x),y:Math.min(drag.y0,y),
+    w:Math.abs(dx),h:Math.abs(dy)};
+  let hits;
+  if(mouseSelect==="rubber-band"){
+    hits=new Set();
+    for(const t of tileRects())
+      if(t.x<drag.rect.x+drag.rect.w&&t.x+t.w>drag.rect.x&&
+         t.y<drag.rect.y+drag.rect.h&&t.y+t.h>drag.rect.y)hits.add(t.i);
+  }else{
+    // sequence: contiguous index run anchor..cursor-tile
+    hits=new Set();
+    const c0=tileAt(x,y),cur=c0>=0?c0:tileNearest(x,y);
+    if(drag.anchor<0)drag.anchor=cur;
+    if(drag.anchor>=0&&cur>=0)
+      for(let i=Math.min(drag.anchor,cur);i<=Math.max(drag.anchor,cur);i++)
+        hits.add(i);
+  }
+  const b=drag.base;
+  selected=drag.mode===1?new Set([...b,...hits])
+    :drag.mode===2
+      ?new Set([...b].filter(i=>!hits.has(i))
+        .concat([...hits].filter(i=>!b.has(i))))
+      :hits;
+  draw();
+});
+addEventListener("mouseup",e=>{
+  if(e.button!==0)return;
+  if(drag&&drag.rect)suppressClick=true;
+  drag=null;draw();
+});
 canvas.addEventListener("click",e=>{
+  if(suppressClick){suppressClick=false;return}
   const mx=e.clientX*devicePixelRatio,my=e.clientY*devicePixelRatio+scrollY;
   for(const t of tileRects()){
     if(mx>=t.x&&mx<t.x+t.w&&my>=t.y&&my<t.y+t.h){

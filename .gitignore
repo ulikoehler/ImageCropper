@@ -6,3 +6,4 @@ e2e/.fixtures
 e2e/.move-target
 e2e/test-results
 e2e/playwright-report
+e2e/.fixtures-rb

@@ -125,6 +125,56 @@ test.describe("album grid", () => {
     await expect(page.locator("#top")).toContainText(`${N_IMAGES} selected`);
   });
 
+  test("mouse drag selects the contiguous sequence (default mode)", async ({
+    page,
+  }) => {
+    await openApp(page);
+    await waitAllCached(page);
+    const rects = await tileRects(page);
+    const r0 = rects[0];
+    // First tile of the row below — the default sequence mode must select
+    // the full contiguous run r0.i..row1First.i even though the band only
+    // crosses the first column.
+    const next = rects.find((r) => r.y > r0.y + r0.h - 1);
+    expect(next, "expected at least two rows").toBeTruthy();
+
+    await page.mouse.move(r0.x + r0.w * 0.2, r0.y + r0.h * 0.5);
+    await page.mouse.down();
+    await page.mouse.move(next.x + next.w * 0.2, next.y + next.h * 0.5, {
+      steps: 8,
+    });
+    await page.mouse.up();
+
+    const sel = await page.evaluate(() => [...selected].sort((a, b) => a - b));
+    const want = [];
+    for (let i = r0.i; i <= next.i; i++) want.push(i);
+    expect(sel).toEqual(want);
+  });
+
+  test("rubber-band mode selects only intersected tiles", async ({ page }) => {
+    // Separate server on :8791 with --mouse-select-mode=rubber-band.
+    await page.goto("http://127.0.0.1:8791/");
+    await expect(page.locator("#c")).toBeVisible();
+    await waitAllCached(page);
+    const rects = await tileRects(page);
+    const r0 = rects[0];
+    const next = rects.find((r) => r.y > r0.y + r0.h - 1);
+    expect(next, "expected at least two rows").toBeTruthy();
+
+    // Narrow vertical band inside the first column — rubber-band picks up
+    // only the two tiles it actually crosses (sequence would take the
+    // whole contiguous run r0.i..next.i).
+    await page.mouse.move(r0.x + r0.w * 0.2, r0.y + r0.h * 0.5);
+    await page.mouse.down();
+    await page.mouse.move(next.x + r0.w * 0.2, next.y + next.h * 0.5, {
+      steps: 8,
+    });
+    await page.mouse.up();
+
+    const sel = await page.evaluate(() => [...selected].sort((a, b) => a - b));
+    expect(sel).toEqual([r0.i, next.i]);
+  });
+
   test("+/- zoom and w/W width change the layout", async ({ page }) => {
     await openApp(page);
     await waitAllCached(page);
@@ -191,6 +241,14 @@ test.describe("album grid", () => {
 
     await page.mouse.click(rect.x + rect.w / 2, rect.y + rect.h / 2);
     await page.keyboard.press("Delete");
+
+    // Optimistic: the tombstone applies synchronously on keypress — the
+    // tile is gone from the UI before the server-side delete lands.
+    const tombstonedEarly = await page.evaluate(
+      (i) => items[i].removed,
+      grayIdx,
+    );
+    expect(tombstonedEarly).toBe(true);
 
     // Server moves the file into .imagecropper-trash.
     const trashed = path.join(FIXTURE_DIR, ".imagecropper-trash", "gray.png");

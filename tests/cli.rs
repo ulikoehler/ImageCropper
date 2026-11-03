@@ -156,3 +156,41 @@ fn order_values_still_parse() {
     };
     assert_eq!(a.scan.order, SortOrder::SizeDesc);
 }
+
+#[test]
+fn mouse_select_mode_defaults_to_sequence() {
+    use imagecropper::cli::MouseSelectMode;
+    let cli = Cli::try_parse_from(["imagecropper", "album", "/x"]).unwrap();
+    let Commands::Album(a) = cli.command else {
+        panic!()
+    };
+    assert_eq!(a.mouse_select, MouseSelectMode::Sequence);
+
+    let cli = Cli::try_parse_from([
+        "imagecropper",
+        "album",
+        "--mouse-select-mode=rubber-band",
+        "/x",
+    ])
+    .unwrap();
+    let Commands::Album(a) = cli.command else {
+        panic!()
+    };
+    assert_eq!(a.mouse_select, MouseSelectMode::RubberBand);
+
+    let cli = Cli::try_parse_from([
+        "imagecropper",
+        "album",
+        "--mouse-select-mode=sequence",
+        "/x",
+    ])
+    .unwrap();
+    let Commands::Album(a) = cli.command else {
+        panic!()
+    };
+    assert_eq!(a.mouse_select, MouseSelectMode::Sequence);
+
+    assert!(
+        Cli::try_parse_from(["imagecropper", "album", "--mouse-select-mode=bogus", "/x"]).is_err()
+    );
+}
