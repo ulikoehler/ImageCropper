@@ -83,6 +83,9 @@ pub struct ScaleController {
     cooldown: u32,
     /// Epochs until `ceiling`/`floor` are lifted (allow full re-probing).
     reprobe: u32,
+    /// Forced worker count — when set, the controller stops probing and
+    /// always returns this value (queues that track another pool's count).
+    pinned: Option<usize>,
 }
 
 impl ScaleController {
@@ -103,11 +106,17 @@ impl ScaleController {
             probing: None,
             cooldown: 0,
             reprobe: REPROBE_EPOCHS,
+            pinned: None,
         }
     }
 
     pub fn workers(&self) -> usize {
         self.workers
+    }
+
+    /// Pin the worker count (0 allowed) — the controller stops autotuning.
+    pub fn pin(&mut self, n: usize) {
+        self.pinned = Some(n);
     }
 
     /// Record one completed job's latency. When an epoch completes, returns the
@@ -139,6 +148,11 @@ impl ScaleController {
     }
 
     fn evaluate(&mut self) -> Option<usize> {
+        if let Some(p) = self.pinned {
+            let old = self.workers;
+            self.workers = p;
+            return (old != p).then_some(p);
+        }
         // Little's law: steady-state throughput ≈ active_workers / avg_latency.
         let avg_lat = self.win_lat.as_secs_f64() / self.win_jobs.max(1) as f64;
         let tput = self.win_workers as f64 / avg_lat.max(1e-6);
@@ -308,6 +322,23 @@ impl<R: Send + 'static> AdaptivePool<R> {
     /// Current worker count (observability, tests).
     pub fn workers(&self) -> usize {
         self.workers.lock().unwrap().len()
+    }
+
+    /// Force the worker count to exactly `n` (0 = fully stopped) and stop
+    /// the autotuner — for queues whose concurrency tracks another pool.
+    pub fn set_worker_override(&self, n: usize) {
+        self.ctrl.lock().unwrap().pin(n);
+        self.set_workers(n);
+    }
+
+    /// Drop every queued-but-not-started job and retire all workers.
+    /// In-flight jobs finish and still deliver their results.
+    pub fn cancel(&self) {
+        self.set_worker_override(0);
+        if let Ok(rx) = self.job_rx.lock() {
+            while rx.try_recv().is_ok() {}
+        }
+        self.pending.lock().unwrap().clear();
     }
 
     /// Apply the controller's target: retire extra workers, spawn missing ones.

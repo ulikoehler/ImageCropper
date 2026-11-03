@@ -394,6 +394,27 @@ pub fn build_router(state: Arc<ServerState>) -> Router {
         .with_state(state)
 }
 
+/// Ctrl-C shutdown: stop preview generation immediately, then wait for
+/// queued deletes/moves/etc. to drain — destructive ops are preferential.
+async fn shutdown(state: &ServerState) {
+    state.previews.stop();
+    let started = std::time::Instant::now();
+    let deadline = started + std::time::Duration::from_secs(60);
+    let mut last = usize::MAX;
+    while state.actions.pending() > 0 && std::time::Instant::now() < deadline {
+        let n = state.actions.pending();
+        if n != last {
+            eprintln!("shutdown: finishing {n} queued action(s)…");
+            last = n;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    let left = state.actions.pending();
+    if left > 0 {
+        eprintln!("shutdown: {left} action(s) did not finish in 60s");
+    }
+}
+
 /// Serve on `addr`. Blocks; used by the `--serve` paths in main.rs.
 pub fn run_server(addr: SocketAddr, state: Arc<ServerState>, open_browser: bool) -> Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
@@ -417,7 +438,14 @@ pub fn run_server(addr: SocketAddr, state: Arc<ServerState>, open_browser: bool)
         if open_browser {
             let _ = webbrowser::open(&url);
         }
-        axum::serve(listener, build_router(state)).await?;
+        tokio::select! {
+            r = axum::serve(listener, build_router(state.clone())) => { r?; }
+            r = tokio::signal::ctrl_c() => {
+                r?;
+                eprintln!("Ctrl-C: stopping preview generation, finishing queued actions…");
+                shutdown(&state).await;
+            }
+        }
         Ok(())
     })
 }

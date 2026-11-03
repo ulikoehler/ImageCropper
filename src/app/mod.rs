@@ -204,15 +204,15 @@ impl ImageCropperApp {
     }
 
     fn deletion_summary(&self) -> String {
-        if self.deleted_files == 0 {
-            "Total deleted file size: 0 B".to_string()
-        } else {
-            format_deletion_summary(self.total_deleted_bytes)
-        }
+        format_deletion_summary(self.deleted_files, self.total_deleted_bytes)
     }
 
     fn exit_summary(&self) -> String {
-        format_overall_summary(&self.conversion_stats, self.total_deleted_bytes)
+        format_overall_summary(
+            &self.conversion_stats,
+            self.deleted_files,
+            self.total_deleted_bytes,
+        )
     }
 
     fn print_exit_summary(&mut self) {
@@ -751,6 +751,8 @@ impl App for ImageCropperApp {
         if !self.scan_done {
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
         }
+        // Keep polling so a Ctrl-C is noticed even while idle.
+        ctx.request_repaint_after(std::time::Duration::from_millis(200));
         if !had_files && !self.files.is_empty() {
             let _ = self.load_current_image(ctx, render_state);
         }
@@ -822,7 +824,7 @@ impl App for ImageCropperApp {
             }
         }
 
-        if self.finished {
+        if self.finished || crate::fs_utils::sigint_received() {
             self.is_exiting = true;
         }
 

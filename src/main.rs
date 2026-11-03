@@ -15,6 +15,7 @@ use imagecropper::image_utils::decode_image_bytes;
 use imagecropper::server::{run_server, ServeMode, ServerState};
 
 fn main() -> Result<()> {
+    imagecropper::fs_utils::install_sigint_handler();
     let cli = Cli::parse();
     match cli.command {
         Commands::Crop(args) => run_crop(args),
@@ -178,6 +179,13 @@ fn pregenerate_stream(stream: ScanStream, parallel: usize) {
     let mut done = 0usize;
     let mut scanning = true;
     while scanning || pool.pending_len() > 0 {
+        // Ctrl-C: stop preview generation outright — nothing queued is
+        // worth blocking the exit for.
+        if imagecropper::fs_utils::sigint_received() {
+            pool.cancel();
+            eprintln!("\nCtrl-C: stopped preview generation");
+            break;
+        }
         if scanning {
             match stream.rx.recv_timeout(Duration::from_millis(20)) {
                 Ok(ScanEvent::Found { path, .. }) => {
@@ -217,6 +225,10 @@ fn headless_crop(args: &CropArgs, stream: ScanStream) -> Result<()> {
     let mut saver = imagecropper::app::saver::Saver::new(args.scan.parallel.max(1));
     let mut queued = 0usize;
     for ev in stream.rx {
+        // Ctrl-C: stop queueing new work; saves already in flight finish.
+        if imagecropper::fs_utils::sigint_received() {
+            break;
+        }
         match ev {
             ScanEvent::Found { path: f, .. } => {
                 let Ok(bytes) = std::fs::read(&f) else {

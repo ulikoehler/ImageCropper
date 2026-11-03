@@ -119,4 +119,11 @@ impl PreviewStore {
     pub fn invalidate(&self, path: &PathBuf) {
         self.cache.lock().unwrap().pop(path);
     }
+
+    /// Stop all preview generation (Ctrl-C shutdown): queued jobs are
+    /// dropped and workers retire.
+    pub fn stop(&self) {
+        self.pool.cancel();
+        self.pending.lock().unwrap().clear();
+    }
 }

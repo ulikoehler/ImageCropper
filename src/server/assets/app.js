@@ -304,8 +304,11 @@ function draw(){
     want.forEach((id,i)=>v.setUint32(2+4*i,id,true));
     dataWs.send(frame(CL_WANT,0,b));
   }
+  let delQ=0,movQ=0;
+  for(const k of pendingActions.values()){if(k==="delete")delQ++;else if(k==="move")movQ++}
   topEl.textContent=`${items.length} images · ${thumbs.size} cached · ${selected.size} selected`+
-    `${selected.size?` (${formatSize(selBytes())})`:""}${scanning?" · scanning…":""}`;
+    `${selected.size?` (${formatSize(selBytes())})`:""}${delQ?` · deleting ${delQ}`:""}`+
+    `${movQ?` · moving ${movQ}`:""}${scanning?" · scanning…":""}`;
 }
 
 let dataWs=null;

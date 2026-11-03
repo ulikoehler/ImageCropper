@@ -1,18 +1,10 @@
-use std::{
-    collections::HashSet,
-    path::PathBuf,
-    sync::{
-        mpsc::{self, Receiver, Sender},
-        Arc, Mutex,
-    },
-    thread,
-};
+use std::{collections::HashSet, path::PathBuf};
 
 use anyhow::Result;
 
 use crate::{
     album::thumbnails::remove_previews_for,
-    fs_utils::{move_with_unique_name, prepare_dir, TRASH_DIR},
+    fs_utils::{adaptive_pool::AdaptivePool, move_with_unique_name, prepare_dir, TRASH_DIR},
 };
 
 /// Outcome of one queued deletion: number of bytes that were trashed.
@@ -23,67 +15,46 @@ pub struct DeleteResult {
 
 /// Background queue that moves deleted images to `.imagecropper-trash`
 /// (same semantics as the crop UI) and removes their cached previews.
+///
+/// Worker count is pinned each frame via [`Deleter::set_workers`] to the
+/// preview pool's autotuned concurrency — deletions fan out across the
+/// same storage-optimal parallelism instead of a fixed thread count.
 pub struct Deleter {
-    job_tx: Sender<PathBuf>,
-    result_rx: Receiver<DeleteResult>,
+    pool: AdaptivePool<Result<u64>>,
     pub pending: HashSet<PathBuf>,
 }
 
 impl Deleter {
     pub fn new(concurrency: usize) -> Self {
-        let (job_tx, job_rx) = mpsc::channel::<PathBuf>();
-        let (result_tx, result_rx) = mpsc::channel::<DeleteResult>();
-        let job_rx = Arc::new(Mutex::new(job_rx));
-
-        for _ in 0..concurrency.max(1).min(4) {
-            let job_rx = job_rx.clone();
-            let result_tx = result_tx.clone();
-            thread::spawn(move || loop {
-                let path = {
-                    let Ok(rx) = job_rx.lock() else { break };
-                    match rx.recv() {
-                        Ok(p) => p,
-                        Err(_) => break,
-                    }
-                };
-                if result_tx
-                    .send(DeleteResult {
-                        result: delete_one(&path),
-                        path,
-                    })
-                    .is_err()
-                {
-                    break;
-                }
-            });
-        }
-
         Self {
-            job_tx,
-            result_rx,
+            pool: AdaptivePool::new(1, concurrency.max(1), |path| delete_one(path)),
             pending: HashSet::new(),
         }
     }
 
+    /// Track another pool's live worker count (e.g. the thumbnail pool).
+    pub fn set_workers(&self, n: usize) {
+        self.pool.set_worker_override(n.max(1));
+    }
+
     /// Queue a file for deletion; deduplicates in-flight jobs.
     pub fn queue(&mut self, path: PathBuf) {
-        if self.pending.contains(&path) {
+        if !self.pending.insert(path.clone()) {
             return;
         }
-        self.pending.insert(path.clone());
-        if self.job_tx.send(path).is_err() {
-            self.pending.clear();
-        }
+        self.pool.request(path);
     }
 
     /// Drain finished deletions, updating the pending set.
     pub fn poll(&mut self) -> Vec<DeleteResult> {
-        let mut done = Vec::new();
-        while let Ok(result) = self.result_rx.try_recv() {
-            self.pending.remove(&result.path);
-            done.push(result);
-        }
-        done
+        self.pool
+            .poll()
+            .into_iter()
+            .map(|(path, result)| {
+                self.pending.remove(&path);
+                DeleteResult { path, result }
+            })
+            .collect()
     }
 }
 

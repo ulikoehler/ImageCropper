@@ -159,3 +159,54 @@ fn pool_dedupes_requests() {
     pool.request(p.clone());
     assert_eq!(pool.pending_len(), 1);
 }
+
+#[test]
+fn worker_override_pins_exact_count() {
+    // Delete-style queue: worker count tracks an external pool's count.
+    let pool: AdaptivePool<u32> = AdaptivePool::new(1, 8, |_| 1u32);
+    pool.set_worker_override(4);
+    assert_eq!(pool.workers(), 4, "override must land exactly");
+    // The autotuner stays out of the way even after jobs complete.
+    let paths: Vec<PathBuf> = (0..60).map(|i| PathBuf::from(format!("/p/{i}"))).collect();
+    pool.request_all(paths.iter());
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut got = 0;
+    while got < paths.len() && std::time::Instant::now() < deadline {
+        got += pool.poll().len();
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert_eq!(got, paths.len());
+    assert_eq!(pool.workers(), 4, "pinned count survives epochs");
+}
+
+#[test]
+fn cancel_drops_queued_jobs_and_stops_workers() {
+    // Block jobs behind a barrier so queued work stays queued, then cancel.
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let b = barrier.clone();
+    let pool: AdaptivePool<u32> = AdaptivePool::new(1, 1, move |_| {
+        b.wait();
+        1u32
+    });
+    let paths: Vec<PathBuf> = (0..10).map(|i| PathBuf::from(format!("/c/{i}"))).collect();
+    pool.request_all(paths.iter());
+    // Let the single worker pick up job #0 (blocks on the barrier), the
+    // rest stay queued.
+    std::thread::sleep(Duration::from_millis(50));
+    pool.cancel();
+    assert_eq!(pool.workers(), 0, "cancel retires all workers");
+    assert_eq!(pool.pending_len(), 0, "queued jobs are dropped");
+    // Job #0 may still be parked on the barrier — at most that one
+    // in-flight result can arrive; the 9 queued jobs never run.
+    let deadline = std::time::Instant::now() + Duration::from_millis(300);
+    let mut got = 0;
+    while std::time::Instant::now() < deadline {
+        got += pool.poll().len();
+        if got > 0 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    // At most the one in-flight job completed; the 9 queued were dropped.
+    assert!(got <= 1, "cancel must not run queued jobs, got {got}");
+}

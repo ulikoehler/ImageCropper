@@ -294,11 +294,18 @@ fn format_savings_summary_reports_per_file_min_max() {
 }
 
 #[test]
-fn format_deletion_summary_reports_deleted_bytes() {
-    assert_eq!(format_deletion_summary(0), "Total deleted file size: 0 B");
+fn format_deletion_summary_reports_count_and_bytes() {
     assert_eq!(
-        format_deletion_summary(2048),
-        "Total deleted file size: 2.0 KB"
+        format_deletion_summary(0, 0),
+        "Total deleted: 0 file(s) (0 B)"
+    );
+    assert_eq!(
+        format_deletion_summary(3, 2048),
+        "Total deleted: 3 file(s) (2.0 KB)"
+    );
+    assert_eq!(
+        format_move_summary(2, 512),
+        "Total moved: 2 file(s) (512 B)"
     );
 }
 
@@ -306,9 +313,9 @@ fn format_deletion_summary_reports_deleted_bytes() {
 fn format_overall_summary_combines_both() {
     let mut stats = ConversionStats::default();
     stats.record(4096, 1024);
-    let s = format_overall_summary(&stats, 512);
+    let s = format_overall_summary(&stats, 2, 512);
     assert!(s.contains("Total conversion savings"));
-    assert!(s.contains("Total deleted file size"));
-    let none = format_overall_summary(&ConversionStats::default(), 0);
+    assert!(s.contains("Total deleted: 2 file(s)"));
+    let none = format_overall_summary(&ConversionStats::default(), 0, 0);
     assert_eq!(none, "No operations performed");
 }

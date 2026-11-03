@@ -96,4 +96,13 @@ impl Thumbnailer {
         }
         done
     }
+
+    /// Stop all preview generation (Ctrl-C): queued jobs are dropped,
+    /// workers retire, and no new requests will be processed.
+    pub fn cancel(&mut self) {
+        self.pool.cancel();
+        self.screen_pool.cancel();
+        self.pending.clear();
+        self.pending_screen.clear();
+    }
 }

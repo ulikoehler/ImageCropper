@@ -18,7 +18,9 @@ use eframe::{
 use crate::{
     app::{AppOptions, ImageCropperApp},
     cli::{sort_files, ScanStream, SortOrder},
-    fs_utils::{format_deletion_summary, format_signed_size, format_size, ScanEvent},
+    fs_utils::{
+        format_deletion_summary, format_move_summary, format_signed_size, format_size, ScanEvent,
+    },
 };
 
 use self::{
@@ -620,6 +622,14 @@ impl AlbumApp {
         self.status = format!("Returned from cropping {}", origin.display());
     }
 
+    /// Enter the exit path (Esc / Ctrl-C): stop all preview generation
+    /// immediately; queued deletes/moves keep draining and the window
+    /// closes once they finish — destructive ops win over previews.
+    fn begin_exit(&mut self) {
+        self.thumbnailer.cancel();
+        self.is_exiting = true;
+    }
+
     /// Indices of tiles intersecting `clip` — the visible range is contiguous
     /// because the layout fills rows left-to-right, top-to-bottom.
     fn visible_range(layout: &JustifiedLayout, clip: Rect) -> Range<usize> {
@@ -643,12 +653,34 @@ impl AlbumApp {
         self.drain_scan();
         self.drain_results();
 
+        // Delete/move worker counts track the preview pool's autotuned
+        // concurrency — same storage, same optimal parallelism.
+        let preview_workers = self.thumbnailer.workers();
+        self.deleter.set_workers(preview_workers);
+        if let Some(m) = &self.mover {
+            m.set_workers(preview_workers);
+        }
+        // Keep polling so a Ctrl-C is noticed even on an idle grid.
+        ctx.request_repaint_after(std::time::Duration::from_millis(200));
+        if crate::fs_utils::sigint_received() && !self.is_exiting {
+            self.begin_exit();
+        }
+
         let pending_moves = self.mover.as_ref().map(|m| m.pending.len()).unwrap_or(0);
         let pending_total = self.deleter.pending.len() + pending_moves;
         if self.is_exiting {
             if pending_total == 0 {
                 if !self.summary_printed {
-                    println!("{}", format_deletion_summary(self.total_deleted_bytes));
+                    println!(
+                        "{}",
+                        format_deletion_summary(self.deleted_files, self.total_deleted_bytes)
+                    );
+                    if self.moved_files > 0 {
+                        println!(
+                            "{}",
+                            format_move_summary(self.moved_files, self.total_moved_bytes)
+                        );
+                    }
                     self.summary_printed = true;
                 }
                 ctx.send_viewport_cmd(ViewportCommand::Close);
@@ -690,7 +722,7 @@ impl AlbumApp {
                     self.selected.clear();
                     self.status = "Selection cleared".into();
                 } else {
-                    self.is_exiting = true;
+                    self.begin_exit();
                     return;
                 }
             }

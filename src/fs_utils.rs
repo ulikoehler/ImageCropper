@@ -25,6 +25,22 @@ pub fn verbose() -> bool {
     VERBOSE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+static SIGINT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Install a SIGINT (Ctrl-C) handler that only raises a flag — callers
+/// poll [`sigint_received`] and run their own graceful shutdown (stop
+/// preview generation, preferentially finish queued deletes).
+pub fn install_sigint_handler() {
+    let _ = ctrlc::set_handler(|| {
+        SIGINT.store(true, std::sync::atomic::Ordering::Relaxed);
+    });
+}
+
+/// Whether Ctrl-C has been pressed since startup.
+pub fn sigint_received() -> bool {
+    SIGINT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub const TRASH_DIR: &str = ".imagecropper-trash";
 pub const ORIGINALS_DIR: &str = ".imagecropper-originals";
 pub const TEMP_DIR: &str = ".imagecropper-tmp";
@@ -460,19 +476,36 @@ pub fn format_savings_summary(stats: &ConversionStats) -> String {
     }
 }
 
-/// Format a summary of bytes deleted (i.e. moved to trash).
-pub fn format_deletion_summary(deleted_bytes: u64) -> String {
-    format!("Total deleted file size: {}", format_size(deleted_bytes))
+/// Format a summary of deleted files (i.e. moved to trash): count + bytes.
+pub fn format_deletion_summary(deleted_files: usize, deleted_bytes: u64) -> String {
+    format!(
+        "Total deleted: {} file(s) ({})",
+        deleted_files,
+        format_size(deleted_bytes)
+    )
+}
+
+/// Same for files moved to the `-m/--move` directory.
+pub fn format_move_summary(moved_files: usize, moved_bytes: u64) -> String {
+    format!(
+        "Total moved: {} file(s) ({})",
+        moved_files,
+        format_size(moved_bytes)
+    )
 }
 
 /// Combined summary string suitable for printing at exit.
-pub fn format_overall_summary(stats: &ConversionStats, deleted_bytes: u64) -> String {
+pub fn format_overall_summary(
+    stats: &ConversionStats,
+    deleted_files: usize,
+    deleted_bytes: u64,
+) -> String {
     let mut parts = Vec::new();
     if stats.files > 0 || stats.original_bytes > 0 || stats.new_bytes > 0 {
         parts.push(format_savings_summary(stats));
     }
-    if deleted_bytes > 0 {
-        parts.push(format_deletion_summary(deleted_bytes));
+    if deleted_bytes > 0 || deleted_files > 0 {
+        parts.push(format_deletion_summary(deleted_files, deleted_bytes));
     }
     if parts.is_empty() {
         "No operations performed".to_string()

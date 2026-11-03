@@ -117,12 +117,13 @@ imagecropper album -m ~/keep -r ~/incoming-photos
 *   **Arrow Keys**: Move the focused tile (plain arrows select it, **Shift** extends the selection, **Ctrl** moves without changing the selection).
 *   **Space**: Toggle the focused image's selection.
 *   **Ctrl + A**: Select all images.
-*   **Delete**: Selected tiles vanish immediately; the actual move to `.imagecropper-trash` runs on a background deletion queue.
+*   **Delete**: Selected tiles vanish immediately; the actual move to `.imagecropper-trash` runs on a background deletion queue whose worker count tracks the preview pool's autotuned concurrency (same storage, same optimal parallelism). The top line shows the live queue (`deleting N`, `moving N`).
 *   **m**: Same flow for the `-m/--move` directory — tiles vanish at keypress, the move completes in the background. (No-op with a status hint when `-m` was not given.)
 *   **f (hold)**: Loupe the image under the mouse fullscreen (falls back to the focused image when hovering nothing) using the preloaded ≤1920px preview; release to return to the grid. Moving the mouse while held switches the loupe to the newly hovered tile.
 *   **+ / -**: Fine-grained zoom of the tile size.
 *   **W / w** (Shift+W / w): Grow / shrink the viewer's width — the grid narrows into a centered band, so repeated `w` presses make it less and less wide.
 *   **Esc**: Clear the selection; with no selection, exit.
+*   **Ctrl-C**: Stop all preview generation immediately and exit — queued deletions/moves are preferentially finished first (the window shows the remaining count). On exit the CLI prints `Total deleted: N file(s) (size)` and `Total moved: N file(s) (size)`.
 
 ## Web UI (`--serve` / `-G`)
 

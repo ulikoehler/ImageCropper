@@ -232,19 +232,27 @@ pub struct ActionEnvelope {
 
 /// Background worker executing actions serially (Saver is not Sync).
 /// Jobs carry the client's tag so completions can be correlated.
+/// `in_flight` counts dispatched-but-unfinished actions so shutdown can
+/// preferentially drain destructive ops before exiting.
 pub struct ActionQueue {
     job_tx: Sender<(u32, Action, PathBuf)>,
     result_rx: std::sync::Mutex<Receiver<ActionDone>>,
+    in_flight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl ActionQueue {
     pub fn new(saver_threads: usize, move_dir: Option<PathBuf>) -> Self {
         let (job_tx, job_rx) = mpsc::channel::<(u32, Action, PathBuf)>();
         let (result_tx, result_rx) = mpsc::channel::<ActionDone>();
+        let in_flight = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let worker_in_flight = in_flight.clone();
         thread::spawn(move || {
             let mut saver = Saver::new(saver_threads.max(1));
             // Async saves awaiting completion: (tag, kind, id, src, out).
             let mut pending: Vec<(u32, ActionKind, u32, PathBuf, PathBuf)> = Vec::new();
+            let dec = |in_flight: &std::sync::atomic::AtomicUsize| {
+                in_flight.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            };
             loop {
                 // Drain completed saves → ActionDone with the new sig.
                 for (path, result, _sizes) in saver.check_completions() {
@@ -278,6 +286,7 @@ impl ActionQueue {
                         if result_tx.send(done).is_err() {
                             return;
                         }
+                        dec(&worker_in_flight);
                     }
                 }
                 match job_rx.try_recv() {
@@ -310,6 +319,7 @@ impl ActionQueue {
                                     {
                                         return;
                                     }
+                                    dec(&worker_in_flight);
                                 } else {
                                     // Async save queued — completion arrives
                                     // via check_completions.
@@ -333,6 +343,7 @@ impl ActionQueue {
                                 {
                                     return;
                                 }
+                                dec(&worker_in_flight);
                             }
                         }
                     }
@@ -346,11 +357,24 @@ impl ActionQueue {
         Self {
             job_tx,
             result_rx: std::sync::Mutex::new(result_rx),
+            in_flight,
         }
     }
 
+    /// Actions dispatched but not yet completed — shutdown waits on this.
+    pub fn pending(&self) -> usize {
+        self.in_flight.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     pub fn dispatch(&self, tag: u32, action: Action, path: PathBuf) {
-        let _ = self.job_tx.send((tag, action, path));
+        // Count before the send lands: the worker may finish the job
+        // before dispatch returns.
+        self.in_flight
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if self.job_tx.send((tag, action, path)).is_err() {
+            self.in_flight
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
     }
 
     pub fn poll(&self) -> Vec<ActionDone> {
