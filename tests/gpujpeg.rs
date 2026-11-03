@@ -66,6 +66,44 @@ fn restart_jpeg_decodes_on_gpu() {
 }
 
 #[test]
+fn session_resize_matches_decode() {
+    if !gpujpeg::available() {
+        eprintln!("gpujpeg not compiled in — skipping");
+        return;
+    }
+    let Some(jpg) = cjpeg(
+        &gradient_ppm(320, 240),
+        &["-restart", "4", "-quality", "92"],
+    ) else {
+        eprintln!("cjpeg missing — skipping");
+        return;
+    };
+
+    let Some(s) = gpujpeg::open(&jpg) else {
+        panic!("session open failed");
+    };
+    assert_eq!((s.width, s.height), (320, 240));
+
+    // Identity-size resize packs the decoded words — bit-exact vs the
+    // plain decode path's RGBA (minus the alpha byte).
+    let (rgb, w, h) = s.resize_rgb(320, 240).expect("identity resize");
+    assert_eq!((w, h), (320, 240));
+    let (rgba, _, _) = gpujpeg::decode_rgba(&jpg).expect("gpu decode");
+    for i in 0..320 * 240 {
+        for c in 0..3 {
+            assert_eq!(rgb[i * 3 + c], rgba[i * 4 + c], "px {i} ch {c}");
+        }
+    }
+
+    // A downscale: right dims, plausible pixels (smooth gradient —
+    // every output pixel stays within the input's value range).
+    let (rgb, w, h) = s.resize_rgb(64, 64).expect("downscale");
+    assert_eq!((w, h), (64, 48));
+    assert_eq!(rgb.len(), 64 * 48 * 3);
+    assert!(rgb.iter().any(|&v| v > 200) && rgb.iter().any(|&v| v < 50));
+}
+
+#[test]
 fn dri0_falls_back() {
     let Some(jpg) = cjpeg(&gradient_ppm(64, 64), &["-quality", "90"]) else {
         eprintln!("cjpeg missing — skipping");
@@ -74,6 +112,7 @@ fn dri0_falls_back() {
     if gpujpeg::available() {
         // plain cjpeg output has no restart markers -> CPU path
         assert_eq!(gpujpeg::decode_rgba(&jpg), None);
+        assert!(gpujpeg::open(&jpg).is_none());
     }
 }
 
@@ -81,4 +120,6 @@ fn dri0_falls_back() {
 fn non_jpeg_falls_back() {
     assert_eq!(gpujpeg::decode_rgba(b"not a jpeg at all"), None);
     assert_eq!(gpujpeg::decode_rgba(&[]), None);
+    assert!(gpujpeg::open(b"not a jpeg at all").is_none());
+    assert!(gpujpeg::open(&[]).is_none());
 }

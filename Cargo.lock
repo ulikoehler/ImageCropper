@@ -1816,7 +1816,6 @@ version = "0.4.1"
 dependencies = [
  "anyhow",
  "axum",
- "cc",
  "clap",
  "ctrlc",
  "eframe",
@@ -1829,7 +1828,6 @@ dependencies = [
  "lru",
  "notify",
  "once_cell",
- "pkg-config",
  "rand 0.10.3",
  "regex",
  "serde",

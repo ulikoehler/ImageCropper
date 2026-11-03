@@ -119,9 +119,7 @@ async fn handle(socket: WebSocket, state: Arc<ServerState>) {
         let queue = queue.clone();
         let state = state.clone();
         tokio::spawn(async move {
-            let mut last_resync = state
-                .resync_seq
-                .load(std::sync::atomic::Ordering::Relaxed);
+            let mut last_resync = state.resync_seq.load(std::sync::atomic::Ordering::Relaxed);
             // Produce up to PUMP_WIDTH thumbs concurrently per batch — a
             // serial produce+send loop caps cold-cache delivery at ~20/s.
             const PUMP_WIDTH: usize = 8;
@@ -182,9 +180,7 @@ async fn handle(socket: WebSocket, state: Arc<ServerState>) {
                         id,
                         path,
                         sig,
-                        tokio::task::spawn_blocking(move || {
-                            previews.get_or_produce(&produce_path)
-                        }),
+                        tokio::task::spawn_blocking(move || previews.get_or_produce(&produce_path)),
                     ));
                 }
                 if handles.is_empty() {
@@ -243,10 +239,9 @@ async fn handle(socket: WebSocket, state: Arc<ServerState>) {
                         let (path, sig) = {
                             let m = state.manifest.read().unwrap();
                             match m.path_of(id) {
-                                Some(p) => (
-                                    p,
-                                    m.items.get(id as usize).map(|i| i.sig).unwrap_or(0),
-                                ),
+                                Some(p) => {
+                                    (p, m.items.get(id as usize).map(|i| i.sig).unwrap_or(0))
+                                }
                                 None => continue,
                             }
                         };
@@ -298,9 +293,8 @@ async fn handle(socket: WebSocket, state: Arc<ServerState>) {
                                 "id": id,
                                 "kind": kind,
                             })) {
-                                let _ = ev_tx
-                                    .send(Frame::new(EV_EVENT, 0, json.into_bytes()))
-                                    .await;
+                                let _ =
+                                    ev_tx.send(Frame::new(EV_EVENT, 0, json.into_bytes())).await;
                             }
                             // "Marked for deletion": tombstone queued
                             // delete/move ops immediately so client reloads
@@ -326,9 +320,8 @@ async fn handle(socket: WebSocket, state: Arc<ServerState>) {
                                 "kind": kind,
                                 "error": "item no longer in manifest",
                             })) {
-                                let _ = ev_tx
-                                    .send(Frame::new(EV_EVENT, 0, json.into_bytes()))
-                                    .await;
+                                let _ =
+                                    ev_tx.send(Frame::new(EV_EVENT, 0, json.into_bytes())).await;
                             }
                         }
                     }

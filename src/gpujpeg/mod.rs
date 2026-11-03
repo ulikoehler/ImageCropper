@@ -1,205 +1,145 @@
-//! GPU JPEG decode via the vendored Vulkan compute decoder
-//! (native/gpujpegdec.cpp — ported from VulkanExamples/p80_gpujpegdec,
-//! bit-exact vs libjpeg-turbo).
+//! GPU-accelerated baseline JPEG decode + resize — pure Rust/wgpu.
 //!
-//! Used only for baseline JPEGs WITH restart markers: restart
-//! intervals are what make the GPU entropy decode parallel (~430
-//! MP/s vs ~33 MP/s for libjpeg-turbo). DRI=0 files have a single
-//! serial entropy stream — slower on GPU than zune's CPU decoder,
-//! so those stay on the CPU path.
+//! The decoder (ported from the former C++/Vulkan implementation)
+//! parallelizes over JPEG restart intervals: the scan is decoded on
+//! the GPU once into a full-resolution RGBA buffer kept device-side.
+//! `GpuJpeg::resize_*` then runs the PIL-exact separable resampler and
+//! the RGB/RGBA pack pass on the GPU, so only the small resized image
+//! ever crosses back to the CPU.
 //!
-//! [`GpuJpeg`] sessions additionally keep the decoded image
-//! GPU-resident: preview/thumbnail resizes run the PIL-exact compute
-//! resample straight off the decoded buffer and only the small packed
-//! output round-trips through the host (ported from
-//! VulkanExamples/p81_resize — bit-exact vs Pillow LANCZOS).
-//!
-//! Compiled in only when libvulkan + libshaderc are present
-//! (build.rs probes via pkg-config); otherwise a stub returns
-//! "unsupported" and callers fall back transparently.
+//! `IC_NO_GPUJPEG=1` disables it.
 
-use std::ffi::c_int;
+mod coeffs;
+mod gpu;
+mod jpeg;
+mod shaders;
+
+use crate::image_utils::fit_dims;
+use image::DynamicImage;
+use jpeg::{build_canon, pack_comps, parse_jpg, Jpg};
 use std::sync::Mutex;
 
-#[cfg(gpujpeg)]
-mod ffi {
-    use super::*;
-    extern "C" {
-        pub fn gpujpeg_probe(
-            data: *const u8,
-            len: usize,
-            w: *mut c_int,
-            h: *mut c_int,
-            dri: *mut c_int,
-        ) -> c_int;
-        pub fn gpujpeg_decode(
-            data: *const u8,
-            len: usize,
-            out: *mut u8,
-            require_restart: c_int,
-        ) -> c_int;
-        pub fn gpujpeg_open(
-            data: *const u8,
-            len: usize,
-            require_restart: c_int,
-            w: *mut c_int,
-            h: *mut c_int,
-        ) -> c_int;
-        pub fn gpujpeg_resize(
-            sid: c_int,
-            out_w: c_int,
-            out_h: c_int,
-            n_comp: c_int,
-            filter: c_int,
-            out: *mut u8,
-        ) -> c_int;
-        pub fn gpujpeg_close(sid: c_int);
+/// Serializes GPU work (queue submissions are internally synchronized
+/// in wgpu, but this keeps decode+resize batches atomic and bounds
+/// device memory pressure like the C++ version did).
+pub static GPU_LOCK: Mutex<()> = Mutex::new(());
+
+const FILTER_LANCZOS: i32 = coeffs::LANCZOS;
+
+#[inline]
+fn disabled() -> bool {
+    static D: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *D.get_or_init(|| std::env::var("IC_NO_GPUJPEG").is_ok())
+}
+
+/// wgpu device + pipelines are usable (adapter found, push constants
+/// supported, WGSL compiled). Lazily initializes on first call.
+pub fn available() -> bool {
+    !disabled() && gpu::ctx().is_some()
+}
+
+/// Returns (width, height, dri) if bytes parse as a baseline JPEG we can
+/// handle, else None. Pure CPU — never touches the GPU.
+pub fn probe(bytes: &[u8]) -> Option<(u32, u32, u32)> {
+    let mut j = Jpg::new(bytes);
+    if !parse_jpg(&mut j) {
+        return None;
+    }
+    Some((j.w as u32, j.h as u32, j.dri as u32))
+}
+
+fn canon(j: &mut Jpg<'_>) {
+    for i in 0..4 {
+        build_canon(&mut j.dctab[i]);
+        build_canon(&mut j.actab[i]);
     }
 }
 
-/// One Vulkan device + one pipeline set shared process-wide; decodes
-/// are serialized — the single GPU queue serializes anyway.
-static GPU_LOCK: Mutex<()> = Mutex::new(());
-
-/// Whether the native decoder was compiled in (vulkan+shaderc found).
-pub fn available() -> bool {
-    cfg!(gpujpeg)
-}
-
-fn disabled() -> bool {
-    std::env::var_os("IC_NO_GPUJPEG").is_some()
-}
-
-/// Probe JPEG headers (pure CPU parse — never touches Vulkan).
-/// Returns (w, h, dri) for decodable baseline JPEGs.
-#[cfg(gpujpeg)]
-pub fn probe(bytes: &[u8]) -> Option<(u32, u32, u32)> {
-    let (mut w, mut h, mut dri) = (0 as c_int, 0 as c_int, 0 as c_int);
-    let rc = unsafe { ffi::gpujpeg_probe(bytes.as_ptr(), bytes.len(), &mut w, &mut h, &mut dri) };
-    (rc == 0 && w > 0 && h > 0).then(|| (w as u32, h as u32, dri as u32))
-}
-
-/// GPU-decode a JPEG to RGBA. `Some` only for baseline JPEGs with
-/// restart markers when the native decoder is compiled in; every
-/// other input returns None (caller falls back to the CPU path).
-pub fn decode_rgba(bytes: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
+fn open_locked(bytes: &[u8]) -> Option<(GpuJpeg, &'static gpu::GpuCtx)> {
     if disabled() {
         return None;
     }
-    #[cfg(gpujpeg)]
-    {
-        let (w, h, dri) = probe(bytes)?;
-        if dri == 0 {
-            return None; // serial entropy stream — CPU decoder is faster
-        }
-        let mut out = vec![0u8; w as usize * h as usize * 4];
-        let _guard = GPU_LOCK.lock().ok()?;
-        let rc = unsafe { ffi::gpujpeg_decode(bytes.as_ptr(), bytes.len(), out.as_mut_ptr(), 1) };
-        (rc == 0).then(|| (out, w, h))
+    let (w, h, dri) = probe(bytes)?;
+    if dri == 0 {
+        return None; // serial entropy stream — zune wins on CPU
     }
-    #[cfg(not(gpujpeg))]
-    {
-        let _ = bytes;
-        None
+    let ctx = gpu::ctx()?;
+    let mut j = Jpg::new(bytes);
+    if !parse_jpg(&mut j) {
+        return None;
     }
+    canon(&mut j);
+    let fg = pack_comps(&j);
+    let px = ctx.decode_into(&j, &fg);
+    Some((
+        GpuJpeg {
+            px,
+            width: w,
+            height: h,
+        },
+        ctx,
+    ))
 }
 
-/// gpujpeg_resize filter id — lanczos matches the quality tier
-/// fast_image_resize's default Lanczos3 provides on the CPU path.
-const FILTER_LANCZOS: c_int = 5;
+/// Full decode -> RGBA (0xAABBGGRR word order, little-endian
+/// R,G,B,0xFF per pixel). Falls back to None on anything unsupported.
+pub fn decode_rgba(bytes: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
+    let _guard = GPU_LOCK.lock().ok()?;
+    let (sj, ctx) = open_locked(bytes)?;
+    let size = u64::from(sj.width) * u64::from(sj.height) * 4;
+    let rgba = ctx.read_buf(&sj.px, size);
+    Some((rgba, sj.width, sj.height))
+}
 
-/// A GPU-resident decoded JPEG: the full-resolution RGBA stays in a
-/// GPU buffer and each `resize_*` produces only the small packed
-/// output — the full-res pixels never round-trip through the host.
+/// GPU-resident decoded JPEG. Dropping frees the device buffer.
 pub struct GpuJpeg {
-    sid: c_int,
+    px: wgpu::Buffer,
     pub width: u32,
     pub height: u32,
 }
 
-/// Open a decode session: decode on the GPU and keep the result
-/// GPU-resident for follow-on resizes. `Some` under the same
-/// conditions as [`decode_rgba`] (baseline + restart markers).
+/// Open a baseline JPEG into a GPU-resident RGBA buffer. Returns None
+/// for unsupported JPEGs (progressive, non-8-bit, DRI=0) or when no
+/// suitable GPU adapter exists.
 pub fn open(bytes: &[u8]) -> Option<GpuJpeg> {
-    if disabled() {
-        return None;
-    }
-    #[cfg(gpujpeg)]
-    {
-        let _guard = GPU_LOCK.lock().ok()?;
-        let (mut w, mut h) = (0 as c_int, 0 as c_int);
-        let sid = unsafe {
-            ffi::gpujpeg_open(bytes.as_ptr(), bytes.len(), 1, &mut w, &mut h)
-        };
-        (sid > 0 && w > 0 && h > 0)
-            .then(|| GpuJpeg { sid, width: w as u32, height: h as u32 })
-    }
-    #[cfg(not(gpujpeg))]
-    {
-        let _ = bytes;
-        None
-    }
+    let _guard = GPU_LOCK.lock().ok()?;
+    open_locked(bytes).map(|(j, _)| j)
 }
 
 impl GpuJpeg {
-    /// GPU-resize to fit `max_w`x`max_h` (aspect preserved — same
-    /// target dims as `image_utils::resize_to_fit`), returning packed
-    /// RGB8 ready for JPEG encoding.
+    fn resize_packed(&self, max_w: u32, max_h: u32, n_comp: u32) -> Option<(Vec<u8>, u32, u32)> {
+        let (ow, oh) = fit_dims(self.width, self.height, max_w, max_h);
+        let ctx = gpu::ctx()?;
+        let _guard = GPU_LOCK.lock().ok()?;
+        let out = ctx.resize_pack(
+            &self.px,
+            self.width,
+            self.height,
+            ow,
+            oh,
+            n_comp,
+            FILTER_LANCZOS,
+        )?;
+        Some((out, ow, oh))
+    }
+
+    /// Resize-to-fit on GPU, returning packed RGB bytes.
     pub fn resize_rgb(&self, max_w: u32, max_h: u32) -> Option<(Vec<u8>, u32, u32)> {
         self.resize_packed(max_w, max_h, 3)
     }
 
-    /// [`resize_rgb`] as a `DynamicImage::ImageRgb8`.
-    pub fn resize_image(&self, max_w: u32, max_h: u32) -> Option<image::DynamicImage> {
-        let (rgb, w, h) = self.resize_rgb(max_w, max_h)?;
-        image::RgbImage::from_raw(w, h, rgb).map(image::DynamicImage::ImageRgb8)
-    }
-
-    /// GPU-resize like [`resize_rgb`] but returning RGBA8 — for callers
-    /// feeding RGBA consumers (e.g. texture upload) directly.
+    /// Resize-to-fit on GPU, returning packed RGBA bytes.
     pub fn resize_rgba(&self, max_w: u32, max_h: u32) -> Option<(Vec<u8>, u32, u32)> {
         self.resize_packed(max_w, max_h, 4)
     }
 
-    /// [`resize_rgba`] as a `DynamicImage::ImageRgba8`.
-    pub fn resize_image_rgba(&self, max_w: u32, max_h: u32) -> Option<image::DynamicImage> {
-        let (rgba, w, h) = self.resize_rgba(max_w, max_h)?;
-        image::RgbaImage::from_raw(w, h, rgba).map(image::DynamicImage::ImageRgba8)
+    pub fn resize_image(&self, max_w: u32, max_h: u32) -> Option<DynamicImage> {
+        let (rgb, ow, oh) = self.resize_rgb(max_w, max_h)?;
+        image::RgbImage::from_raw(ow, oh, rgb).map(DynamicImage::ImageRgb8)
     }
 
-    fn resize_packed(&self, max_w: u32, max_h: u32, n_comp: c_int) -> Option<(Vec<u8>, u32, u32)> {
-        #[cfg(gpujpeg)]
-        {
-            let (out_w, out_h) =
-                crate::image_utils::fit_dims(self.width, self.height, max_w, max_h);
-            let mut out = vec![0u8; out_w as usize * out_h as usize * n_comp as usize];
-            let _guard = GPU_LOCK.lock().ok()?;
-            let rc = unsafe {
-                ffi::gpujpeg_resize(
-                    self.sid,
-                    out_w as c_int,
-                    out_h as c_int,
-                    n_comp,
-                    FILTER_LANCZOS,
-                    out.as_mut_ptr(),
-                )
-            };
-            return (rc == 0).then(|| (out, out_w, out_h));
-        }
-        #[cfg(not(gpujpeg))]
-        {
-            let _ = (max_w, max_h, n_comp);
-            None
-        }
-    }
-}
-
-impl Drop for GpuJpeg {
-    fn drop(&mut self) {
-        #[cfg(gpujpeg)]
-        {
-            let _guard = GPU_LOCK.lock().ok();
-            unsafe { ffi::gpujpeg_close(self.sid) }
-        }
+    pub fn resize_image_rgba(&self, max_w: u32, max_h: u32) -> Option<DynamicImage> {
+        let (rgba, ow, oh) = self.resize_rgba(max_w, max_h)?;
+        image::RgbaImage::from_raw(ow, oh, rgba).map(DynamicImage::ImageRgba8)
     }
 }

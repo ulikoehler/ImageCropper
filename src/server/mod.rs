@@ -486,9 +486,7 @@ impl ServerState {
                 // recomputed when the manifest changed; missing pinned
                 // previews are re-queued periodically so the set converges
                 // (a failed/evicted preview must not leave a hole).
-                if state
-                    .pins_dirty
-                    .load(std::sync::atomic::Ordering::Relaxed)
+                if state.pins_dirty.load(std::sync::atomic::Ordering::Relaxed)
                     && last_pin.elapsed() >= std::time::Duration::from_millis(250)
                 {
                     state.refresh_pins();
@@ -500,58 +498,58 @@ impl ServerState {
                     }
                     last_fill = std::time::Instant::now();
                 }
-            // Preview completions → per-path ready events.
-            for (path, preview) in state.previews.poll() {
-                if let Some(id) = state.position_of(&path) {
-                    let dims = preview
-                        .as_ref()
-                        .map(|p| format!(",\"w\":{},\"h\":{}", p.w, p.h))
-                        .unwrap_or_default();
-                    let _ = state.events.send(ServerEvent::Json(format!(
-                        "{{\"ev\":\"thumb-ready\",\"id\":{id}{dims}}}"
-                    )));
+                // Preview completions → per-path ready events.
+                for (path, preview) in state.previews.poll() {
+                    if let Some(id) = state.position_of(&path) {
+                        let dims = preview
+                            .as_ref()
+                            .map(|p| format!(",\"w\":{},\"h\":{}", p.w, p.h))
+                            .unwrap_or_default();
+                        let _ = state.events.send(ServerEvent::Json(format!(
+                            "{{\"ev\":\"thumb-ready\",\"id\":{id}{dims}}}"
+                        )));
+                    }
                 }
-            }
-            // Action completions → differential manifest updates + events.
-            for done in state.actions.poll() {
-                use crate::server::actions::ActionKind;
-                match (done.ok, done.kind) {
-                    // Path-based: ids may have been reassigned by a rescan
-                    // while the action was in flight — done.src is stable.
-                    (true, ActionKind::Delete | ActionKind::Move) => {
-                        state.remove_path(&done.src);
-                    }
-                    // Undo the eager tombstone: the file never left.
-                    (false, ActionKind::Delete | ActionKind::Move) => {
-                        state.restore_path(&done.src);
-                    }
-                    (true, ActionKind::Crop | ActionKind::Resave) => {
-                        if let Some(new_path) = &done.new_path {
-                            if new_path != &done.src {
-                                state.remove_path(&done.src);
-                            }
-                            state.upsert_files(vec![(new_path.clone(), None)]);
+                // Action completions → differential manifest updates + events.
+                for done in state.actions.poll() {
+                    use crate::server::actions::ActionKind;
+                    match (done.ok, done.kind) {
+                        // Path-based: ids may have been reassigned by a rescan
+                        // while the action was in flight — done.src is stable.
+                        (true, ActionKind::Delete | ActionKind::Move) => {
+                            state.remove_path(&done.src);
                         }
+                        // Undo the eager tombstone: the file never left.
+                        (false, ActionKind::Delete | ActionKind::Move) => {
+                            state.restore_path(&done.src);
+                        }
+                        (true, ActionKind::Crop | ActionKind::Resave) => {
+                            if let Some(new_path) = &done.new_path {
+                                if new_path != &done.src {
+                                    state.remove_path(&done.src);
+                                }
+                                state.upsert_files(vec![(new_path.clone(), None)]);
+                            }
+                        }
+                        (false, _) => {}
                     }
-                    (false, _) => {}
+                    if crate::fs_utils::verbose() {
+                        eprintln!(
+                            "action {:?} id={} ok={} err={:?}",
+                            done.kind, done.id, done.ok, done.error
+                        );
+                    }
+                    if let Ok(json) = serde_json::to_string(&serde_json::json!({
+                        "ev": "action-done",
+                        "tag": done.tag,
+                        "ok": done.ok,
+                        "error": done.error,
+                        "new_sig": done.new_sig,
+                        "bytes": done.bytes,
+                    })) {
+                        let _ = state.events.send(ServerEvent::Json(json));
+                    }
                 }
-                if crate::fs_utils::verbose() {
-                    eprintln!(
-                        "action {:?} id={} ok={} err={:?}",
-                        done.kind, done.id, done.ok, done.error
-                    );
-                }
-                if let Ok(json) = serde_json::to_string(&serde_json::json!({
-                    "ev": "action-done",
-                    "tag": done.tag,
-                    "ok": done.ok,
-                    "error": done.error,
-                    "new_sig": done.new_sig,
-                    "bytes": done.bytes,
-                })) {
-                    let _ = state.events.send(ServerEvent::Json(json));
-                }
-            }
                 std::thread::sleep(std::time::Duration::from_millis(20));
             }
         });
@@ -573,15 +571,14 @@ impl ServerState {
         // every image header, which matters a lot on slow/remote mounts.
         let (version, prior) = {
             let m = self.manifest.read().unwrap();
-            let prior: std::collections::HashMap<PathBuf, (u32, u32, u64, u64)> = (0..m
-                .items
-                .len())
-                .filter_map(|i| {
-                    let it = &m.items[i];
-                    m.path_of(i as u32)
-                        .map(|p| (p, (it.w, it.h, it.bytes, it.sig)))
-                })
-                .collect();
+            let prior: std::collections::HashMap<PathBuf, (u32, u32, u64, u64)> =
+                (0..m.items.len())
+                    .filter_map(|i| {
+                        let it = &m.items[i];
+                        m.path_of(i as u32)
+                            .map(|p| (p, (it.w, it.h, it.bytes, it.sig)))
+                    })
+                    .collect();
             (m.version + 1, prior)
         };
         let sniff = move |path: &Path| {

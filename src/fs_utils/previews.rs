@@ -399,11 +399,7 @@ pub fn produce_preview_bytes(
             drop(bytes);
             let (w, h) = (image.width(), image.height());
             ensure_screen_preview(path, Some(&image), Some((len, nanos)));
-            (
-                resize_to_fit(image, THUMB_MAX_DIM, THUMB_MAX_DIM),
-                w,
-                h,
-            )
+            (resize_to_fit(image, THUMB_MAX_DIM, THUMB_MAX_DIM), w, h)
         }
     };
 
