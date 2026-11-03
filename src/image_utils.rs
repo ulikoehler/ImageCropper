@@ -63,6 +63,15 @@ pub struct SaveStatus {
 /// Decode image bytes, using the fast zune-jpeg decoder for JPEG files
 /// (with fallback to the standard loader for incomplete/failed JPEGs).
 pub fn decode_image_bytes(path: &Path, bytes: &[u8]) -> image::ImageResult<DynamicImage> {
+    decode_image_bytes_tagged(path, bytes).0
+}
+
+/// Like [`decode_image_bytes`], also reporting which engine decoded:
+/// `"gpu"` for the wgpu restart-interval JPEG path, `"cpu"` otherwise.
+pub fn decode_image_bytes_tagged(
+    path: &Path,
+    bytes: &[u8],
+) -> (image::ImageResult<DynamicImage>, &'static str) {
     let is_jpeg = path
         .extension()
         .and_then(|e| e.to_str())
@@ -75,7 +84,7 @@ pub fn decode_image_bytes(path: &Path, bytes: &[u8]) -> image::ImageResult<Dynam
         // through to the CPU decoder transparently.
         if let Some((rgba, w, h)) = crate::gpujpeg::decode_rgba(bytes) {
             if let Some(img) = image::RgbaImage::from_raw(w, h, rgba) {
-                return Ok(image::DynamicImage::ImageRgba8(img));
+                return (Ok(image::DynamicImage::ImageRgba8(img)), "gpu");
             }
         }
         // Allow incomplete JPEGs to still be rendered
@@ -84,7 +93,7 @@ pub fn decode_image_bytes(path: &Path, bytes: &[u8]) -> image::ImageResult<Dynam
         let mut decoder = JpegDecoder::new(Cursor::new(bytes));
         decoder.set_options(options);
 
-        match decoder.decode() {
+        let res = match decoder.decode() {
             Ok(pixels) => {
                 let info = decoder.info().unwrap();
                 image::RgbImage::from_raw(info.width as u32, info.height as u32, pixels)
@@ -97,9 +106,10 @@ pub fn decode_image_bytes(path: &Path, bytes: &[u8]) -> image::ImageResult<Dynam
                     })
             }
             Err(_e) => image::load_from_memory(bytes),
-        }
+        };
+        (res, "cpu")
     } else {
-        image::load_from_memory(bytes)
+        (image::load_from_memory(bytes), "cpu")
     }
 }
 

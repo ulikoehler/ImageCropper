@@ -15,7 +15,7 @@ use image::DynamicImage;
 
 use crate::{
     fs_utils::{prepare_dir, sigint_received, verbose, PREVIEWS_DIR},
-    image_utils::{decode_image_bytes, resize_to_fit},
+    image_utils::{decode_image_bytes, decode_image_bytes_tagged, resize_to_fit},
 };
 
 /// Maximum dimension of generated previews (pixels).
@@ -138,7 +138,7 @@ pub fn produce_screen_image(source: &Path) -> Option<DynamicImage> {
 
 /// JPEG-encode the resized `screen` image, prune stale signature
 /// variants in the per-source cache dir, and write it to `expected`.
-fn persist_screen_jpeg(source: &Path, expected: &Path, screen: &DynamicImage) {
+fn persist_screen_jpeg(source: &Path, expected: &Path, screen: &DynamicImage, engine: &str) {
     let mut jpeg = Vec::new();
     {
         let writer = std::io::BufWriter::new(std::io::Cursor::new(&mut jpeg));
@@ -162,7 +162,7 @@ fn persist_screen_jpeg(source: &Path, expected: &Path, screen: &DynamicImage) {
         }
     }
     if std::fs::write(expected, &jpeg).is_ok() && verbose() {
-        eprintln!("screen preview generated: {}", source.display());
+        eprintln!("screen preview generated [{engine}]: {}", source.display());
     }
 }
 
@@ -182,7 +182,7 @@ fn ensure_screen_preview_gpu(
         return;
     }
     if let Some(screen) = session.resize_image(SCREEN_MAX_DIM, SCREEN_MAX_DIM) {
-        persist_screen_jpeg(source, &expected, &screen);
+        persist_screen_jpeg(source, &expected, &screen, "gpu");
     }
 }
 
@@ -199,7 +199,7 @@ fn ensure_screen_preview(source: &Path, decoded: Option<&DynamicImage>, sig: Opt
     }
     if let Some(img) = decoded {
         let screen = resize_to_fit(img.clone(), SCREEN_MAX_DIM, SCREEN_MAX_DIM);
-        persist_screen_jpeg(source, &expected, &screen);
+        persist_screen_jpeg(source, &expected, &screen, "cpu");
         return;
     }
     let Some(bytes) = std::fs::read(source).ok() else {
@@ -209,7 +209,7 @@ fn ensure_screen_preview(source: &Path, decoded: Option<&DynamicImage>, sig: Opt
     // never materializes on the host.
     if let Some(session) = crate::gpujpeg::open(&bytes) {
         if let Some(screen) = session.resize_image(SCREEN_MAX_DIM, SCREEN_MAX_DIM) {
-            persist_screen_jpeg(source, &expected, &screen);
+            persist_screen_jpeg(source, &expected, &screen, "gpu");
             return;
         }
     }
@@ -217,7 +217,7 @@ fn ensure_screen_preview(source: &Path, decoded: Option<&DynamicImage>, sig: Opt
         return;
     };
     let screen = resize_to_fit(img, SCREEN_MAX_DIM, SCREEN_MAX_DIM);
-    persist_screen_jpeg(source, &expected, &screen);
+    persist_screen_jpeg(source, &expected, &screen, "cpu");
 }
 
 /// Remove stale previews of `source` inside `dir`, keeping `expected_name`.
@@ -319,10 +319,11 @@ pub fn produce_preview_image(path: &Path) -> Option<DynamicImage> {
 
     // Fast path: the deterministic path exists → read it straight away.
     if let Ok(bytes) = std::fs::read(&expected) {
-        if let Ok(img) = decode_image_bytes(&expected, &bytes) {
+        let (decoded, engine) = decode_image_bytes_tagged(&expected, &bytes);
+        if let Ok(img) = decoded {
             ensure_screen_preview(path, None, Some((len, nanos)));
             if verbose() {
-                eprintln!("preview cache hit: {}", path.display());
+                eprintln!("preview cache hit [{engine}]: {}", path.display());
             }
             return Some(img);
         }
@@ -334,21 +335,21 @@ pub fn produce_preview_image(path: &Path) -> Option<DynamicImage> {
     // JPEGs go entirely through the GPU session — decode + both resizes
     // run on the GPU and the full-res image never reaches the host.
     let bytes = std::fs::read(path).ok()?;
-    let thumb = match crate::gpujpeg::open(&bytes) {
+    let (thumb, engine) = match crate::gpujpeg::open(&bytes) {
         Some(session) => {
             ensure_screen_preview_gpu(path, &session, Some((len, nanos)));
-            session.resize_image(THUMB_MAX_DIM, THUMB_MAX_DIM)?
+            (session.resize_image(THUMB_MAX_DIM, THUMB_MAX_DIM)?, "gpu")
         }
         None => {
             let image = decode_image_bytes(path, &bytes).ok()?;
             drop(bytes);
             ensure_screen_preview(path, Some(&image), Some((len, nanos)));
-            resize_to_fit(image, THUMB_MAX_DIM, THUMB_MAX_DIM)
+            (resize_to_fit(image, THUMB_MAX_DIM, THUMB_MAX_DIM), "cpu")
         }
     };
     persist_preview(path, &expected_name, &thumb);
     if verbose() {
-        eprintln!("preview generated: {}", path.display());
+        eprintln!("preview generated [{engine}]: {}", path.display());
     }
     Some(thumb)
 }
@@ -379,27 +380,27 @@ pub fn produce_preview_bytes(
             .or_else(|| image::image_dimensions(path).ok())
             .unwrap_or((0, 0));
         if verbose() {
-            eprintln!("preview cache hit: {}", path.display());
+            eprintln!("preview cache hit [disk]: {}", path.display());
         }
         return Some((bytes, dims.0, dims.1));
     }
 
     let bytes = std::fs::read(path).ok()?;
-    let (thumb, w, h) = match crate::gpujpeg::open(&bytes) {
+    let (thumb, w, h, engine) = match crate::gpujpeg::open(&bytes) {
         Some(session) => {
             let (w, h) = (session.width, session.height);
             ensure_screen_preview_gpu(path, &session, Some((len, nanos)));
             let Some(t) = session.resize_image(THUMB_MAX_DIM, THUMB_MAX_DIM) else {
                 return None;
             };
-            (t, w, h)
+            (t, w, h, "gpu")
         }
         None => {
             let image = decode_image_bytes(path, &bytes).ok()?;
             drop(bytes);
             let (w, h) = (image.width(), image.height());
             ensure_screen_preview(path, Some(&image), Some((len, nanos)));
-            (resize_to_fit(image, THUMB_MAX_DIM, THUMB_MAX_DIM), w, h)
+            (resize_to_fit(image, THUMB_MAX_DIM, THUMB_MAX_DIM), w, h, "cpu")
         }
     };
 
@@ -412,7 +413,7 @@ pub fn produce_preview_bytes(
     }
     persist_preview_bytes(path, &expected_name, &jpeg);
     if verbose() {
-        eprintln!("preview generated: {}", path.display());
+        eprintln!("preview generated [{engine}]: {}", path.display());
     }
     Some((jpeg, w, h))
 }

@@ -153,13 +153,16 @@ fn produce_full(path: &std::path::Path, fmt: u8, quality: u8) -> Option<(Vec<u8>
             let bytes = std::fs::read(path).ok()?;
             // Restart-marker JPEGs: GPU decode + resize in one session —
             // the full-res image never reaches the host.
-            let img = match crate::gpujpeg::open(&bytes) {
-                Some(session) => session.resize_image(FULL_MAX_DIM, FULL_MAX_DIM)?,
+            let (img, engine) = match crate::gpujpeg::open(&bytes) {
+                Some(session) => (session.resize_image(FULL_MAX_DIM, FULL_MAX_DIM)?, "gpu"),
                 None => {
                     let img = decode_image_bytes(path, &bytes).ok()?;
-                    resize_to_fit(img, FULL_MAX_DIM, FULL_MAX_DIM)
+                    (resize_to_fit(img, FULL_MAX_DIM, FULL_MAX_DIM), "cpu")
                 }
             };
+            if crate::fs_utils::verbose() {
+                eprintln!("full preview [{engine}]: {}", path.display());
+            }
             let (w, h) = (img.width(), img.height());
             let mut out = Vec::new();
             let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(

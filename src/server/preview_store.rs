@@ -232,6 +232,10 @@ impl PreviewStore {
     /// background sweep to reach it).
     pub fn get_or_produce(&self, path: &PathBuf) -> Option<Preview> {
         if let Some(p) = self.cached(path) {
+            if crate::fs_utils::verbose() {
+                let kind = if self.is_pinned(path) { "ram" } else { "ram-lru" };
+                eprintln!("preview hit [{kind}]: {}", path.display());
+            }
             return Some(p);
         }
         if self.stopped() {
