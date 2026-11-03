@@ -79,9 +79,9 @@ pub fn decode_image_bytes_tagged(
         .unwrap_or(false);
 
     if is_jpeg {
-        // GPU decode: baseline JPEGs with restart markers only — the
-        // GPU wins big there (~10x libjpeg); DRI=0/unsupported fall
-        // through to the CPU decoder transparently.
+        // GPU decode: baseline + progressive, restart markers or not
+        // (DRI=0 gets virtual intervals via the survey pass) —
+        // ~10x libjpeg; unsupported inputs fall through to zune.
         if let Some((rgba, w, h)) = crate::gpujpeg::decode_rgba(bytes) {
             if let Some(img) = image::RgbaImage::from_raw(w, h, rgba) {
                 return (Ok(image::DynamicImage::ImageRgba8(img)), "gpu");
