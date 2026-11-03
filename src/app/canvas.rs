@@ -179,7 +179,7 @@ impl Canvas {
                 painter.rect_filled(handle_rect, 2.0, handle_color);
                 let response = ui.interact(
                     handle_rect,
-                    ui.id().with(handle.id_suffix()).with(i),
+                    ui.scope_id().with(handle.id_suffix()).with(i),
                     egui::Sense::click_and_drag(),
                 );
                 if response.drag_started() {

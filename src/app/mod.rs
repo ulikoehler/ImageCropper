@@ -937,7 +937,7 @@ impl App for ImageCropperApp {
 
                     let image_response = ui.interact(
                         response.rect,
-                        ui.id().with("image_drag_area"),
+                        ui.scope_id().with("image_drag_area"),
                         egui::Sense::click_and_drag(),
                     );
                     self.canvas.handle_pointer(&image_response, &metrics, self.image_size, ctx);

@@ -664,7 +664,7 @@ impl AlbumApp {
 
                         let tile_response = ui.interact(
                             rect,
-                            ui.id().with("tile").with(i),
+                            ui.scope_id().with("tile").with(i),
                             egui::Sense::click_and_drag(),
                         );
                         if tile_response.clicked() {
