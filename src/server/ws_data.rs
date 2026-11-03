@@ -86,11 +86,7 @@ async fn handle(socket: WebSocket, state: Arc<ServerState>) {
                     // can't leave it permanently inconsistent.
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                         if out_tx
-                            .send(Frame::new(
-                                EV_EVENT,
-                                0,
-                                b"{\"ev\":\"fs-changed\"}".to_vec(),
-                            ))
+                            .send(Frame::new(EV_EVENT, 0, b"{\"ev\":\"fs-changed\"}".to_vec()))
                             .await
                             .is_err()
                         {

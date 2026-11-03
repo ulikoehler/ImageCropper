@@ -3,7 +3,10 @@
 //! itself in an infinite loop.
 
 use imagecropper::server::watch::event_affects_listing;
-use notify::event::{AccessKind, AccessMode, CreateKind, DataChange, EventKind, MetadataKind, ModifyKind, RemoveKind, RenameMode};
+use notify::event::{
+    AccessKind, AccessMode, CreateKind, DataChange, EventKind, MetadataKind, ModifyKind,
+    RemoveKind, RenameMode,
+};
 
 #[test]
 fn read_side_access_events_are_ignored() {

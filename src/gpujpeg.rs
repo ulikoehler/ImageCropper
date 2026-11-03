@@ -53,9 +53,7 @@ fn disabled() -> bool {
 #[cfg(gpujpeg)]
 pub fn probe(bytes: &[u8]) -> Option<(u32, u32, u32)> {
     let (mut w, mut h, mut dri) = (0 as c_int, 0 as c_int, 0 as c_int);
-    let rc = unsafe {
-        ffi::gpujpeg_probe(bytes.as_ptr(), bytes.len(), &mut w, &mut h, &mut dri)
-    };
+    let rc = unsafe { ffi::gpujpeg_probe(bytes.as_ptr(), bytes.len(), &mut w, &mut h, &mut dri) };
     (rc == 0 && w > 0 && h > 0).then(|| (w as u32, h as u32, dri as u32))
 }
 
@@ -74,9 +72,7 @@ pub fn decode_rgba(bytes: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
         }
         let mut out = vec![0u8; w as usize * h as usize * 4];
         let _guard = GPU_LOCK.lock().ok()?;
-        let rc = unsafe {
-            ffi::gpujpeg_decode(bytes.as_ptr(), bytes.len(), out.as_mut_ptr(), 1)
-        };
+        let rc = unsafe { ffi::gpujpeg_decode(bytes.as_ptr(), bytes.len(), out.as_mut_ptr(), 1) };
         (rc == 0).then(|| (out, w, h))
     }
     #[cfg(not(gpujpeg))]

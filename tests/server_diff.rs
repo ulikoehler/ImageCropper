@@ -102,9 +102,11 @@ fn marked_for_deletion_stays_out_of_rebuilds_and_upserts() {
 
     // Dispatch a delete and eagerly tombstone it, as the /data handler does.
     let sig = imagecropper::fs_utils::previews::preview_sig_u64(&path_a).unwrap();
-    state
-        .actions
-        .dispatch(1, imagecropper::server::Action::Delete { id: 0, sig }, path_a.clone());
+    state.actions.dispatch(
+        1,
+        imagecropper::server::Action::Delete { id: 0, sig },
+        path_a.clone(),
+    );
     state.remove_path(&path_a);
 
     assert!(state.actions.is_pending(&path_a));

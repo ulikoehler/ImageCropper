@@ -23,15 +23,15 @@ fn gradient_ppm(w: usize, h: usize) -> Vec<u8> {
 fn cjpeg(ppm: &[u8], args: &[&str]) -> Option<Vec<u8>> {
     let mut ch = Command::new("cjpeg")
         .args(args)
-        .arg("-outfile").arg("/dev/stdout")
+        .arg("-outfile")
+        .arg("/dev/stdout")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
         .ok()?;
     ch.stdin.as_mut()?.write_all(ppm).ok()?;
     let out = ch.wait_with_output().ok()?;
-    (out.status.success() && out.stdout.starts_with(&[0xFF, 0xD8]))
-        .then_some(out.stdout)
+    (out.status.success() && out.stdout.starts_with(&[0xFF, 0xD8])).then_some(out.stdout)
 }
 
 #[test]
