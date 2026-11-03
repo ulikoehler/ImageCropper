@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use notify::{RecursiveMode, Watcher};
 
-use super::{ServerEvent, ServerState};
+use super::ServerState;
 use crate::cli::{collect_sorted_files, ScanArgs};
 
 const DEBOUNCE: Duration = Duration::from_millis(250);
@@ -45,9 +45,8 @@ pub fn spawn(state: Arc<ServerState>, scan: ScanArgs) -> Option<notify::Recommen
             while rx.recv_timeout(DEBOUNCE).is_ok() {}
             if let Ok(files) = collect_sorted_files(&scan) {
                 state.rebuild_manifest(files, &roots);
-                let _ = state
-                    .events
-                    .send(ServerEvent::Json("{\"ev\":\"fs-changed\"}".to_string()));
+                // Full resync patch — ids were reassigned wholesale.
+                state.broadcast_resync();
             }
         }
     });

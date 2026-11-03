@@ -73,6 +73,12 @@ impl PushQueue {
         }
     }
 
+    /// Update the total id space — a streaming scan appends ids, so the
+    /// sweep picks up newly discovered items.
+    pub fn set_count(&mut self, count: usize) {
+        self.count = count;
+    }
+
     pub fn add_credit(&mut self, bytes: u64) {
         self.credit = self.credit.saturating_add(bytes);
     }

@@ -13,12 +13,15 @@ use std::{
 use image::DynamicImage;
 
 use crate::{
-    fs_utils::{prepare_dir, PREVIEWS_DIR},
+    fs_utils::{prepare_dir, verbose, PREVIEWS_DIR},
     image_utils::{decode_image_bytes, resize_to_fit},
 };
 
 /// Maximum dimension of generated previews (pixels).
 pub const THUMB_MAX_DIM: u32 = 512;
+
+/// Maximum dimension of the fullscreen preview tier (fit inside 1920x1080).
+pub const SCREEN_MAX_DIM: u32 = 1920;
 
 /// Quality of the JPEG previews stored in `.imagecropper-previews`.
 pub const PREVIEW_JPEG_QUALITY: u8 = 80;
@@ -60,6 +63,114 @@ pub fn previews_dir_for(source: &Path) -> PathBuf {
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .join(PREVIEWS_DIR)
+}
+
+/// User-global cache root for large previews: `$XDG_CACHE_HOME/imagecropper`
+/// or `~/.cache/imagecropper`. A global cache means fullscreen previews
+/// work even when the source mount is read-only.
+pub fn cache_root() -> PathBuf {
+    let base = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
+        .unwrap_or_else(|| PathBuf::from("."));
+    base.join("imagecropper")
+}
+
+/// Stable per-file key for the global cache (avoids collisions between
+/// same-named files in different directories).
+fn source_key(source: &Path) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    source.hash(&mut h);
+    h.finish()
+}
+
+/// Per-source directory for fullscreen previews: `f/<path-hash>/`.
+pub fn screen_dir_for(source: &Path) -> PathBuf {
+    cache_root()
+        .join("f")
+        .join(format!("{:016x}", source_key(source)))
+}
+
+/// Expected fullscreen-preview path for the source's current signature.
+/// Stale variants (different signature) are pruned on write.
+pub fn screen_preview_path(source: &Path) -> Option<PathBuf> {
+    let sig = preview_sig_u64(source)?;
+    Some(
+        screen_dir_for(source).join(format!("{sig}-f{SCREEN_MAX_DIM}.jpg")),
+    )
+}
+
+/// Read the cached fullscreen preview, generating + persisting it if
+/// missing. Returns (jpeg bytes, preview w, preview h).
+pub fn produce_screen_jpeg(source: &Path) -> Option<(Vec<u8>, u32, u32)> {
+    let path = screen_preview_path(source)?;
+    if !path.exists() {
+        ensure_screen_preview(source, None);
+    }
+    match std::fs::read(&path) {
+        Ok(jpeg) => {
+            let (w, h) = image::image_dimensions(&path).unwrap_or((0, 0));
+            Some((jpeg, w, h))
+        }
+        Err(_) => None,
+    }
+}
+
+/// Like [`produce_screen_jpeg`] but returns the decoded preview image —
+/// the form the native hold-`f` fullscreen view needs.
+pub fn produce_screen_image(source: &Path) -> Option<DynamicImage> {
+    let (jpeg, _, _) = produce_screen_jpeg(source)?;
+    decode_image_bytes(source, &jpeg).ok()
+}
+
+/// Ensure a fullscreen-size preview exists in the global cache. `decoded`
+/// may pass an already-decoded source image to avoid a second decode.
+fn ensure_screen_preview(source: &Path, decoded: Option<&DynamicImage>) {
+    let Some(expected) = screen_preview_path(source) else {
+        return;
+    };
+    if expected.exists() {
+        return;
+    }
+    let image = match decoded {
+        Some(img) => img.clone(),
+        None => {
+            let Some(bytes) = std::fs::read(source).ok() else {
+                return;
+            };
+            let Some(img) = decode_image_bytes(source, &bytes).ok() else {
+                return;
+            };
+            img
+        }
+    };
+    let screen = resize_to_fit(image, SCREEN_MAX_DIM, SCREEN_MAX_DIM);
+    let mut jpeg = Vec::new();
+    {
+        let writer = std::io::BufWriter::new(std::io::Cursor::new(&mut jpeg));
+        let encoder =
+            image::codecs::jpeg::JpegEncoder::new_with_quality(writer, PREVIEW_JPEG_QUALITY);
+        if screen.to_rgb8().write_with_encoder(encoder).is_err() {
+            return;
+        }
+    }
+    let dir = screen_dir_for(source);
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    // Prune stale variants (older signatures of the same source).
+    let expected_name = expected.file_name().unwrap_or_default();
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            if entry.file_name() != expected_name {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+    if std::fs::write(&expected, &jpeg).is_ok() && verbose() {
+        eprintln!("screen preview generated: {}", source.display());
+    }
 }
 
 /// Remove stale previews of `source` inside `dir`, keeping `expected_name`.
@@ -112,6 +223,10 @@ pub fn produce_preview_image(path: &Path) -> Option<DynamicImage> {
     if let Some(cached) = find_cached_preview(&dir, path, &expected_name) {
         if let Ok(bytes) = std::fs::read(&cached) {
             if let Ok(img) = decode_image_bytes(&cached, &bytes) {
+                ensure_screen_preview(path, None);
+                if verbose() {
+                    eprintln!("preview cache hit: {}", path.display());
+                }
                 return Some(img);
             }
         }
@@ -123,13 +238,19 @@ pub fn produce_preview_image(path: &Path) -> Option<DynamicImage> {
     let bytes = std::fs::read(path).ok()?;
     let image = decode_image_bytes(path, &bytes).ok()?;
     drop(bytes);
+    ensure_screen_preview(path, Some(&image));
     let thumb = resize_to_fit(image, THUMB_MAX_DIM, THUMB_MAX_DIM);
     persist_preview(path, &expected_name, &thumb);
+    if verbose() {
+        eprintln!("preview generated: {}", path.display());
+    }
     Some(thumb)
 }
 
 /// Like [`produce_preview_image`] but returns the persisted JPEG bytes plus
 /// the source image's natural dimensions — the form the web server needs.
+/// Also ensures the fullscreen-size preview exists in `~/.cache`, so
+/// hold-`f` previews are preloaded alongside thumbnails.
 pub fn produce_preview_bytes(path: &Path) -> Option<(Vec<u8>, u32, u32)> {
     let (len, nanos) = source_signature(path)?;
     let source_name = path.file_name()?.to_string_lossy().into_owned();
@@ -138,7 +259,11 @@ pub fn produce_preview_bytes(path: &Path) -> Option<(Vec<u8>, u32, u32)> {
 
     if let Some(cached) = find_cached_preview(&dir, path, &expected_name) {
         if let Ok(bytes) = std::fs::read(&cached) {
+            ensure_screen_preview(path, None);
             let dims = image::image_dimensions(path).unwrap_or((0, 0));
+            if verbose() {
+                eprintln!("preview cache hit: {}", path.display());
+            }
             return Some((bytes, dims.0, dims.1));
         }
         let _ = std::fs::remove_file(&cached);
@@ -148,6 +273,7 @@ pub fn produce_preview_bytes(path: &Path) -> Option<(Vec<u8>, u32, u32)> {
     let image = decode_image_bytes(path, &bytes).ok()?;
     drop(bytes);
     let (w, h) = (image.width(), image.height());
+    ensure_screen_preview(path, Some(&image));
     let thumb = resize_to_fit(image, THUMB_MAX_DIM, THUMB_MAX_DIM);
 
     let mut jpeg = Vec::new();
@@ -158,6 +284,9 @@ pub fn produce_preview_bytes(path: &Path) -> Option<(Vec<u8>, u32, u32)> {
         thumb.to_rgb8().write_with_encoder(encoder).ok()?;
     }
     persist_preview_bytes(path, &expected_name, &jpeg);
+    if verbose() {
+        eprintln!("preview generated: {}", path.display());
+    }
     Some((jpeg, w, h))
 }
 

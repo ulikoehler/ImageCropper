@@ -66,6 +66,23 @@ impl Action {
             | Action::Resave { id, .. } => *id,
         }
     }
+
+    pub fn kind(&self) -> ActionKind {
+        match self {
+            Action::Delete { .. } => ActionKind::Delete,
+            Action::Move { .. } => ActionKind::Move,
+            Action::Crop { .. } => ActionKind::Crop,
+            Action::Resave { .. } => ActionKind::Resave,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum ActionKind {
+    Delete,
+    Move,
+    Crop,
+    Resave,
 }
 
 /// Server → client result for an action (sent as an EVENT on /data).
@@ -73,6 +90,16 @@ impl Action {
 pub struct ActionDone {
     pub tag: u32,
     pub ok: bool,
+    /// Manifest id + kind — lets the server apply differential updates.
+    pub id: u32,
+    #[serde(rename = "kind")]
+    pub kind: ActionKind,
+    /// Source path (server-internal; not sent to clients).
+    #[serde(skip)]
+    pub src: PathBuf,
+    /// Output path for crop/resave (same file for crop; new ext for resave).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub new_path: Option<PathBuf>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     /// For crop/resave: the new file's sig; for delete: trashed bytes.
@@ -216,18 +243,22 @@ impl ActionQueue {
         let (result_tx, result_rx) = mpsc::channel::<ActionDone>();
         thread::spawn(move || {
             let mut saver = Saver::new(saver_threads.max(1));
-            // Async saves awaiting completion, keyed to their client's tag.
-            let mut pending: Vec<(u32, PathBuf)> = Vec::new();
+            // Async saves awaiting completion: (tag, kind, id, src, out).
+            let mut pending: Vec<(u32, ActionKind, u32, PathBuf, PathBuf)> = Vec::new();
             loop {
                 // Drain completed saves → ActionDone with the new sig.
                 for (path, result, _sizes) in saver.check_completions() {
-                    if let Some(pos) = pending.iter().position(|(_, p)| p == &path) {
-                        let (tag, _) = pending.remove(pos);
+                    if let Some(pos) = pending.iter().position(|(.., p)| p == &path) {
+                        let (tag, kind, id, src, out) = pending.remove(pos);
                         let new_sig = preview_sig_u64(&path);
                         let done = match result {
                             Ok(()) => ActionDone {
                                 tag,
                                 ok: true,
+                                id,
+                                kind,
+                                src,
+                                new_path: Some(out),
                                 error: None,
                                 new_sig,
                                 bytes: None,
@@ -235,6 +266,10 @@ impl ActionQueue {
                             Err(e) => ActionDone {
                                 tag,
                                 ok: false,
+                                id,
+                                kind,
+                                src,
+                                new_path: Some(out),
                                 error: Some(e.to_string()),
                                 new_sig: None,
                                 bytes: None,
@@ -247,6 +282,15 @@ impl ActionQueue {
                 }
                 match job_rx.try_recv() {
                     Ok((tag, action, path)) => {
+                        let kind = action.kind();
+                        let id = action.id();
+                        let out_path = match &action {
+                            Action::Crop { .. } => Some(path.clone()),
+                            Action::Resave { format, .. } => {
+                                Some(path.with_extension(format.extension()))
+                            }
+                            _ => None,
+                        };
                         match execute(&action, &path, &mut saver, move_dir.as_deref()) {
                             Ok((new_sig, bytes)) => {
                                 if new_sig.is_some() || bytes.is_some() {
@@ -254,6 +298,10 @@ impl ActionQueue {
                                         .send(ActionDone {
                                             tag,
                                             ok: true,
+                                            id,
+                                            kind,
+                                            src: path,
+                                            new_path: out_path,
                                             error: None,
                                             new_sig,
                                             bytes,
@@ -265,7 +313,7 @@ impl ActionQueue {
                                 } else {
                                     // Async save queued — completion arrives
                                     // via check_completions.
-                                    pending.push((tag, path));
+                                    pending.push((tag, kind, id, path, out_path.unwrap()));
                                 }
                             }
                             Err(e) => {
@@ -273,6 +321,10 @@ impl ActionQueue {
                                     .send(ActionDone {
                                         tag,
                                         ok: false,
+                                        id,
+                                        kind,
+                                        src: path,
+                                        new_path: out_path,
                                         error: Some(e.to_string()),
                                         new_sig: None,
                                         bytes: None,

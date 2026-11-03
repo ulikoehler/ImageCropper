@@ -13,6 +13,18 @@ use walkdir::WalkDir;
 pub mod adaptive_pool;
 pub mod previews;
 
+static VERBOSE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Enable `-v/--verbose` output across scan/preview/action paths. Set once
+/// at startup from the CLI flag.
+pub fn set_verbose(v: bool) {
+    VERBOSE.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn verbose() -> bool {
+    VERBOSE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub const TRASH_DIR: &str = ".imagecropper-trash";
 pub const ORIGINALS_DIR: &str = ".imagecropper-originals";
 pub const TEMP_DIR: &str = ".imagecropper-tmp";
@@ -116,24 +128,33 @@ fn normalize_filter_path(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
 }
 
-pub fn collect_images(paths: &[PathBuf], recursive: bool) -> Result<Vec<PathBuf>> {
-    collect_images_with_filter(paths, recursive, None)
+/// One event from a streaming directory scan.
+#[derive(Debug, Clone)]
+pub enum ScanEvent {
+    /// An image file matched — emitted the moment it is discovered.
+    Found(PathBuf),
+    /// Non-fatal problem (missing root, unreadable dir); the scan continues.
+    Error(String),
 }
 
-pub fn collect_images_with_filter(
+/// Walk `paths` in filesystem order, calling `emit` for every match —
+/// never collects, sorts, or waits, so consumers can work on partial
+/// results as soon as the first entries arrive.
+pub fn walk_images(
     paths: &[PathBuf],
     recursive: bool,
     filter: Option<&PathFilter>,
-) -> Result<Vec<PathBuf>> {
-    let mut files = Vec::new();
+    emit: &mut dyn FnMut(ScanEvent),
+) {
     for path in paths {
         if !path.exists() {
-            return Err(anyhow!("{} does not exist", path.display()));
+            emit(ScanEvent::Error(format!("{} does not exist", path.display())));
+            continue;
         }
 
         if path.is_file() {
             if is_supported_image(path) && filter.is_none_or(|f| f.matches(path)) {
-                files.push(path.to_path_buf());
+                emit(ScanEvent::Found(path.to_path_buf()));
             }
         } else if path.is_dir() {
             if recursive {
@@ -151,23 +172,70 @@ pub fn collect_images_with_filter(
                         && is_supported_image(entry.path())
                         && filter.is_none_or(|f| f.matches(entry.path()))
                     {
-                        files.push(entry.path().to_path_buf());
+                        emit(ScanEvent::Found(entry.path().to_path_buf()));
                     }
                 }
             } else {
-                for entry in fs::read_dir(path)
-                    .with_context(|| format!("Unable to read directory {}", path.display()))?
-                {
-                    let entry = entry
-                        .with_context(|| format!("Unable to read entry in {}", path.display()))?;
-                    let p = entry.path();
-                    if p.is_file() && is_supported_image(&p) && filter.is_none_or(|f| f.matches(&p))
-                    {
-                        files.push(p);
+                match fs::read_dir(path) {
+                    Err(e) => emit(ScanEvent::Error(format!(
+                        "Unable to read directory {}: {e}",
+                        path.display()
+                    ))),
+                    Ok(entries) => {
+                        for entry in entries.flatten() {
+                            let p = entry.path();
+                            if p.is_file()
+                                && is_supported_image(&p)
+                                && filter.is_none_or(|f| f.matches(&p))
+                            {
+                                emit(ScanEvent::Found(p));
+                            }
+                        }
                     }
                 }
             }
         }
+    }
+}
+
+/// Run [`walk_images`] on a background thread. Events stream over the
+/// returned channel in filesystem order; the sender drops (and the
+/// receiver sees `Disconnected`) when the scan completes.
+pub fn spawn_image_scan(
+    paths: Vec<PathBuf>,
+    recursive: bool,
+    filter: Option<PathFilter>,
+) -> std::sync::mpsc::Receiver<ScanEvent> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        walk_images(&paths, recursive, filter.as_ref(), &mut |ev| {
+            let _ = tx.send(ev);
+        });
+    });
+    rx
+}
+
+pub fn collect_images(paths: &[PathBuf], recursive: bool) -> Result<Vec<PathBuf>> {
+    collect_images_with_filter(paths, recursive, None)
+}
+
+pub fn collect_images_with_filter(
+    paths: &[PathBuf],
+    recursive: bool,
+    filter: Option<&PathFilter>,
+) -> Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    let mut error = None;
+    walk_images(paths, recursive, filter, &mut |ev| match ev {
+        ScanEvent::Found(p) => files.push(p),
+        ScanEvent::Error(e) => {
+            if error.is_none() {
+                error = Some(e);
+            }
+        }
+    });
+    if let Some(e) = error {
+        return Err(anyhow!("{e}"));
     }
     Ok(files)
 }

@@ -21,6 +21,9 @@ const FULL_MAX_DIM: u32 = 3840;
 
 /// Requested encoding for GET_FULL payloads.
 const FMT_ORIGINAL: u8 = 0;
+/// Fullscreen-size preview JPEG (≤1920) from the shared `~/.cache` tier —
+/// used by hold-`f` in the web client.
+const FMT_SCREEN: u8 = 2;
 
 pub async fn handler(ws: WebSocketUpgrade, State(state): State<Arc<ServerState>>) -> Response {
     ws.max_message_size(1024)
@@ -123,6 +126,7 @@ async fn send_chunked(out_tx: &mpsc::Sender<Frame>, req_id: u32, msg_type: u8, p
 /// image for layout purposes.
 fn produce_full(path: &std::path::Path, fmt: u8, quality: u8) -> Option<(Vec<u8>, u32, u32)> {
     match fmt {
+        FMT_SCREEN => crate::fs_utils::previews::produce_screen_jpeg(path),
         FMT_ORIGINAL => {
             let bytes = std::fs::read(path).ok()?;
             let (w, h) = image::image_dimensions(path).unwrap_or((0, 0));

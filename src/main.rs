@@ -6,8 +6,11 @@ use eframe::egui;
 
 use imagecropper::album::{AlbumCropApp, AlbumOptions};
 use imagecropper::app::{AppOptions, ImageCropperApp};
-use imagecropper::cli::{collect_sorted_files, AlbumArgs, Cli, Commands, CropArgs, HeadlessArgs};
+use imagecropper::cli::{
+    spawn_scan_stream, AlbumArgs, Cli, Commands, CropArgs, HeadlessArgs, ScanStream,
+};
 use imagecropper::fs_utils::previews::produce_preview_bytes;
+use imagecropper::fs_utils::ScanEvent;
 use imagecropper::image_utils::decode_image_bytes;
 use imagecropper::server::{run_server, ServeMode, ServerState};
 
@@ -27,12 +30,13 @@ fn fullscreen_window() -> eframe::NativeOptions {
 }
 
 fn run_crop(args: CropArgs) -> Result<()> {
+    imagecropper::fs_utils::set_verbose(args.scan.verbose);
     if let Some(addr) = args.headless.serve {
         return serve(args.scan, addr, &args.headless, ServeMode::Crop, None);
     }
-    let files = collect_sorted_files(&args.scan)?;
+    let scan = spawn_scan_stream(&args.scan)?;
     if args.headless.no_gui {
-        return headless_crop(&args, files);
+        return headless_crop(&args, scan);
     }
     let options = AppOptions {
         dry_run: args.scan.dry_run,
@@ -44,13 +48,13 @@ fn run_crop(args: CropArgs) -> Result<()> {
         benchmark: args.benchmark,
         embedded: false,
     };
-    let files_for_app = files.clone();
+    let mut scan_slot = Some(scan);
 
     eframe::run_native(
         "ImageCropper",
         fullscreen_window(),
         Box::new(move |cc| {
-            match ImageCropperApp::new(cc, files_for_app.clone(), options.clone()) {
+            match ImageCropperApp::new(cc, Vec::new(), options.clone(), scan_slot.take()) {
                 Ok(app) => Ok(Box::new(app) as Box<dyn eframe::App>),
                 Err(err) => {
                     eprintln!("{err:#}");
@@ -64,13 +68,14 @@ fn run_crop(args: CropArgs) -> Result<()> {
 }
 
 fn run_album(args: AlbumArgs) -> Result<()> {
+    imagecropper::fs_utils::set_verbose(args.scan.verbose);
     let move_dir = imagecropper::cli::resolve_move_dir(&args.move_dir)?;
     if let Some(addr) = args.headless.serve {
         return serve(args.scan, addr, &args.headless, ServeMode::Album, move_dir);
     }
-    let files = collect_sorted_files(&args.scan)?;
+    let scan = spawn_scan_stream(&args.scan)?;
     if args.headless.no_gui {
-        return headless_album(&args, files);
+        return headless_album(&args, scan);
     }
     let options = AlbumOptions {
         dry_run: args.scan.dry_run,
@@ -89,18 +94,24 @@ fn run_album(args: AlbumArgs) -> Result<()> {
         },
     };
 
+    let mut scan_slot = Some(scan);
     eframe::run_native(
         "ImageCropper Album",
         fullscreen_window(),
-        Box::new(
-            move |_cc| Ok(Box::new(AlbumCropApp::new(files, options)) as Box<dyn eframe::App>),
-        ),
+        Box::new(move |_cc| {
+            Ok(Box::new(AlbumCropApp::new(
+                Vec::new(),
+                options,
+                scan_slot.take(),
+            )) as Box<dyn eframe::App>)
+        }),
     )?;
 
     Ok(())
 }
 
-/// Shared `--serve` path: collect files, build server state, run.
+/// Shared `--serve` path: start the server with an empty manifest, then
+/// stream scan results in as they are discovered (never blocks on listing).
 fn serve(
     scan: imagecropper::cli::ScanArgs,
     addr: std::net::SocketAddr,
@@ -108,9 +119,9 @@ fn serve(
     mode: ServeMode,
     move_dir: Option<PathBuf>,
 ) -> Result<()> {
-    let files = collect_sorted_files(&scan)?;
+    let stream = spawn_scan_stream(&scan)?;
     let state = ServerState::new(
-        files,
+        Vec::new(),
         scan.paths.clone(),
         mode,
         scan.parallel,
@@ -126,67 +137,86 @@ fn serve(
         headless.push_credit_kb,
         move_dir,
     );
+    imagecropper::server::spawn_scan_feeder(&state, stream);
     let _watcher = imagecropper::server::watch::spawn(state.clone(), scan.clone());
     run_server(addr, state, !headless.no_gui)
 }
 
-/// `album -G`: pregenerate every preview, then exit.
-fn headless_album(args: &AlbumArgs, files: Vec<PathBuf>) -> Result<()> {
-    pregenerate_all(&files, args.scan.parallel);
+/// `album -G`: pregenerate every preview as scan results stream in.
+fn headless_album(args: &AlbumArgs, stream: ScanStream) -> Result<()> {
+    pregenerate_stream(stream, args.scan.parallel);
     Ok(())
 }
 
-/// Worker-pool pregeneration of all previews (shared by `album -G` and
-/// usable by tests). Concurrency self-tunes to the storage device.
-fn pregenerate_all(files: &[PathBuf], parallel: usize) {
+/// Worker-pool pregeneration fed by a streaming scan — preview work starts
+/// while the directory listing is still being produced (pipelined; matters
+/// on slow mounts). Concurrency self-tunes to the storage device.
+fn pregenerate_stream(stream: ScanStream, parallel: usize) {
     use imagecropper::fs_utils::adaptive_pool::AdaptivePool;
+    use std::sync::mpsc::RecvTimeoutError;
     use std::time::Duration;
 
-    let total = files.len();
     let pool = AdaptivePool::new(2, parallel.max(1), |p| produce_preview_bytes(p));
-    pool.request_all(files.iter());
-
+    let mut queued = 0usize;
     let mut done = 0usize;
-    while done < total {
-        for _ in pool.poll() {
-            done += 1;
-            if done % 25 == 0 || done == total {
-                eprint!("\rPregenerated previews {done}/{total}");
+    let mut scanning = true;
+    while scanning || pool.pending_len() > 0 {
+        if scanning {
+            match stream.rx.recv_timeout(Duration::from_millis(20)) {
+                Ok(ScanEvent::Found(p)) => {
+                    pool.request(p);
+                    queued += 1;
+                }
+                Ok(ScanEvent::Error(e)) => eprintln!("scan: {e}"),
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => scanning = false,
             }
         }
-        if done < total {
-            std::thread::sleep(Duration::from_millis(15));
+        for _ in pool.poll() {
+            done += 1;
+            if done % 25 == 0 {
+                eprint!("\rPregenerated previews {done}/{queued}…");
+            }
+        }
+        if !scanning && pool.pending_len() == 0 {
+            break;
         }
     }
-    if total > 0 {
-        eprintln!(" ({} worker(s))", pool.workers());
+    if queued > 0 {
+        eprintln!("\rPregenerated previews {done}/{queued} ({} worker(s))", pool.workers());
     }
 }
 
-/// `crop -G`: batch resave all files to the selected format/quality.
-fn headless_crop(args: &CropArgs, files: Vec<PathBuf>) -> Result<()> {
+/// `crop -G`: batch resave all files to the selected format/quality as the
+/// scan streams them in.
+fn headless_crop(args: &CropArgs, stream: ScanStream) -> Result<()> {
     if !args.resave && args.format == imagecropper::image_utils::OutputFormat::Avif {
         eprintln!("crop -G without --resave does nothing (pass --resave and/or -f).");
         return Ok(());
     }
     let mut saver = imagecropper::app::saver::Saver::new(args.scan.parallel.max(1));
     let mut queued = 0usize;
-    for f in &files {
-        let Ok(bytes) = std::fs::read(f) else {
-            continue;
-        };
-        let Ok(img) = decode_image_bytes(f, &bytes) else {
-            continue;
-        };
-        let out = f.with_extension(args.format.extension());
-        saver.queue_save(imagecropper::image_utils::SaveRequest {
-            image: img,
-            path: out,
-            original_path: f.clone(),
-            quality: args.quality,
-            format: args.format,
-        })?;
-        queued += 1;
+    for ev in stream.rx {
+        match ev {
+            ScanEvent::Found(f) => {
+                let Ok(bytes) = std::fs::read(&f) else {
+                    continue;
+                };
+                let Ok(img) = decode_image_bytes(&f, &bytes) else {
+                    continue;
+                };
+                let out = f.with_extension(args.format.extension());
+                saver.queue_save(imagecropper::image_utils::SaveRequest {
+                    image: img,
+                    path: out,
+                    original_path: f.clone(),
+                    quality: args.quality,
+                    format: args.format,
+                })?;
+                queued += 1;
+            }
+            ScanEvent::Error(e) => eprintln!("scan: {e}"),
+        }
     }
     eprintln!("Queued {queued} resaves; waiting for completion…");
     loop {

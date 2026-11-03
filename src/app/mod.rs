@@ -71,6 +71,13 @@ pub struct ImageCropperApp {
     /// Set when the app is embedded in the album view and the user asked to
     /// leave crop mode (Esc, or after the image list completed).
     pub exit_to_album: bool,
+    /// Streaming directory scan (background); `None` once complete.
+    pub scan_rx: Option<std::sync::mpsc::Receiver<crate::fs_utils::ScanEvent>>,
+    pub scan_done: bool,
+    scan_order: crate::cli::SortOrder,
+    scan_inverse: bool,
+    /// Dedupe set for scan-discovered paths (overlapping roots, resaves).
+    files_seen: std::collections::HashSet<PathBuf>,
 }
 
 impl ImageCropperApp {
@@ -78,8 +85,15 @@ impl ImageCropperApp {
         cc: &eframe::CreationContext<'_>,
         files: Vec<PathBuf>,
         options: AppOptions,
+        scan: Option<crate::cli::ScanStream>,
     ) -> Result<Self> {
-        Self::create(&cc.egui_ctx, cc.wgpu_render_state.as_ref(), files, options)
+        Self::create(
+            &cc.egui_ctx,
+            cc.wgpu_render_state.as_ref(),
+            files,
+            options,
+            scan,
+        )
     }
 
     /// Create the app from its parts — used both at startup and when the
@@ -89,6 +103,7 @@ impl ImageCropperApp {
         render_state: Option<&RenderState>,
         files: Vec<PathBuf>,
         options: AppOptions,
+        scan: Option<crate::cli::ScanStream>,
     ) -> Result<Self> {
         let wgpu_render_state = render_state.expect("WGPU enabled");
         let device = wgpu_render_state.device.clone();
@@ -97,6 +112,11 @@ impl ImageCropperApp {
         let saver = Saver::new(options.parallel);
         let canvas = Canvas::new();
 
+        let (scan_rx, scan_order, scan_inverse) = match scan {
+            Some(s) => (Some(s.rx), s.order, s.inverse),
+            None => (None, crate::cli::SortOrder::Filename, false),
+        };
+        let files_seen = files.iter().cloned().collect();
         let mut app = Self {
             files,
             current_index: 0,
@@ -125,9 +145,53 @@ impl ImageCropperApp {
             exit_summary_printed: false,
             embedded: options.embedded,
             exit_to_album: false,
+            scan_done: scan_rx.is_none(),
+            scan_rx,
+            scan_order,
+            scan_inverse,
+            files_seen,
         };
-        app.load_current_image(ctx, Some(wgpu_render_state))?;
+        if !app.files.is_empty() {
+            app.load_current_image(ctx, Some(wgpu_render_state))?;
+        }
         Ok(app)
+    }
+
+    /// Pull newly discovered paths from the background scan (deduped).
+    /// When the stream ends the final `-o` ordering is applied once,
+    /// keeping the current image anchored by path.
+    fn drain_scan(&mut self) {
+        let mut done = false;
+        if let Some(rx) = &self.scan_rx {
+            loop {
+                match rx.try_recv() {
+                    Ok(crate::fs_utils::ScanEvent::Found(p)) => {
+                        if self.files_seen.insert(p.clone()) {
+                            self.files.push(p);
+                        }
+                    }
+                    Ok(crate::fs_utils::ScanEvent::Error(e)) => {
+                        eprintln!("scan: {e}")
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        done = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if done {
+            self.scan_rx = None;
+            self.scan_done = true;
+            let cur = self.current_path().map(Path::to_path_buf);
+            crate::cli::sort_files(&mut self.files, self.scan_order, self.scan_inverse);
+            if let Some(cur) = cur {
+                if let Some(i) = self.files.iter().position(|p| p == &cur) {
+                    self.current_index = i;
+                }
+            }
+        }
     }
 
     fn conversion_summary(&self) -> String {
@@ -372,8 +436,12 @@ impl ImageCropperApp {
         }
 
         if self.current_index + 1 >= self.files.len() {
-            self.list_completed = true;
-            self.status = "All images processed".into();
+            if self.scan_done {
+                self.list_completed = true;
+                self.status = "All images processed".into();
+            } else {
+                self.status = "Waiting for directory scan…".into();
+            }
             return;
         }
 
@@ -491,14 +559,21 @@ impl ImageCropperApp {
         self.loader.cache.remove(&path);
         self.files.remove(self.current_index);
         if self.files.is_empty() {
-            self.list_completed = true;
-            self.status = "No images remaining".into();
+            if self.scan_done {
+                self.list_completed = true;
+                self.status = "No images remaining".into();
+            } else {
+                self.status = "Waiting for directory scan…".into();
+            }
             return;
         }
         if self.current_index >= self.files.len() {
-            self.list_completed = true;
-            self.status = "All images processed".into();
-            return;
+            if self.scan_done {
+                self.list_completed = true;
+                self.status = "All images processed".into();
+                return;
+            }
+            self.current_index = self.files.len() - 1;
         }
         if let Err(err) = self.load_current_image(ctx, render_state) {
             self.status = format!("{err:#}");
@@ -667,6 +742,17 @@ impl App for ImageCropperApp {
 
         self.loader.update();
 
+        // Stream in directory-scan results; the first arrival kicks off
+        // the initial image load (creation may have found an empty list).
+        let had_files = !self.files.is_empty();
+        self.drain_scan();
+        if !self.scan_done {
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        }
+        if !had_files && !self.files.is_empty() {
+            let _ = self.load_current_image(ctx, render_state);
+        }
+
         // Preload next 64 images
         if self.image.is_some() {
             let start = self.current_index + 1;
@@ -762,6 +848,25 @@ impl App for ImageCropperApp {
                 });
                 ctx.request_repaint();
             }
+            return;
+        }
+
+        if self.files.is_empty() {
+            egui::CentralPanel::default().show(ui, |ui| {
+                ui.centered_and_justified(|ui| {
+                    ui.vertical_centered(|ui| {
+                        if self.scan_done {
+                            ui.heading("No images found");
+                            ui.add_space(10.0);
+                            if ui.button("Quit").clicked() {
+                                self.finished = true;
+                            }
+                        } else {
+                            ui.heading("Scanning for images…");
+                        }
+                    });
+                });
+            });
             return;
         }
 

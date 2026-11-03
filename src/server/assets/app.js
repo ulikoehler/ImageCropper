@@ -27,9 +27,10 @@ const token=new URLSearchParams(location.search).get("token")||"";
 const canvas=document.getElementById("c"), ctx=canvas.getContext("2d");
 const topEl=document.getElementById("top"), statusEl=document.getElementById("status"),
       helpEl=document.getElementById("help");
-helpEl.textContent="scroll: wheel · zoom: +/- · width: w/W · select: click/ctrl/shift · delete: Del · move: m · crop: c";
+helpEl.textContent="scroll: wheel · zoom: +/- · width: w/W · select: click/ctrl/shift · delete: Del · move: m · fullscreen: hold f · crop: c";
 
 let manifest=null, items=[], thumbs=new Map(), pending=new Set();
+let scanning=false;
 let tileH=180, zoom=1.0, scrollY=0, selected=new Set(), focus=0, anchor=0;
 let creditBudget=8*1024*1024;
 
@@ -38,23 +39,71 @@ function connect(path){ return new Promise((res,rej)=>{
   ws.binaryType="arraybuffer"; ws.onopen=()=>res(ws); ws.onerror=rej; });
 }
 
+// /bulk request router: GET_MANIFEST + GET_FULL replies share the socket,
+// correlated by req_id.
+let bulkWs=null;
+const bulkReqs=new Map(); let bulkReqId=0x100;
+function bulkRequest(type,payload){
+  const reqId=bulkReqId++;
+  return new Promise(res=>{
+    bulkReqs.set(reqId,{parts:[],head:null,res});
+    bulkWs.send(frame(type,reqId,payload));
+  });
+}
+function onBulk(f){
+  const req=bulkReqs.get(f.reqId); if(!req)return;
+  if(f.type===BK_FULL_HEAD){
+    const v=new DataView(f.payload.buffer,f.payload.byteOffset);
+    req.head={w:v.getUint32(8,true),h:v.getUint32(12,true),fmt:v.getUint8(16)};
+    return;
+  }
+  req.parts.push(f.payload);
+  if(f.flags&1){
+    bulkReqs.delete(f.reqId);
+    const all=new Uint8Array(req.parts.reduce((s,p)=>s+p.length,0));let o=0;
+    for(const p of req.parts){all.set(p,o);o+=p.length}
+    req.res({head:req.head,body:all});
+  }
+}
+
+async function refreshManifest(){
+  const {body}=await bulkRequest(BK_GET_MANIFEST,u32s(1,0));
+  manifest=JSON.parse(new TextDecoder().decode(body));
+  items=manifest.items;
+  thumbs.clear();pending.clear();
+  selected=new Set();focus=0;anchor=0;scanning=false;
+  screenBmp=null;screenIdx=-1;
+  layout();draw();
+}
+
+// ids are positional (items[id]); tombstoned entries keep their slot.
+function applyPatch(p){
+  if(p.resync){
+    items=[];manifest.dirs=[];thumbs.clear();pending.clear();
+    selected=new Set();focus=0;anchor=0;scanning=false;
+    screenBmp=null;screenIdx=-1;
+    manifest.dirs=(p.dirs_added||[]).slice();
+  }else{
+    (p.dirs_added||[]).forEach(d=>manifest.dirs.push(d));
+  }
+  (p.upsert||[]).forEach(it=>{items[it.id]=it});
+  (p.remove||[]).forEach(id=>{if(items[id])items[id].removed=true;thumbs.delete(id)});
+  manifest.version=p.version;
+  layout();draw();
+}
+
 async function boot(){
   const bulk=await connect("/bulk"), data=await connect("/data");
+  bulkWs=bulk;dataWs=data;
+  bulk.onmessage=e=>onBulk(unframe(e.data));
 
   // /data: hello then handle thumbs+events
   data.onmessage=e=>onData(unframe(e.data));
   data.send(frame(CL_HELLO,0,str(JSON.stringify({token,manifest_version:0}))));
 
   // /bulk: manifest (chunked)
-  const parts=[]; let got=0;
-  const manifestReady=new Promise(res=>{
-    bulk.onmessage=e=>{const f=unframe(e.data);
-      if(f.type===BK_MANIFEST){parts.push(f.payload);got+=f.payload.length;
-        if(f.flags&1){const all=new Uint8Array(got);let o=0;
-          for(const p of parts){all.set(p,o);o+=p.length}
-          res(JSON.parse(new TextDecoder().decode(all)));}}}});
-  bulk.send(frame(BK_GET_MANIFEST,1,u32s(1,0)));
-  manifest=await manifestReady;
+  const {body}=await bulkRequest(BK_GET_MANIFEST,u32s(1,0));
+  manifest=JSON.parse(new TextDecoder().decode(body));
   items=manifest.items;
   layout(); draw();
 
@@ -82,22 +131,19 @@ function onData(f){
       if(kind!=null&&ev.ok){
         const id=pendingIds.get(ev.tag);
         pendingActions.delete(ev.tag);pendingIds.delete(ev.tag);
-        const idx=items.findIndex(it=>it.id===id);
-        if(idx>=0){
-          items.splice(idx,1);
-          thumbs.delete(id);
-          selected.delete(idx);
-          // indices shift after splice — remap remaining selection
-          selected=new Set([...selected].map(i=>i>idx?i-1:i));
-          if(focus>idx)focus--;if(anchor>idx)anchor--;
-        }
+        // Optimistic tombstone — the server's manifest-patch remove
+        // arrives too; both are idempotent and keep ids positional.
+        if(items[id])items[id].removed=true;
+        thumbs.delete(id);selected.delete(id);
         layout();draw();
       } else if(kind!=null){
         pendingActions.delete(ev.tag);pendingIds.delete(ev.tag);
         statusEl.textContent=`${kind} failed: ${ev.error||"?"}`;
       }
     }
-    if(ev.ev==="fs-changed") location.reload();
+    if(ev.ev==="scan-start"){scanning=true;draw();}
+    if(ev.ev==="manifest-patch"){applyPatch(ev.patch||{});}
+    if(ev.ev==="fs-changed"){refreshManifest();}
     if(ev.ev==="progress") statusEl.textContent=
       `previews ${ev.done}/${ev.queued}`;
   }
@@ -109,9 +155,9 @@ function layout(){
   rows=[]; const W=canvas.width;
   const target=tileH*zoom;
   let cur=[], curW=0;
-  const aspect=i=>{const it=items[i];
-    return it.h>0?it.w/it.h:1};
   for(let i=0;i<items.length;i++){
+    const it=items[i];
+    if(!it||it.removed)continue;   // tombstones/holes keep id positions
     const w=aspect(i)*target;
     if(curW+w>W&&cur.length){rows.push({ids:cur,w:curW});cur=[];curW=0;}
     cur.push(i);curW+=w;
@@ -124,7 +170,7 @@ function rowH(row){
   if(row.last)return Math.min(target,W/row.ids.reduce((s,i)=>s+aspect(i),0));
   return target*(W/row.w)/1||0;
 }
-const aspect=i=>{const it=items[i];return it.h>0?it.w/it.h:1};
+const aspect=i=>{const it=items[i];return (!it||it.removed)?1:(it.h>0?it.w/it.h:1)};
 
 function tileRects(){
   const out=[];
@@ -141,6 +187,23 @@ function tileRects(){
   return out;
 }
 
+// ---- hold-`f` fullscreen preview (1920-class JPEG from /bulk) ----
+let fHeld=false, screenBmp=null, screenIdx=-1;
+const screenFetching=new Set();
+async function fetchScreen(i){
+  const it=items[i];
+  if(!it||it.removed||screenFetching.has(i))return;
+  screenFetching.add(i);
+  try{
+    const b=new Uint8Array(14),v=new DataView(b.buffer);
+    v.setUint32(0,it.id,true);v.setBigUint64(4,BigInt(it.sig),true);
+    v.setUint8(12,2);v.setUint8(13,80);   // fmt=2: ≤1920 screen preview
+    const {body}=await bulkRequest(BK_GET_FULL,b);
+    const bmp=await createImageBitmap(new Blob([body],{type:"image/jpeg"}));
+    screenBmp=bmp;screenIdx=i;if(fHeld)draw();
+  }finally{screenFetching.delete(i)}
+}
+
 function draw(){
   const W=canvas.width=innerWidth*devicePixelRatio|0,
         H=canvas.height=innerHeight*devicePixelRatio|0;
@@ -150,6 +213,22 @@ function draw(){
   layout();
   canvas.style.width=innerWidth+"px";canvas.style.height=innerHeight+"px";
   ctx.fillStyle="#111";ctx.fillRect(0,0,W,H);
+
+  if(fHeld){
+    ctx.fillStyle="#000";ctx.fillRect(0,0,W,H);
+    const it=items[focus];
+    if(screenIdx===focus&&screenBmp){
+      const s=Math.min(W/screenBmp.width,H/screenBmp.height),
+            w=screenBmp.width*s,h=screenBmp.height*s;
+      ctx.drawImage(screenBmp,(W-w)/2,(H-h)/2,w,h);
+    }else{
+      if(it&&!it.removed)fetchScreen(focus);
+      ctx.fillStyle="#888";ctx.font=`${16*devicePixelRatio}px monospace`;
+      ctx.fillText("loading fullscreen preview…",W/2-160*devicePixelRatio,H/2);
+    }
+    topEl.textContent=`${items.length} images · fullscreen: ${it?it.name:"?"}`;
+    return;
+  }
   const want=[];
   for(const t of tileRects()){
     const y=t.y-scrollY;
@@ -169,12 +248,10 @@ function draw(){
     want.forEach((id,i)=>v.setUint32(2+4*i,id,true));
     dataWs.send(frame(CL_WANT,0,b));
   }
-  topEl.textContent=`${items.length} images · ${thumbs.size} cached · ${selected.size} selected`;
+  topEl.textContent=`${items.length} images · ${thumbs.size} cached · ${selected.size} selected${scanning?" · scanning…":""}`;
 }
 
 let dataWs=null;
-const _connect=connect;
-connect=async p=>{const ws=await _connect(p);if(p==="/data")dataWs=ws;return ws};
 
 // ---- input ----
 let pendingTag=1, pendingActions=new Map(), pendingIds=new Map();
@@ -202,6 +279,9 @@ addEventListener("keydown",e=>{
     }
     selected.clear();draw();
   }
+  else if((e.key==="f"||e.key==="F")&&!e.ctrlKey&&!e.metaKey){
+    fHeld=true;if(screenIdx!==focus)fetchScreen(focus);draw();
+  }
   else if(e.key==="c"||e.key==="Escape"){}
   else if(e.key.startsWith("Arrow")){
     const n=items.length;let nf=focus;
@@ -217,6 +297,9 @@ addEventListener("keydown",e=>{
   }
   else if(e.key===" "){selected.has(focus)?selected.delete(focus):selected.add(focus);draw();e.preventDefault()}
   else if(e.key==="a"&&e.ctrlKey){for(let i=0;i<items.length;i++)selected.add(i);draw();e.preventDefault()}
+});
+addEventListener("keyup",e=>{
+  if(e.key==="f"||e.key==="F"){fHeld=false;draw()}
 });
 canvas.addEventListener("click",e=>{
   const mx=e.clientX*devicePixelRatio,my=e.clientY*devicePixelRatio+scrollY;

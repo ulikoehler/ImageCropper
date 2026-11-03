@@ -3,7 +3,10 @@ use std::{collections::HashSet, path::PathBuf};
 use eframe::egui;
 
 use crate::{
-    fs_utils::{adaptive_pool::AdaptivePool, previews::produce_preview_image},
+    fs_utils::{
+        adaptive_pool::AdaptivePool,
+        previews::{produce_preview_image, produce_screen_image},
+    },
     image_utils::to_color_image,
 };
 
@@ -30,7 +33,10 @@ pub struct ThumbResult {
 /// and stale preview files are cleaned up.
 pub struct Thumbnailer {
     pool: AdaptivePool<Option<egui::ColorImage>>,
+    /// Fullscreen-size (≤1920) preview jobs for hold-`f`.
+    screen_pool: AdaptivePool<Option<egui::ColorImage>>,
     pub pending: HashSet<PathBuf>,
+    pending_screen: HashSet<PathBuf>,
 }
 
 impl Thumbnailer {
@@ -40,7 +46,11 @@ impl Thumbnailer {
             pool: AdaptivePool::new(2, concurrency.max(1), |path| {
                 produce_preview_image(path).map(|i| to_color_image(&i))
             }),
+            screen_pool: AdaptivePool::new(2, 4, |path| {
+                produce_screen_image(path).map(|i| to_color_image(&i))
+            }),
             pending: HashSet::new(),
+            pending_screen: HashSet::new(),
         }
     }
 
@@ -63,6 +73,25 @@ impl Thumbnailer {
         let mut done = Vec::new();
         for (path, image) in self.pool.poll() {
             self.pending.remove(&path);
+            done.push(ThumbResult { path, image });
+        }
+        done
+    }
+
+    /// Queue a fullscreen-size (≤1920) preview job for hold-`f`.
+    pub fn request_screen(&mut self, path: PathBuf) {
+        if self.pending_screen.contains(&path) {
+            return;
+        }
+        self.pending_screen.insert(path.clone());
+        self.screen_pool.request(path);
+    }
+
+    /// Drain finished fullscreen-preview jobs.
+    pub fn poll_screen(&mut self) -> Vec<ThumbResult> {
+        let mut done = Vec::new();
+        for (path, image) in self.screen_pool.poll() {
+            self.pending_screen.remove(&path);
             done.push(ThumbResult { path, image });
         }
         done

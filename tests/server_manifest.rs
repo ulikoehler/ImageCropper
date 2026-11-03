@@ -46,52 +46,35 @@ fn manifest_sig_serializes_as_string() {
 
 #[test]
 fn manifest_patch_upsert_and_remove() {
+    let mk = |id: u32, name: &str| ManifestItem {
+        id,
+        name: name.into(),
+        dir_index: 0,
+        w: 1,
+        h: 1,
+        bytes: 1,
+        sig: 1,
+        removed: false,
+    };
     let mut m = Manifest {
         version: 1,
         mode: ServeMode::Album,
         generated_ms: 0,
         dirs: vec!["/d".into()],
         roots: vec![],
-        items: vec![
-            ManifestItem {
-                id: 0,
-                name: "a".into(),
-                dir_index: 0,
-                w: 1,
-                h: 1,
-                bytes: 1,
-                sig: 1,
-            },
-            ManifestItem {
-                id: 1,
-                name: "b".into(),
-                dir_index: 0,
-                w: 1,
-                h: 1,
-                bytes: 1,
-                sig: 1,
-            },
-            ManifestItem {
-                id: 2,
-                name: "c".into(),
-                dir_index: 0,
-                w: 1,
-                h: 1,
-                bytes: 1,
-                sig: 1,
-            },
-        ],
+        items: vec![mk(0, "a"), mk(1, "b"), mk(2, "c")],
+        positions: Default::default(),
     };
+    m.rebuild_positions();
     let patch = ManifestPatch {
         version: 2,
+        resync: false,
         upsert: vec![ManifestItem {
-            id: 1,
-            name: "b2".into(),
-            dir_index: 0,
             w: 9,
             h: 9,
             bytes: 9,
             sig: 9,
+            ..mk(1, "b2")
         }],
         remove: vec![0],
         dirs_added: vec!["/e".into()],
@@ -99,8 +82,11 @@ fn manifest_patch_upsert_and_remove() {
     m.apply_patch(&patch);
     assert_eq!(m.version, 2);
     assert_eq!(m.dirs, vec!["/d", "/e"]);
-    assert_eq!(m.items.len(), 2);
-    assert_eq!(m.items[0].name, "b2");
-    assert_eq!((m.items[0].w, m.items[0].sig), (9, 9));
-    assert_eq!(m.items[1].name, "c");
+    // Removals are tombstones — ids stay positional across clients.
+    assert_eq!(m.items.len(), 3);
+    assert!(m.items[0].removed);
+    assert!(m.path_of(0).is_none());
+    assert_eq!(m.items[1].name, "b2");
+    assert_eq!((m.items[1].w, m.items[1].sig), (9, 9));
+    assert_eq!(m.items[2].name, "c");
 }

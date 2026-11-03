@@ -86,6 +86,9 @@ async fn handle(socket: WebSocket, state: Arc<ServerState>) {
             loop {
                 let id = {
                     let mut q = queue.lock().await;
+                    // The manifest may still be growing (streaming scan) —
+                    // let the sweep pick up newly appended ids.
+                    q.set_count(state.item_count());
                     if !q.may_send() {
                         None
                     } else {

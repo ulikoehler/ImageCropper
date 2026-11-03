@@ -46,6 +46,14 @@ pub struct ManifestItem {
     /// Content signature — same scheme as preview filenames.
     #[serde(serialize_with = "sig_as_str", deserialize_with = "sig_from_any")]
     pub sig: u64,
+    /// Tombstone: removed server-side but the id stays positional so every
+    /// client's `items[id]` indexing stays consistent. Omitted when false.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub removed: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -58,15 +66,24 @@ pub struct Manifest {
     /// Scan roots as passed on the command line.
     pub roots: Vec<String>,
     pub items: Vec<ManifestItem>,
+    /// Server-side lookup: absolute path → item id. Not serialized.
+    #[serde(skip)]
+    pub positions: HashMap<PathBuf, u32>,
 }
 
 /// Incremental change to a manifest: replace/insert `upsert`, remove `remove`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ManifestPatch {
     pub version: u32,
+    /// Full replacement: clients clear `items`/`dirs` before applying the
+    /// upserts (used when ids were reassigned wholesale, e.g. final sort
+    /// after a streaming scan or an fs-watch rescan).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub resync: bool,
     pub upsert: Vec<ManifestItem>,
     pub remove: Vec<u32>,
     /// Added since `version-1`: new dirs appended to the interned list.
+    /// For `resync` patches this is the complete dir list instead.
     pub dirs_added: Vec<String>,
 }
 
@@ -101,9 +118,15 @@ impl Manifest {
                 h,
                 bytes,
                 sig,
+                removed: false,
             });
         }
 
+        let positions = files
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (p.clone(), i as u32))
+            .collect();
         Manifest {
             version,
             mode,
@@ -114,17 +137,38 @@ impl Manifest {
                 .map(|p| p.to_string_lossy().into_owned())
                 .collect(),
             items,
+            positions,
         }
     }
 
+    /// Item id for an absolute path (inverse of [`Self::path_of`]).
+    pub fn position_of(&self, path: &Path) -> Option<u32> {
+        self.positions.get(path).copied()
+    }
+
+    /// Rebuild `positions` after items changed in place (skips tombstones).
+    pub fn rebuild_positions(&mut self) {
+        let positions = (0..self.items.len())
+            .filter(|&i| !self.items[i].removed)
+            .filter_map(|i| self.path_of(i as u32).map(|p| (p, i as u32)))
+            .collect();
+        self.positions = positions;
+    }
+
     /// Absolute path for an item (dirs interned, names are file names only).
+    /// `None` for tombstoned items.
     pub fn path_of(&self, id: u32) -> Option<PathBuf> {
         let item = self.items.get(id as usize)?;
+        if item.removed {
+            return None;
+        }
         let dir = self.dirs.get(item.dir_index as usize)?;
         Some(Path::new(dir).join(&item.name))
     }
 
-    /// Apply a patch in place (used by the client side too).
+    /// Apply a patch in place (used by the client side too). Upserts replace
+    /// the item at its id; removals are tombstones, never compactions —
+    /// `items[id]` indexing stays positional for every client.
     pub fn apply_patch(&mut self, patch: &ManifestPatch) {
         self.dirs.extend(patch.dirs_added.iter().cloned());
         for up in &patch.upsert {
@@ -134,8 +178,26 @@ impl Manifest {
                 self.items.push(up.clone());
             }
         }
-        self.items.retain(|i| !patch.remove.contains(&i.id));
+        for &id in &patch.remove {
+            if let Some(item) = self.items.get_mut(id as usize) {
+                item.removed = true;
+            }
+        }
         self.version = patch.version;
+        self.rebuild_positions();
+    }
+
+    /// A `resync` patch carrying the entire manifest — used after a full
+    /// rebuild so clients replace their item list without a reconnect or
+    /// manifest re-pull.
+    pub fn full_patch(&self) -> ManifestPatch {
+        ManifestPatch {
+            version: self.version,
+            resync: true,
+            upsert: self.items.clone(),
+            remove: Vec::new(),
+            dirs_added: self.dirs.clone(),
+        }
     }
 }
 

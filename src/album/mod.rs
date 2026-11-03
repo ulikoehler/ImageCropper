@@ -7,6 +7,7 @@ use std::{
     collections::{BTreeSet, HashMap},
     ops::Range,
     path::{Path, PathBuf},
+    sync::mpsc::{Receiver, TryRecvError},
 };
 
 use eframe::{
@@ -16,7 +17,8 @@ use eframe::{
 
 use crate::{
     app::{AppOptions, ImageCropperApp},
-    fs_utils::{format_deletion_summary, format_signed_size, format_size},
+    cli::{sort_files, ScanStream, SortOrder},
+    fs_utils::{format_deletion_summary, format_signed_size, format_size, ScanEvent},
 };
 
 use self::{
@@ -55,6 +57,8 @@ struct Entry {
     /// Decoded preview waiting to be uploaded to the GPU.
     color: Option<egui::ColorImage>,
     texture: Option<egui::TextureHandle>,
+    /// Decoded fullscreen-size preview for hold-`f`.
+    full_color: Option<egui::ColorImage>,
     failed: bool,
 }
 
@@ -65,6 +69,7 @@ impl Entry {
             aspect: 1.0,
             color: None,
             texture: None,
+            full_color: None,
             failed: false,
         }
     }
@@ -87,6 +92,8 @@ struct AlbumKeys {
     zoom_out: bool,
     width_increase: bool,
     width_decrease: bool,
+    /// Held `f` — show the focused image fullscreen.
+    fullscreen: bool,
 }
 
 /// Fullscreen album/tiling view over a set of image files.
@@ -117,11 +124,27 @@ pub struct AlbumApp {
     scroll_to_focus: bool,
     enqueue_cursor: usize,
     last_visible: Range<usize>,
+    /// Streaming directory scan (background); `None` once complete.
+    scan_rx: Option<Receiver<ScanEvent>>,
+    scan_done: bool,
+    scan_order: SortOrder,
+    scan_inverse: bool,
+    scan_errors: usize,
+    /// Single-slot fullscreen texture for hold-`f` (path it belongs to).
+    fs_tex: Option<egui::TextureHandle>,
+    fs_path: Option<PathBuf>,
+    /// FIFO of entries holding a decoded fullscreen preview — bounded so
+    /// arrowing through many images while holding `f` can't grow memory.
+    full_loaded: std::collections::VecDeque<PathBuf>,
 }
 
 impl AlbumApp {
-    pub fn new(files: Vec<PathBuf>, options: AlbumOptions) -> Self {
+    pub fn new(files: Vec<PathBuf>, options: AlbumOptions, scan: Option<ScanStream>) -> Self {
         let parallel = options.parallel.max(1);
+        let (scan_rx, scan_order, scan_inverse) = match scan {
+            Some(s) => (Some(s.rx), s.order, s.inverse),
+            None => (None, SortOrder::Filename, false),
+        };
         Self {
             entries: files.into_iter().map(Entry::new).collect(),
             positions: HashMap::new(),
@@ -149,6 +172,14 @@ impl AlbumApp {
             scroll_to_focus: false,
             enqueue_cursor: 0,
             last_visible: 0..0,
+            scan_done: scan_rx.is_none(),
+            scan_rx,
+            scan_order,
+            scan_inverse,
+            scan_errors: 0,
+            fs_tex: None,
+            fs_path: None,
+            full_loaded: std::collections::VecDeque::new(),
         }
         .reindex()
     }
@@ -165,6 +196,80 @@ impl AlbumApp {
             .enumerate()
             .map(|(i, e)| (e.path.clone(), i))
             .collect();
+    }
+
+    /// Pull newly discovered paths from the background scan (deduped by
+    /// path — overlapping roots or re-scans can't produce double entries).
+    /// When the stream ends, the final `-o` ordering is applied once.
+    fn drain_scan(&mut self) {
+        let mut done = false;
+        if let Some(rx) = &self.scan_rx {
+            loop {
+                match rx.try_recv() {
+                    Ok(ScanEvent::Found(p)) => {
+                        if !self.positions.contains_key(&p) {
+                            self.positions.insert(p.clone(), self.entries.len());
+                            self.entries.push(Entry::new(p));
+                        }
+                    }
+                    Ok(ScanEvent::Error(e)) => {
+                        self.scan_errors += 1;
+                        if self.verbose {
+                            eprintln!("scan: {e}");
+                        }
+                    }
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        done = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if done {
+            self.scan_rx = None;
+            self.scan_done = true;
+            self.resort_after_scan();
+        }
+    }
+
+    /// Apply the final sort once scanning completes. Tiles appear in
+    /// discovery order during the scan; this reorders them per `-o` while
+    /// preserving entry state and remapping selection/focus by path.
+    fn resort_after_scan(&mut self) {
+        if self.entries.is_empty() {
+            self.status = "Scan complete — no images found".into();
+            return;
+        }
+        let sel_paths: BTreeSet<PathBuf> = self
+            .selected
+            .iter()
+            .filter_map(|&i| self.entries.get(i).map(|e| e.path.clone()))
+            .collect();
+        let focus_path = self.entries.get(self.focus).map(|e| e.path.clone());
+        let anchor_path = self.entries.get(self.anchor).map(|e| e.path.clone());
+
+        let mut paths: Vec<PathBuf> = self.entries.iter().map(|e| e.path.clone()).collect();
+        sort_files(&mut paths, self.scan_order, self.scan_inverse);
+
+        let mut by_path: HashMap<PathBuf, Entry> =
+            self.entries.drain(..).map(|e| (e.path.clone(), e)).collect();
+        self.entries = paths
+            .iter()
+            .filter_map(|p| by_path.remove(p))
+            .collect();
+        self.rebuild_index();
+        self.selected = sel_paths
+            .iter()
+            .filter_map(|p| self.positions.get(p).copied())
+            .collect();
+        if let Some(p) = &focus_path {
+            self.focus = self.positions.get(p).copied().unwrap_or(0);
+        }
+        if let Some(p) = &anchor_path {
+            self.anchor = self.positions.get(p).copied().unwrap_or(0);
+        }
+        self.status = format!("Scan complete — {} images", self.entries.len());
     }
 
     fn read_keys(ctx: &egui::Context) -> AlbumKeys {
@@ -185,10 +290,30 @@ impl AlbumApp {
             zoom_out: input.key_pressed(egui::Key::Minus),
             width_increase: input.key_pressed(egui::Key::W) && input.modifiers.shift,
             width_decrease: input.key_pressed(egui::Key::W) && !input.modifiers.shift,
+            fullscreen: input.key_down(egui::Key::F),
         })
     }
 
     fn drain_results(&mut self) {
+        for result in self.thumbnailer.poll_screen() {
+            if let Some(&idx) = self.positions.get(&result.path) {
+                self.entries[idx].full_color = result.image;
+                self.full_loaded.push_back(result.path);
+                // Keep at most a handful of decoded fullscreen previews
+                // resident (~8 MB each at 1920px).
+                while self.full_loaded.len() > 8 {
+                    let p = self.full_loaded.pop_front().unwrap();
+                    let focused = self.entries.get(self.focus).map(|e| &e.path);
+                    if focused == Some(&p) {
+                        self.full_loaded.push_back(p);
+                        break;
+                    }
+                    if let Some(&i) = self.positions.get(&p) {
+                        self.entries[i].full_color = None;
+                    }
+                }
+            }
+        }
         for result in self.thumbnailer.poll() {
             let Some(&idx) = self.positions.get(&result.path) else {
                 continue; // File was removed from the album meanwhile.
@@ -461,6 +586,7 @@ impl AlbumApp {
 
     pub fn update(&mut self, ui: &mut egui::Ui, _frame: &mut Frame) {
         let ctx = ui.ctx().clone();
+        self.drain_scan();
         self.drain_results();
 
         let pending_moves = self.mover.as_ref().map(|m| m.pending.len()).unwrap_or(0);
@@ -572,6 +698,17 @@ impl AlbumApp {
             if keys.crop {
                 if let Some(entry) = self.entries.get(self.focus) {
                     self.crop_request = Some(entry.path.clone());
+                }
+            }
+
+            // Hold-`f`: fullscreen preview of the focused tile. Navigation
+            // still works while held — the overlay tracks the focus.
+            let show_fullscreen = keys.fullscreen && !self.entries.is_empty();
+            if show_fullscreen {
+                if let Some(entry) = self.entries.get_mut(self.focus) {
+                    if entry.full_color.is_none() {
+                        self.thumbnailer.request_screen(entry.path.clone());
+                    }
                 }
             }
 
@@ -703,8 +840,68 @@ impl AlbumApp {
                     }
                 });
 
-            // Overlay: counts (top-left), status (bottom-left), help (bottom-right)
             let painter = ui.painter().clone();
+
+            if show_fullscreen {
+                // Upload the decoded fullscreen preview once, keep the
+                // texture for as long as the same file is focused.
+                if let Some(color) = self
+                    .entries
+                    .get_mut(self.focus)
+                    .and_then(|e| e.full_color.take())
+                {
+                    self.fs_tex = Some(ctx.load_texture(
+                        "album-fullscreen",
+                        color,
+                        egui::TextureOptions::LINEAR,
+                    ));
+                    self.fs_path = self.entries.get(self.focus).map(|e| e.path.clone());
+                }
+                painter.rect_filled(panel_rect, 0.0, Color32::BLACK);
+                let ready = self
+                    .entries
+                    .get(self.focus)
+                    .map(|e| self.fs_path.as_ref() == Some(&e.path) && self.fs_tex.is_some())
+                    .unwrap_or(false);
+                if ready {
+                    let tex = self.fs_tex.as_ref().unwrap();
+                    let [w, h] = tex.size();
+                    let scale = (panel_rect.width() / w as f32)
+                        .min(panel_rect.height() / h as f32);
+                    let rect = Rect::from_center_size(
+                        panel_rect.center(),
+                        egui::vec2(w as f32 * scale, h as f32 * scale),
+                    );
+                    painter.image(
+                        tex.id(),
+                        rect,
+                        Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                        Color32::WHITE,
+                    );
+                } else {
+                    painter.text(
+                        panel_rect.center(),
+                        Align2::CENTER_CENTER,
+                        "loading fullscreen preview…",
+                        FontId::proportional(22.0),
+                        Color32::from_gray(140),
+                    );
+                }
+            } else if self.entries.is_empty() {
+                painter.text(
+                    panel_rect.center(),
+                    Align2::CENTER_CENTER,
+                    if self.scan_done {
+                        "No images found"
+                    } else {
+                        "Scanning for images…"
+                    },
+                    FontId::proportional(24.0),
+                    Color32::from_gray(160),
+                );
+            }
+
+            // Overlay: counts (top-left), status (bottom-left), help (bottom-right)
             draw_text_with_bg(
                 &painter,
                 &ctx,
@@ -728,7 +925,7 @@ impl AlbumApp {
                 &ctx,
                 panel_rect.right_bottom() + egui::vec2(-12.0, -12.0),
                 Align2::RIGHT_BOTTOM,
-                "Click: Select | Ctrl+Click: Toggle | Shift+Click: Range | Space: Toggle | Arrows: Move | Shift+Arrows: Extend | Del: Trash | m: Move | c/2xClick: Crop | +/-: Zoom | w/W: Width | Esc: Clear/Quit".to_string(),
+                "Click: Select | Ctrl+Click: Toggle | Shift+Click: Range | Space: Toggle | Arrows: Move | Shift+Arrows: Extend | Del: Trash | m: Move | f(hold): Fullscreen | c/2xClick: Crop | +/-: Zoom | w/W: Width | Esc: Clear/Quit".to_string(),
                 FontId::monospace(16.0),
                 Color32::from_gray(200),
             );
@@ -747,6 +944,12 @@ impl AlbumApp {
             .filter(|e| e.texture.is_some() || e.color.is_some() || e.failed)
             .count();
         let mut line = format!("{total} images — previews {loaded}/{total}");
+        if !self.scan_done {
+            line += " — scanning…";
+        }
+        if self.scan_errors > 0 {
+            line += &format!(" — {} scan error(s)", self.scan_errors);
+        }
         if !self.selected.is_empty() {
             line += &format!(" — {} selected", self.selected.len());
         }
@@ -798,9 +1001,9 @@ pub struct AlbumCropApp {
 }
 
 impl AlbumCropApp {
-    pub fn new(files: Vec<PathBuf>, options: AlbumOptions) -> Self {
+    pub fn new(files: Vec<PathBuf>, options: AlbumOptions, scan: Option<ScanStream>) -> Self {
         Self {
-            album: AlbumApp::new(files, options),
+            album: AlbumApp::new(files, options, scan),
             crop: None,
             crop_origin: None,
         }
@@ -836,6 +1039,7 @@ impl App for AlbumCropApp {
                 frame.wgpu_render_state(),
                 vec![path.clone()],
                 options,
+                None,
             ) {
                 Ok(app) => {
                     self.crop = Some(app);

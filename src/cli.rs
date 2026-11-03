@@ -5,12 +5,16 @@
 use std::cmp::Ordering;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::mpsc::Receiver;
 
 use anyhow::{anyhow, Result};
 use clap::{Args, Parser, Subcommand};
 use rand::seq::SliceRandom;
 
-use crate::fs_utils::{collect_images_with_filter, exif_datetime_key, FilterSyntax, PathFilter};
+use crate::fs_utils::{
+    collect_images_with_filter, exif_datetime_key, spawn_image_scan, FilterSyntax, PathFilter,
+    ScanEvent,
+};
 use crate::image_utils::OutputFormat;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -179,6 +183,27 @@ pub fn resolve_move_dir(arg: &Option<PathBuf>) -> Result<Option<PathBuf>> {
     std::fs::create_dir_all(dir)
         .map_err(|e| anyhow!("Unable to create move directory {}: {e}", dir.display()))?;
     Ok(Some(dir.canonicalize().unwrap_or_else(|_| dir.clone())))
+}
+
+/// A running background directory scan. Paths stream over `rx` in
+/// filesystem order — consumers must work with partial lists and apply
+/// `order`/`inverse` only once the stream ends.
+pub struct ScanStream {
+    pub rx: Receiver<ScanEvent>,
+    pub order: SortOrder,
+    pub inverse: bool,
+}
+
+/// Spawn a streaming scan for `scan`'s paths/filters. Errors in the
+/// filter patterns fail up front; per-path problems arrive as
+/// [`ScanEvent::Error`]s.
+pub fn spawn_scan_stream(scan: &ScanArgs) -> Result<ScanStream> {
+    let filter = PathFilter::compile(scan.filter_syntax, &scan.whitelist, &scan.blacklist)?;
+    Ok(ScanStream {
+        rx: spawn_image_scan(scan.paths.clone(), scan.recursive, filter),
+        order: scan.order,
+        inverse: scan.inverse,
+    })
 }
 
 /// Collect the input images, apply filters and sort them the same way for
