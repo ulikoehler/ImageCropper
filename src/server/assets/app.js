@@ -101,7 +101,7 @@ async function refreshManifest(){
   manifest=JSON.parse(new TextDecoder().decode(body));
   mouseSelect=manifest.mouse_select||"sequence";
   items=manifest.items;
-  thumbs.clear();pending.clear();
+  thumbs.clear();pending.clear();icStats.thumbClears++;decRetry.clear();
   restoreThumbs(snap);
   selected=new Set();focus=0;anchor=0;scanning=false;
   // Completions may have been lost on the way — the re-pulled manifest is
@@ -118,15 +118,17 @@ let pendingPatches=[];
 function applyPatch(p){
   if(!manifest){pendingPatches.push(p);return}
   if(p.resync){
+    icStats.resyncs++;icStats.lastResyncAt=Date.now();
     const snap=snapshotThumbs();
     items=[];manifest.dirs=[];thumbs.clear();pending.clear();
+    icStats.thumbClears++;
     selected=new Set();focus=0;anchor=0;scanning=false;
-    screenBmp=null;screenIdx=-1;
+    screenBmp=null;screenIdx=-1;decRetry.clear();
     manifest.dirs=(p.dirs_added||[]).slice();
     (p.upsert||[]).forEach(it=>{items[it.id]=it});
     (p.remove||[]).forEach(id=>{if(items[id])items[id].removed=true;thumbs.delete(id)});
     manifest.version=p.version;
-    restoreThumbs(snap);
+    restoreThumbs(snap);icStats.restored=thumbs.size;
     layoutDirty=true;scheduleDraw();
     return;
   }
@@ -166,6 +168,7 @@ async function boot(){
   items=manifest.items;
   // Patches that raced the manifest pull apply now, in order.
   pendingPatches.forEach(applyPatch);pendingPatches=[];
+  statusEl.textContent="";
   layoutDirty=true; draw();
 
   // credits: keep the push pipeline fed
@@ -235,11 +238,11 @@ setInterval(()=>{
 const DEC_WORKERS=4;
 const decPool=[];
 try{
-  const decSrc='onmessage=e=>{const{id,b}=e.data;createImageBitmap(b).then(bmp=>postMessage({id,bmp},[bmp]),()=>postMessage({id,bmp:null}))}';
+  const decSrc='onmessage=e=>{const{id,b}=e.data;createImageBitmap(b).then(bmp=>postMessage({id,bmp},[bmp]),err=>postMessage({id,bmp:null,err:String(err)}))}';
   const decUrl=URL.createObjectURL(new Blob([decSrc],{type:"text/javascript"}));
   for(let i=0;i<DEC_WORKERS;i++){
     const w=new Worker(decUrl);
-    w.onmessage=e=>{const{id,bmp}=e.data;onDecoded(id,bmp)};
+    w.onmessage=e=>{const{id,bmp,err}=e.data;onDecoded(id,bmp,err)};
     w.onerror=()=>{};
     decPool.push(w);
   }
@@ -252,17 +255,35 @@ function decodeThumb(id,jpeg){
     w.postMessage({id,b:jpeg});   // Blob clones by reference — no copy
   }else{
     decJobs.set(id,{w:-1,at:Date.now()});
-    createImageBitmap(jpeg).then(bmp=>onDecoded(id,bmp),()=>onDecoded(id,null));
+    createImageBitmap(jpeg).then(bmp=>onDecoded(id,bmp),
+      err=>onDecoded(id,null,String(err)));
   }
 }
-function onDecoded(id,bmp){
+// Decode-failure backoff: without it a rejected createImageBitmap clears
+// `pending`, the next draw() re-wants the id, and the whole visible set
+// retries at frame rate — thousands of wasted server hits per second.
+// Exponential, capped at 60 s; cleared on success/resync (new bytes may
+// decode fine) and removed on the resync path entirely.
+const decRetry=new Map();   // id -> {n, next:ms}
+function onDecoded(id,bmp,err){
   decJobs.delete(id);
-  if(bmp)thumbs.set(id,bmp);else pending.delete(id);   // null → retry later
+  if(bmp){icStats.thumbOk++;thumbs.set(id,bmp);decRetry.delete(id)}
+  else{
+    icStats.decFail++;icStats.decErr=String(err||"");
+    pending.delete(id);
+    const r=decRetry.get(id)||{n:0,next:0};
+    r.n++;
+    r.next=Date.now()+Math.min(60000,250*(1<<Math.min(r.n,8)));
+    decRetry.set(id,r);
+  }
   scheduleDraw();
 }
 
 function onThumb(id,sig,jpeg,reqId){
   pending.delete(id);
+  // First bytes of the pushed payload — is it actually a JPEG (FF D8)?
+  jpeg.slice(0,8).arrayBuffer().then(ab=>{
+    icStats.lastThumbMagic=[...new Uint8Array(ab)]});
   // Free the want-worker slot that asked for this id (sweep pushes carry
   // req_id 0 and free nothing).
   const slot=wantSlots.get(reqId);
@@ -507,10 +528,11 @@ function draw(){
   // screen ahead, a quarter behind). Rebuilt every frame so a scroll always
   // outranks whatever is still queued from the previous viewport — an
   // append-only queue lets offscreen ids starve the tiles you are looking at.
-  const want=[], ahead=[];
+  const want=[], ahead=[], nowMs=Date.now();
   for(const t of tileRects()){
     const y=t.y-scrollY;
-    const missing=!thumbs.has(t.i)&&!pending.has(t.i);
+    const rt=decRetry.get(t.i);
+    const missing=!thumbs.has(t.i)&&!pending.has(t.i)&&(!rt||rt.next<=nowMs);
     if(y+t.h>=0&&y<=H){
       if(missing){pending.set(t.i,Date.now());want.push(t.i)}
     }else if(missing&&y+t.h>=-H/4&&y<=H*2){
@@ -705,7 +727,9 @@ addEventListener("resize",()=>{layoutDirty=true;scheduleDraw()});
 
 // ---- debug instrumentation (ic() / icServer() in the JS console) ----
 const icStats={wantSent:0,thumbRecv:0,thumbDrop:0,thumbDup:0,batchRecv:0,
-  lastFrameAt:0,lastFrameType:0,lastEventAt:0,lastEventEv:"",frames:{},errs:[]};
+  thumbOk:0,decFail:0,resyncs:0,restored:0,thumbClears:0,
+  lastFrameAt:0,lastFrameType:0,lastEventAt:0,lastEventEv:"",
+  lastThumbMagic:null,frames:{},errs:[]};
 const decJobs=new Map();   // thumb id -> {w:workerIdx,at:ms} in decode
 window.addEventListener("error",e=>{
   icStats.errs.push(`${Date.now()}: ${e.message} @${e.lineno}`);
@@ -731,6 +755,7 @@ window.ic=function(){
     ws:{data:dataWs&&dataWs.readyState,bulk:bulkWs&&bulkWs.readyState},
     stats:icStats,
     decJobs:[...decJobs].map(([id,j])=>({id,w:j.w,ageMs:now-j.at})),
+    decRetry:[...decRetry].map(([id,r])=>({id,n:r.n,nextInMs:r.next-now})),
     decWorkers:decPool.length,
     fsMode,focus,screenIdx,screenFetching:[...screenFetching],
     pendingActions:[...pendingActions].map(([t,a])=>({tag:t,kind:a.kind,
