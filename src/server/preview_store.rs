@@ -6,7 +6,10 @@ use std::{
     collections::{HashMap, HashSet},
     num::NonZeroUsize,
     path::PathBuf,
-    sync::{Arc, Mutex, RwLock},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex, RwLock,
+    },
 };
 
 use lru::LruCache;
@@ -29,6 +32,9 @@ pub struct PreviewStore {
     /// Natural source dims already sniffed at manifest build/upsert time —
     /// lets a preview cache hit skip opening the source file at all.
     dims: Arc<RwLock<HashMap<PathBuf, (u32, u32)>>>,
+    /// Set by `stop()`: all new production (pool AND inline `get_or_produce`)
+    /// is refused. Cached RAM hits are still served.
+    stopped: AtomicBool,
 }
 
 impl PreviewStore {
@@ -49,7 +55,13 @@ impl PreviewStore {
             cache: Mutex::new(LruCache::new(NonZeroUsize::new(ram_cache.max(1)).unwrap())),
             pending: Mutex::new(HashSet::new()),
             dims,
+            stopped: AtomicBool::new(false),
         }
+    }
+
+    /// `stop()` was called — no new production should start.
+    pub fn stopped(&self) -> bool {
+        self.stopped.load(Ordering::Relaxed)
     }
 
     /// Record natural dims for a path (from manifest sniffing) so preview
@@ -62,6 +74,9 @@ impl PreviewStore {
 
     /// Queue a path for preview production; dedupes in-flight jobs.
     pub fn request(&self, path: PathBuf) {
+        if self.stopped() {
+            return;
+        }
         let mut pending = self.pending.lock().unwrap();
         if !pending.insert(path.clone()) {
             return;
@@ -104,6 +119,9 @@ impl PreviewStore {
         if let Some(p) = self.cached(path) {
             return Some(p);
         }
+        if self.stopped() {
+            return None;
+        }
         let hint = self.dims.read().unwrap().get(path).copied();
         let preview = produce_preview_bytes(path, hint).map(|(jpeg, w, h)| Preview {
             jpeg: Arc::new(jpeg),
@@ -121,8 +139,12 @@ impl PreviewStore {
     }
 
     /// Stop all preview generation (Ctrl-C shutdown): queued jobs are
-    /// dropped and workers retire.
+    /// dropped, workers retire, and every production entry point (pool
+    /// requests, inline `get_or_produce`) refuses new work. In-flight
+    /// workers still finish their current job — a blocking remote read
+    /// can't be aborted — but nothing new starts.
     pub fn stop(&self) {
+        self.stopped.store(true, Ordering::Relaxed);
         self.pool.cancel();
         self.pending.lock().unwrap().clear();
     }

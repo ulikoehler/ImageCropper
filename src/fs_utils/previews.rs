@@ -13,7 +13,7 @@ use std::{
 use image::DynamicImage;
 
 use crate::{
-    fs_utils::{prepare_dir, verbose, PREVIEWS_DIR},
+    fs_utils::{prepare_dir, sigint_received, verbose, PREVIEWS_DIR},
     image_utils::{decode_image_bytes, resize_to_fit},
 };
 
@@ -108,6 +108,11 @@ pub fn screen_preview_path(source: &Path) -> Option<PathBuf> {
 /// Read the cached fullscreen preview, generating + persisting it if
 /// missing. Returns (jpeg bytes, preview w, preview h).
 pub fn produce_screen_jpeg(source: &Path) -> Option<(Vec<u8>, u32, u32)> {
+    // Ctrl-C: no new production — this runs on detached blocking tasks that
+    // outlive the pools' cancel.
+    if sigint_received() {
+        return None;
+    }
     let (len, nanos) = source_signature(source)?;
     let path = screen_path_with_sig(source, len, nanos);
     if !path.exists() {
@@ -274,6 +279,9 @@ pub fn produce_preview_bytes(
     path: &Path,
     dims_hint: Option<(u32, u32)>,
 ) -> Option<(Vec<u8>, u32, u32)> {
+    if sigint_received() {
+        return None;
+    }
     let (len, nanos) = source_signature(path)?;
     let source_name = path.file_name()?.to_string_lossy().into_owned();
     let expected_name = preview_file_name(&source_name, len, nanos);

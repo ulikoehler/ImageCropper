@@ -348,10 +348,14 @@ pub fn spawn_scan_feeder(state: &Arc<ServerState>, stream: crate::cli::ScanStrea
             eprintln!("scan: started");
         }
         let mut batch: Vec<(PathBuf, Option<u64>)> = Vec::new();
+        let mut found = 0usize;
+        let t0 = std::time::Instant::now();
+        let mut last_report = t0;
         loop {
             let timed_out = match stream.rx.recv_timeout(FLUSH) {
                 Ok(ScanEvent::Found { path, bytes }) => {
                     batch.push((path, Some(bytes)));
+                    found += 1;
                     false
                 }
                 Ok(ScanEvent::Error(e)) => {
@@ -361,6 +365,16 @@ pub fn spawn_scan_feeder(state: &Arc<ServerState>, stream: crate::cli::ScanStrea
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => true,
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
             };
+            // Slow mounts can take minutes to enumerate — say we're alive.
+            if crate::fs_utils::verbose() && last_report.elapsed().as_secs() >= 2 {
+                eprintln!("scan: {found} files discovered so far…");
+                last_report = std::time::Instant::now();
+            }
+            // Ctrl-C: stop feeding upserts/preview requests into a state
+            // that's already shutting down.
+            if crate::fs_utils::sigint_received() {
+                break;
+            }
             if batch.len() >= BATCH || (timed_out && !batch.is_empty()) {
                 state.upsert_files(std::mem::take(&mut batch));
             }
@@ -368,9 +382,15 @@ pub fn spawn_scan_feeder(state: &Arc<ServerState>, stream: crate::cli::ScanStrea
         if !batch.is_empty() {
             state.upsert_files(batch);
         }
+        if crate::fs_utils::verbose() {
+            eprintln!(
+                "scan: finished — {found} files discovered in {:?}, indexing…",
+                t0.elapsed()
+            );
+        }
         state.finish_scan(stream.order, stream.inverse);
         if crate::fs_utils::verbose() {
-            eprintln!("scan complete: {} items", state.item_count());
+            eprintln!("scan: {} items indexed", state.item_count());
         }
     });
 }
@@ -416,7 +436,15 @@ async fn shutdown(state: &ServerState) {
 }
 
 /// Serve on `addr`. Blocks; used by the `--serve` paths in main.rs.
-pub fn run_server(addr: SocketAddr, state: Arc<ServerState>, open_browser: bool) -> Result<()> {
+/// `on_ready` runs after the socket is bound and the URL printed — slow
+/// startup work (scan feeding, FS watcher registration on remote mounts)
+/// belongs there so the server is reachable first.
+pub fn run_server(
+    addr: SocketAddr,
+    state: Arc<ServerState>,
+    open_browser: bool,
+    on_ready: impl FnOnce() + Send + 'static,
+) -> Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async move {
         let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -438,6 +466,7 @@ pub fn run_server(addr: SocketAddr, state: Arc<ServerState>, open_browser: bool)
         if open_browser {
             let _ = webbrowser::open(&url);
         }
+        on_ready();
         tokio::select! {
             r = axum::serve(listener, build_router(state.clone())) => { r?; }
             r = tokio::signal::ctrl_c() => {

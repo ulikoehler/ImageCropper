@@ -75,6 +75,11 @@ async fn handle(socket: WebSocket, state: Arc<ServerState>) {
                         let Some(path) = state.path_of(id) else {
                             return;
                         };
+                        // Shutting down — no new production, and a client
+                        // about to lose its socket won't miss the reply.
+                        if state.previews.stopped() {
+                            return;
+                        }
                         let item = state
                             .manifest
                             .read()

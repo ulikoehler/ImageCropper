@@ -239,6 +239,9 @@ pub struct AdaptivePool<R: Send + 'static> {
     next_worker_id: AtomicU64,
     /// In-flight/queued paths (dedup + progress introspection).
     pending: Mutex<HashSet<PathBuf>>,
+    /// Latched by `cancel()`: no new jobs accepted, workers exit after
+    /// their in-flight job. Never cleared — a cancelled pool stays dead.
+    cancelled: Arc<AtomicBool>,
 }
 
 impl<R: Send + 'static> AdaptivePool<R> {
@@ -261,13 +264,17 @@ impl<R: Send + 'static> AdaptivePool<R> {
             workers: Mutex::new(Vec::new()),
             next_worker_id: AtomicU64::new(0),
             pending: Mutex::new(HashSet::new()),
+            cancelled: Arc::new(AtomicBool::new(false)),
         };
         pool.set_workers(pool.ctrl.lock().unwrap().workers());
         pool
     }
 
-    /// Queue a path; deduplicates in-flight jobs.
+    /// Queue a path; deduplicates in-flight jobs. No-op once cancelled.
     pub fn request(&self, path: PathBuf) {
+        if self.cancelled.load(Ordering::Relaxed) {
+            return;
+        }
         let mut pending = self.pending.lock().unwrap();
         if !pending.insert(path.clone()) {
             return;
@@ -332,8 +339,11 @@ impl<R: Send + 'static> AdaptivePool<R> {
     }
 
     /// Drop every queued-but-not-started job and retire all workers.
-    /// In-flight jobs finish and still deliver their results.
+    /// Latches: `request` becomes a no-op, so producers (scan feed, push
+    /// WANTs) cannot refill the queue after cancellation. In-flight jobs
+    /// finish and still deliver their results.
     pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Relaxed);
         self.set_worker_override(0);
         if let Ok(rx) = self.job_rx.lock() {
             while rx.try_recv().is_ok() {}
@@ -358,9 +368,10 @@ impl<R: Send + 'static> AdaptivePool<R> {
             let result_tx = self.result_tx.clone();
             let work = self.work.clone();
             let alive_flag = alive.clone();
+            let cancelled = self.cancelled.clone();
             workers.push((id, alive));
             thread::spawn(move || loop {
-                if !alive_flag.load(Ordering::Relaxed) {
+                if !alive_flag.load(Ordering::Relaxed) || cancelled.load(Ordering::Relaxed) {
                     break;
                 }
                 let path = {
@@ -371,6 +382,10 @@ impl<R: Send + 'static> AdaptivePool<R> {
                         Err(mpsc::RecvTimeoutError::Disconnected) => break,
                     }
                 };
+                // Cancelled between dequeue and start — drop the job.
+                if cancelled.load(Ordering::Relaxed) {
+                    break;
+                }
                 let t0 = Instant::now();
                 let result = work(&path);
                 let latency = t0.elapsed();

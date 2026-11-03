@@ -155,9 +155,14 @@ fn serve(
         headless.push_credit_kb,
         move_dir,
     );
-    imagecropper::server::spawn_scan_feeder(&state, stream);
-    let _watcher = imagecropper::server::watch::spawn(state.clone(), scan.clone());
-    run_server(addr, state, !headless.no_gui)
+    // The server binds and prints its URL first; scan feeding and the FS
+    // watcher (recursive registration can take a long time on remote
+    // mounts) start once it is reachable.
+    let start_state = state.clone();
+    run_server(addr, state, !headless.no_gui, move || {
+        imagecropper::server::spawn_scan_feeder(&start_state, stream);
+        imagecropper::server::watch::spawn(start_state, scan);
+    })
 }
 
 /// `album -G`: pregenerate every preview as scan results stream in.
