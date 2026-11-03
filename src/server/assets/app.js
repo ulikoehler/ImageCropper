@@ -160,10 +160,11 @@ const WANT_WORKERS=6, WANT_CHUNK=8, WANT_TIMEOUT=8000;
 // A requested thumbnail that never arrives is retried: drop it from
 // `pending` so the next draw() re-requests it.
 const PENDING_TIMEOUT=8000;
-// The server fails a wedged delete/move after 30s and acks it. This local
-// watchdog is the backstop if that ack is lost — the counter can never sit
-// at "1 moving" forever.
-const ACTION_TIMEOUT=30000;
+// A dispatched action the server never acknowledges is retried by the user
+// (the socket must be dead). Once the server acks the enqueue the op is in
+// its queue and is finished even across a restart — so a queued delete is
+// never timed out here, however slow the filesystem is.
+const ACTION_ACK_TIMEOUT=30000;
 let wantQ=[], wantCtr=0;
 const wantSlots=new Map();   // reqId -> {left:Set(ids), at:ms}
 function pumpWants(){
@@ -187,9 +188,12 @@ setInterval(()=>{
   for(const [id,at] of pending)
     if(now-at>PENDING_TIMEOUT){pending.delete(id);dirty=true}
   for(const [tag,a] of pendingActions)
-    if(now-a.at>ACTION_TIMEOUT){
+    if(!a.queued&&now-a.at>ACTION_ACK_TIMEOUT){
       pendingActions.delete(tag);
-      statusEl.textContent=`${a.kind} timed out after ${ACTION_TIMEOUT/1000}s`;
+      // The dispatch never reached the server: bring its tiles back so the
+      // user can retry instead of looking at holes.
+      for(const i of a.ids||[])if(items[i]&&items[i].removed)items[i].removed=false;
+      statusEl.textContent=`${a.kind} was not acknowledged — try again`;
       dirty=true;
     }
   if(dirty){pumpWants()}
@@ -224,6 +228,11 @@ function onData(f){
       ()=>{pending.delete(id);scheduleDraw()});   // undecodable: retry later
   } else if(f.type===EV_EVENT){
     const ev=JSON.parse(new TextDecoder().decode(f.payload));
+    if(ev.ev==="action-queued"){
+      const act=pendingActions.get(ev.tag);
+      // The op is in the server's queue — it will finish in its own time.
+      if(act)act.queued=true;
+    }
     if(ev.ev==="action-done"){
       const act=pendingActions.get(ev.tag);
       if(act!=null){
@@ -442,7 +451,7 @@ addEventListener("keydown",e=>{
     const at=targets.length?Math.min(...targets):focus;
     for(const i of targets){
       const it=items[i];if(!it||it.removed)continue;const tag=nextTag();
-      pendingActions.set(tag,{kind,at:Date.now()});
+      pendingActions.set(tag,{kind,at:Date.now(),queued:false,ids:[it.id]});
       // Optimistic: the tile vanishes now, the FS op lands async.
       it.removed=true;thumbs.delete(it.id);
       dataWs.send(frame(CL_ACTION,0,str(JSON.stringify({

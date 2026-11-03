@@ -25,20 +25,26 @@ pub fn verbose() -> bool {
     VERBOSE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-static SIGINT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static SIGINT_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Install a SIGINT (Ctrl-C) handler that only raises a flag — callers
 /// poll [`sigint_received`] and run their own graceful shutdown (stop
-/// preview generation, preferentially finish queued deletes).
+/// preview generation, finish queued deletes). A second Ctrl-C bumps
+/// [`sigint_count`] so a drain loop can be abandoned.
 pub fn install_sigint_handler() {
     let _ = ctrlc::set_handler(|| {
-        SIGINT.store(true, std::sync::atomic::Ordering::Relaxed);
+        SIGINT_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     });
 }
 
 /// Whether Ctrl-C has been pressed since startup.
 pub fn sigint_received() -> bool {
-    SIGINT.load(std::sync::atomic::Ordering::Relaxed)
+    sigint_count() > 0
+}
+
+/// How many times Ctrl-C was pressed. `> 1` means "stop draining, quit now".
+pub fn sigint_count() -> usize {
+    SIGINT_COUNT.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 pub const TRASH_DIR: &str = ".imagecropper-trash";

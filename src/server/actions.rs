@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use eframe::egui;
@@ -18,6 +18,7 @@ use crate::fs_utils::previews::{preview_sig_u64, remove_previews_for, remove_pre
 use crate::fs_utils::{move_with_unique_name, prepare_dir, TRASH_DIR};
 use crate::image_utils::{build_output_image, decode_image_bytes, OutputFormat, SaveRequest};
 use crate::selection::Selection;
+use crate::server::io_gate::IoGate;
 
 /// Rotation applied to a crop save.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -246,12 +247,6 @@ pub struct ActionEnvelope {
     pub action: Action,
 }
 
-/// A delete/move/crop/resave that hasn't finished within this window is
-/// reported as failed. A wedged FS op (unresponsive mount, stuck
-/// cross-device copy) must never leave the client's pending counter — or the
-/// manifest tombstone — stuck forever.
-pub const ACTION_TIMEOUT: Duration = Duration::from_secs(30);
-
 /// One queued delete/move. Unlike crop/resave these never touch the
 /// `Saver`, so they run on a parallel pool instead of the serial thread.
 struct DestructiveJob {
@@ -262,14 +257,13 @@ struct DestructiveJob {
     sig: u64,
 }
 
-/// A dispatched action awaiting completion — the bookkeeping that both
-/// `pending()` and the timeout sweep work from.
+/// A dispatched action awaiting completion. Delete/move are tracked by path
+/// ("marked for deletion"), crop/resave by client tag.
 struct PendingOp {
     tag: u32,
     id: u32,
     kind: ActionKind,
     path: PathBuf,
-    started: Instant,
 }
 
 impl PendingOp {
@@ -279,25 +273,6 @@ impl PendingOp {
             id,
             kind,
             path,
-            started: Instant::now(),
-        }
-    }
-
-    fn expired(&self, timeout: Duration) -> bool {
-        self.started.elapsed() >= timeout
-    }
-
-    fn timed_out(&self, timeout: Duration) -> ActionDone {
-        ActionDone {
-            tag: self.tag,
-            ok: false,
-            id: self.id,
-            kind: self.kind,
-            src: self.path.clone(),
-            new_path: None,
-            error: Some(format!("timed out after {}s", timeout.as_secs())),
-            new_sig: None,
-            bytes: None,
         }
     }
 }
@@ -311,7 +286,7 @@ struct DestructivePool {
 }
 
 impl DestructivePool {
-    fn new(workers: usize, move_dir: Option<PathBuf>) -> Self {
+    fn new(workers: usize, move_dir: Option<PathBuf>, gate: Arc<IoGate>) -> Self {
         let (job_tx, job_rx) = mpsc::channel::<DestructiveJob>();
         let job_rx = Arc::new(Mutex::new(job_rx));
         let (result_tx, result_rx) = mpsc::channel::<ActionDone>();
@@ -319,6 +294,7 @@ impl DestructivePool {
             let job_rx = job_rx.clone();
             let result_tx = result_tx.clone();
             let move_dir = move_dir.clone();
+            let gate = Arc::clone(&gate);
             thread::spawn(move || loop {
                 let job = {
                     let Ok(rx) = job_rx.lock() else { return };
@@ -328,6 +304,11 @@ impl DestructivePool {
                         Err(mpsc::RecvTimeoutError::Disconnected) => return,
                     }
                 };
+                // Client work first: while the web client is waiting for
+                // images, background deletes/moves hold off so they don't
+                // compete for IO. The wait is bounded, so the queue always
+                // drains.
+                gate.yield_to_clients();
                 let result = match job.kind {
                     ActionKind::Delete => trash_one(&job.path, job.sig),
                     ActionKind::Move => move_one(&job.path, job.sig, move_dir.as_deref()),
@@ -386,7 +367,8 @@ impl DestructivePool {
 /// Delete/move bypass it on [`DestructivePool`] — they never touch the Saver.
 /// Jobs carry the client's tag so completions can be correlated.
 /// Dispatched-but-unfinished actions are tracked in [`PendingOp`] maps so
-/// shutdown can drain them and so a wedged op can be failed on timeout.
+/// shutdown can drain them; they are never timed out — a queued delete is
+/// finished even if it is slow.
 pub struct ActionQueue {
     job_tx: Sender<(u32, Action, PathBuf)>,
     result_rx: Mutex<Receiver<ActionDone>>,
@@ -403,27 +385,28 @@ pub struct ActionQueue {
     /// Successfully deleted/moved paths whose cached previews still need
     /// purging — batched until the queue drains.
     cleanup: Mutex<Vec<PathBuf>>,
-    /// How long an op may stay unfinished before it is reported as failed.
-    timeout: Duration,
+    /// Client-first IO priority, shared with preview production.
+    gate: Arc<IoGate>,
 }
 
 impl ActionQueue {
     /// `delete_workers` bounds how many deletes/moves run at once.
     pub fn new(saver_threads: usize, delete_workers: usize, move_dir: Option<PathBuf>) -> Self {
-        Self::with_timeout(saver_threads, delete_workers, move_dir, ACTION_TIMEOUT)
+        Self::with_gate(saver_threads, delete_workers, move_dir, IoGate::new())
     }
 
-    /// Same as [`ActionQueue::new`] with an explicit timeout — tests use a
-    /// short one so a wedged op can be observed without waiting 30s.
-    pub fn with_timeout(
+    /// Same as [`ActionQueue::new`] with the server's shared IO gate so
+    /// deletes can yield to client requests.
+    pub fn with_gate(
         saver_threads: usize,
         delete_workers: usize,
         move_dir: Option<PathBuf>,
-        timeout: Duration,
+        gate: Arc<IoGate>,
     ) -> Self {
         let (job_tx, job_rx) = mpsc::channel::<(u32, Action, PathBuf)>();
         let (result_tx, result_rx) = mpsc::channel::<ActionDone>();
         let serial_move_dir = move_dir.clone();
+        let serial_gate = Arc::clone(&gate);
         thread::spawn(move || {
             let mut saver = Saver::new(saver_threads.max(1));
             // Async saves awaiting completion: (tag, kind, id, src, out).
@@ -474,6 +457,10 @@ impl ActionQueue {
                             }
                             _ => None,
                         };
+                        // Client work first — a crop/resave reads and writes
+                        // whole images, so it must not compete with a client
+                        // that is waiting for thumbnails.
+                        serial_gate.yield_for(Duration::from_secs(2));
                         match execute(&action, &path, &mut saver, serial_move_dir.as_deref()) {
                             Ok((new_sig, bytes)) => {
                                 if new_sig.is_some() || bytes.is_some() {
@@ -529,13 +516,18 @@ impl ActionQueue {
         Self {
             job_tx,
             result_rx: Mutex::new(result_rx),
-            destructive_pool: DestructivePool::new(delete_workers, move_dir),
+            destructive_pool: DestructivePool::new(delete_workers, move_dir, Arc::clone(&gate)),
             immediate: Mutex::new(Vec::new()),
             destructive: Mutex::new(HashMap::new()),
             serial: Mutex::new(HashMap::new()),
             cleanup: Mutex::new(Vec::new()),
-            timeout,
+            gate,
         }
+    }
+
+    /// The IO gate this queue yields to (shared with preview production).
+    pub fn io_gate(&self) -> Arc<IoGate> {
+        Arc::clone(&self.gate)
     }
 
     /// Actions dispatched but not yet completed — shutdown waits on this.
@@ -614,9 +606,7 @@ impl ActionQueue {
         {
             let mut destructive = self.destructive.lock().unwrap();
             for done in self.destructive_pool.poll() {
-                // Absent → already reported as timed out. A late completion
-                // must not be double-counted, nor resurrect a tombstone the
-                // client has already been told about.
+                // Absent → the duplicate-dispatch path already answered it.
                 if destructive.remove(&done.src).is_none() {
                     continue;
                 }
@@ -624,19 +614,6 @@ impl ActionQueue {
                     purged.push(done.src.clone());
                 }
                 out.push(done);
-            }
-            // Wedged delete/move (hung mount, stuck cross-device move):
-            // fail it so the client's counter clears and the item comes back
-            // instead of the whole album looking stuck.
-            let expired: Vec<PathBuf> = destructive
-                .iter()
-                .filter(|(_, op)| op.expired(self.timeout))
-                .map(|(p, _)| p.clone())
-                .collect();
-            for path in expired {
-                if let Some(op) = destructive.remove(&path) {
-                    out.push(op.timed_out(self.timeout));
-                }
             }
         }
 
@@ -646,20 +623,9 @@ impl ActionQueue {
             let result_rx = self.result_rx.lock().unwrap();
             while let Ok(done) = result_rx.try_recv() {
                 if serial.remove(&done.tag).is_none() {
-                    continue; // already reported as timed out
+                    continue;
                 }
                 out.push(done);
-            }
-            drop(result_rx);
-            let expired: Vec<u32> = serial
-                .iter()
-                .filter(|(_, op)| op.expired(self.timeout))
-                .map(|(t, _)| *t)
-                .collect();
-            for tag in expired {
-                if let Some(op) = serial.remove(&tag) {
-                    out.push(op.timed_out(self.timeout));
-                }
             }
         }
 
@@ -680,105 +646,5 @@ impl ActionQueue {
             }
         }
         out
-    }
-
-    /// Test hook: register a dispatched-but-unfinished op without a worker,
-    /// backdated so `poll()` already considers it expired. Reproduces a wedged
-    /// FS op (unresponsive mount) that never returns a result.
-    #[cfg(test)]
-    fn wedge(&self, tag: u32, id: u32, kind: ActionKind, path: PathBuf, age: Duration) {
-        let op = PendingOp {
-            tag,
-            id,
-            kind,
-            path: path.clone(),
-            started: Instant::now().checked_sub(age).unwrap_or_else(Instant::now),
-        };
-        match kind {
-            ActionKind::Delete | ActionKind::Move => {
-                self.destructive.lock().unwrap().insert(path, op);
-            }
-            ActionKind::Crop | ActionKind::Resave => {
-                self.serial.lock().unwrap().insert(tag, op);
-            }
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// A delete/move that never completes must be failed on timeout — the
-    /// client's counter and the manifest tombstone both depend on it.
-    #[test]
-    fn wedged_destructive_action_times_out() {
-        let queue = ActionQueue::with_timeout(1, 4, None, Duration::from_millis(50));
-        let path = PathBuf::from("/wedged/photo.jpg");
-        queue.wedge(7, 3, ActionKind::Delete, path.clone(), Duration::from_secs(1));
-
-        assert_eq!(queue.pending(), 1);
-        assert!(queue.is_pending(&path));
-
-        let done = queue.poll();
-        assert_eq!(done.len(), 1, "exactly one completion reported");
-        assert_eq!(done[0].tag, 7);
-        assert!(!done[0].ok);
-        assert_eq!(done[0].id, 3);
-        assert_eq!(done[0].src, path);
-        assert!(
-            done[0].error.as_deref().unwrap_or("").contains("timed out"),
-            "error names the timeout: {:?}",
-            done[0].error
-        );
-
-        assert_eq!(queue.pending(), 0, "timed-out op stops counting as pending");
-        assert!(
-            !queue.is_pending(&path),
-            "timed-out path is no longer marked for deletion"
-        );
-        assert!(queue.poll().is_empty(), "a timeout is reported only once");
-    }
-
-    /// A move wedged the same way must not keep the sweep or shutdown stuck.
-    #[test]
-    fn wedged_move_times_out() {
-        let queue = ActionQueue::with_timeout(1, 4, None, Duration::from_millis(50));
-        let path = PathBuf::from("/wedged/moved.jpg");
-        queue.wedge(9, 5, ActionKind::Move, path.clone(), Duration::from_secs(1));
-
-        let done = queue.poll();
-        assert_eq!(done.len(), 1);
-        assert_eq!(done[0].kind, ActionKind::Move);
-        assert!(!done[0].ok);
-        assert_eq!(queue.pending(), 0);
-    }
-
-    /// Crop/resave go through the serial worker; a stalled save must also be
-    /// failed rather than holding `pending()` above zero forever.
-    #[test]
-    fn wedged_serial_action_times_out() {
-        let queue = ActionQueue::with_timeout(1, 4, None, Duration::from_millis(50));
-        let path = PathBuf::from("/wedged/resave.jpg");
-        queue.wedge(11, 2, ActionKind::Resave, path.clone(), Duration::from_secs(1));
-
-        assert_eq!(queue.pending(), 1);
-        let done = queue.poll();
-        assert_eq!(done.len(), 1);
-        assert_eq!(done[0].tag, 11);
-        assert!(!done[0].ok);
-        assert_eq!(queue.pending(), 0);
-    }
-
-    /// A fresh op is not expired: poll() must leave it alone.
-    #[test]
-    fn fresh_action_is_not_timed_out() {
-        let queue = ActionQueue::with_timeout(1, 4, None, ACTION_TIMEOUT);
-        let path = PathBuf::from("/wedged/fresh.jpg");
-        queue.wedge(13, 1, ActionKind::Delete, path.clone(), Duration::from_secs(0));
-
-        assert!(queue.poll().is_empty(), "not expired yet");
-        assert_eq!(queue.pending(), 1);
-        assert!(queue.is_pending(&path));
     }
 }

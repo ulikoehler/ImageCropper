@@ -380,27 +380,79 @@ test.describe("album grid", () => {
     );
   });
 
-  test("a pending action the server never acks is dropped by the watchdog", async ({
+  test("a queued action is never timed out; an unacknowledged one is", async ({
     page,
   }) => {
     await openApp(page);
     await waitAllCached(page);
 
-    // Simulate an action whose completion event never arrives (lost ack, or
-    // a wedged FS op on the server): it must not leave the top bar stuck at
-    // "moving 1" forever.
+    // A delete the server has accepted into its queue ("action-queued") must
+    // keep counting however slow the filesystem is — no local deadline.
+    // One the server never acknowledged is dropped so the tile can be retried.
     await page.evaluate(() => {
-      pendingActions.set(424242, { kind: "move", at: Date.now() - 31_000 });
+      pendingActions.set(424242, {
+        kind: "move",
+        at: Date.now() - 300_000,
+        queued: true,
+        ids: [],
+      });
+      pendingActions.set(424243, {
+        kind: "delete",
+        at: Date.now() - 300_000,
+        queued: false,
+        ids: [],
+      });
       scheduleDraw();
     });
     await expect(page.locator("#top")).toContainText("moving 1");
+    await expect(page.locator("#top")).toContainText("deleting 1");
 
-    // The watchdog (1s interval, 30s limit) clears it and reports the failure.
-    await expect(page.locator("#top")).not.toContainText("moving", {
+    // The watchdog only expires the unacknowledged dispatch.
+    await expect(page.locator("#top")).not.toContainText("deleting", {
       timeout: 5_000,
     });
-    await expect(page.locator("#status")).toContainText("timed out");
-    expect(await page.evaluate(() => pendingActions.size)).toBe(0);
+    await expect(page.locator("#status")).toContainText("not acknowledged");
+    await expect(page.locator("#top")).toContainText("moving 1");
+    expect(await page.evaluate(() => pendingActions.size)).toBe(1);
+  });
+
+  test("the server acknowledges a delete as queued", async ({ page }) => {
+    await openApp(page);
+    await waitAllCached(page);
+
+    // Record `action-queued` events as they arrive.
+    await page.evaluate(() => {
+      window._acked = [];
+      const orig = onData;
+      window.onData = (f) => {
+        if (f.type === EV_EVENT) {
+          const ev = JSON.parse(new TextDecoder().decode(f.payload));
+          if (ev.ev === "action-queued") window._acked.push(ev.tag);
+        }
+        return orig(f);
+      };
+    });
+
+    // Dispatch a delete the server rejects (bogus signature) but whose
+    // *enqueue* is acknowledged first — that ack is what keeps the client
+    // from timing the op out.
+    const tag = await page.evaluate(() => {
+      const id = items.findIndex((it) => it && !it.removed);
+      const tag = nextTag();
+      dataWs.send(
+        frame(
+          CL_ACTION,
+          0,
+          str(JSON.stringify({ tag, kind: "delete", id, sig: "1" })),
+        ),
+      );
+      return tag;
+    });
+    await page.waitForFunction(
+      (t) => window._acked.includes(t),
+      tag,
+      { timeout: 10_000 },
+    );
   });
 
   test("scrolling loads the tiles that come into view", async ({ page }) => {
@@ -436,21 +488,24 @@ test.describe("album grid", () => {
       { timeout: 15_000 },
     );
 
-    // Which tiles the top of the album had cached before scrolling.
-    const atTop = await page.evaluate(() => [...thumbs.keys()]);
-
-    // Jump to the last row: those tiles were never in view, so scrolling is
-    // what has to fetch them.
+    // Jump to the last row and drop its thumbnails: the tiles that are now
+    // in view are exactly the ones "not already loaded", so scrolling is what
+    // has to fetch them.
     const target = await page.evaluate(() => {
       scrollY = rowY(rows.length - 1);
+      const vis = tileRects().filter(
+        (t) => t.y + t.h > scrollY && t.y < scrollY + canvas.height,
+      );
+      for (const t of vis) {
+        thumbs.delete(t.i);
+        pending.delete(t.i);
+      }
       scheduleDraw();
-      return {
-        ids: tileRects()
-          .filter((t) => t.y + t.h > scrollY && t.y < scrollY + canvas.height)
-          .map((t) => t.i),
-      };
+      return { ids: vis.map((t) => t.i) };
     });
     expect(target.ids.length).toBeGreaterThan(0);
+    expect(await page.evaluate((ids) => ids.every((i) => !thumbs.has(i)), target.ids))
+      .toBe(true);
 
     await page.waitForFunction(
       () => {
@@ -464,9 +519,7 @@ test.describe("album grid", () => {
     );
     const after = await visible();
     expect(after.every((t) => t.loaded)).toBe(true);
-    // The scrolled-to tiles include ones that were not cached before, so the
-    // scroll itself is what loaded them.
-    const fresh = after.filter((t) => !atTop.includes(t.i));
-    expect(fresh.length).toBeGreaterThan(0);
+    // Every tile the scroll exposed got (re)loaded.
+    expect(after.map((t) => t.i)).toEqual(expect.arrayContaining(target.ids));
   });
 });

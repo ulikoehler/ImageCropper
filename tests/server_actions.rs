@@ -205,18 +205,17 @@ fn action_queue_deletes_bulk_in_parallel() {
     });
 }
 
-/// An op that misses its deadline must be reported as failed — and every
-/// dispatched tag must get exactly one completion, so `pending()` always
-/// drains (no 60s shutdown wait, no stuck client counter).
+/// Deletes are queued and always finished: every dispatched tag gets exactly
+/// one completion and `pending()` drains, so a slow filesystem delays work
+/// instead of failing it.
 #[test]
-fn action_queue_times_out_wedged_ops_and_always_drains() {
+fn queued_deletes_all_finish() {
     with_temp_workdir(|root| {
-        // A 1ms deadline with a single worker: the ops queued behind the
-        // first one cannot finish in time, exactly like a wedged FS op.
-        let queue = ActionQueue::with_timeout(1, 1, None, std::time::Duration::from_millis(1));
+        // One worker, many jobs: the queue is the thing under test.
+        let queue = ActionQueue::new(1, 1, None);
         let mut tags = Vec::new();
         for i in 0..50u32 {
-            let img = root.join(format!("slow{i:02}.png"));
+            let img = root.join(format!("queued{i:02}.png"));
             write_image(&img, &solid_image(8, 8, [i as u8, 1, 1, 255]));
             let sig = preview_sig_u64(&img).unwrap();
             queue.dispatch(i, Action::Delete { id: i, sig }, img);
@@ -230,16 +229,10 @@ fn action_queue_times_out_wedged_ops_and_always_drains() {
             for done in queue.poll() {
                 assert!(
                     !seen.contains(&done.tag),
-                    "tag {} completed twice — late results must be dropped",
+                    "tag {} completed twice",
                     done.tag
                 );
-                if !done.ok {
-                    assert!(
-                        done.error.as_deref().unwrap_or("").contains("timed out")
-                            || done.error.is_some(),
-                        "failed op carries an error"
-                    );
-                }
+                assert!(done.ok, "queued delete must succeed: {:?}", done.error);
                 seen.push(done.tag);
             }
             std::thread::sleep(std::time::Duration::from_millis(2));
@@ -248,5 +241,40 @@ fn action_queue_times_out_wedged_ops_and_always_drains() {
         assert_eq!(seen.len(), tags.len(), "every dispatched op completed once");
         seen.sort_unstable();
         assert_eq!(seen, tags);
+    });
+}
+
+/// Background deletes yield to live client requests but still finish: the
+/// server must not let a busy client starve the queue.
+#[test]
+fn deletes_yield_to_client_work_and_still_finish() {
+    with_temp_workdir(|root| {
+        let gate = imagecropper::server::IoGate::new();
+        let queue = ActionQueue::with_gate(1, 4, None, gate.clone());
+        let img = root.join("yield.png");
+        write_image(&img, &solid_image(8, 8, [3, 3, 3, 255]));
+        let sig = preview_sig_u64(&img).unwrap();
+
+        // A client request is in flight.
+        let client = gate.client_work();
+        queue.dispatch(1, Action::Delete { id: 0, sig }, img.clone());
+
+        // The delete holds off while the client is being served.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(queue.poll().is_empty(), "delete must wait for the client");
+        assert!(img.exists());
+
+        // Once the client is done, the queued delete lands promptly.
+        drop(client);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut done = Vec::new();
+        while done.is_empty() && std::time::Instant::now() < deadline {
+            done.extend(queue.poll());
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(done.len(), 1);
+        assert!(done[0].ok, "delete failed: {:?}", done[0].error);
+        assert!(!img.exists());
+        assert_eq!(queue.pending(), 0);
     });
 }

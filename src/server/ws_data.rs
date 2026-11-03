@@ -288,6 +288,20 @@ async fn handle(socket: WebSocket, state: Arc<ServerState>) {
                     match state.path_of(id) {
                         Some(path) => {
                             state.actions.dispatch(env.tag, env.action, path.clone());
+                            // Ack the *enqueue* right away: the op is now in
+                            // the server's queue and will be finished (also
+                            // across Ctrl-C), so the client must stop
+                            // counting it against any local deadline.
+                            if let Ok(json) = serde_json::to_string(&serde_json::json!({
+                                "ev": "action-queued",
+                                "tag": env.tag,
+                                "id": id,
+                                "kind": kind,
+                            })) {
+                                let _ = ev_tx
+                                    .send(Frame::new(EV_EVENT, 0, json.into_bytes()))
+                                    .await;
+                            }
                             // "Marked for deletion": tombstone queued
                             // delete/move ops immediately so client reloads
                             // and fs-watch rescans can't resurrect the file

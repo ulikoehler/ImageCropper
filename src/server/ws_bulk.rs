@@ -87,11 +87,16 @@ async fn handle(socket: WebSocket, state: Arc<ServerState>) {
                             .items
                             .get(id as usize)
                             .cloned();
-                        let produced =
-                            tokio::task::spawn_blocking(move || produce_full(&path, want_fmt, q))
-                                .await
-                                .ok()
-                                .flatten();
+                        // A full-resolution read is a live client request:
+                        // background work (deletes, preload) yields to it.
+                        let gate = state.io_gate.clone();
+                        let produced = tokio::task::spawn_blocking(move || {
+                            let _client = gate.client_work();
+                            produce_full(&path, want_fmt, q)
+                        })
+                        .await
+                        .ok()
+                        .flatten();
                         if let Some(((bytes, w, h), sig)) = produced.zip(item.map(|i| i.sig)) {
                             let _ = out_tx
                                 .send(Frame::new(

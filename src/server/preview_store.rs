@@ -15,6 +15,7 @@ use std::{
 use lru::LruCache;
 
 use crate::fs_utils::{adaptive_pool::AdaptivePool, previews::produce_preview_bytes};
+use crate::server::io_gate::IoGate;
 
 /// A produced preview: raw JPEG bytes + natural source dimensions.
 #[derive(Debug, Clone)]
@@ -35,16 +36,28 @@ pub struct PreviewStore {
     /// Set by `stop()`: all new production (pool AND inline `get_or_produce`)
     /// is refused. Cached RAM hits are still served.
     stopped: AtomicBool,
+    /// Client-first IO priority: live requests mark it, background preload
+    /// and destructive work yield to it.
+    gate: Arc<IoGate>,
 }
 
 impl PreviewStore {
     /// `concurrency` is the scaling ceiling (`-j`); `ram_cache` entries held
     /// decoded-to-JPEG in RAM.
     pub fn new(concurrency: usize, ram_cache: usize) -> Self {
+        Self::with_gate(concurrency, ram_cache, IoGate::new())
+    }
+
+    /// Same as [`PreviewStore::new`] sharing the server's IO gate.
+    pub fn with_gate(concurrency: usize, ram_cache: usize, gate: Arc<IoGate>) -> Self {
         let dims = Arc::new(RwLock::new(HashMap::new()));
         let worker_dims = dims.clone();
+        let worker_gate = Arc::clone(&gate);
         Self {
             pool: AdaptivePool::new(2, concurrency.max(1), move |path| {
+                // Speculative preload: yield to live client requests instead
+                // of competing with them for IO.
+                worker_gate.yield_to_clients();
                 let hint = worker_dims.read().unwrap().get(path).copied();
                 produce_preview_bytes(path, hint).map(|(jpeg, w, h)| Preview {
                     jpeg: Arc::new(jpeg),
@@ -56,6 +69,7 @@ impl PreviewStore {
             pending: Mutex::new(HashSet::new()),
             dims,
             stopped: AtomicBool::new(false),
+            gate,
         }
     }
 
@@ -122,6 +136,9 @@ impl PreviewStore {
         if self.stopped() {
             return None;
         }
+        // A live client is waiting for this — mark it so background work
+        // (preload, deletes, crops) holds off while it runs.
+        let _client = self.gate.client_work();
         let hint = self.dims.read().unwrap().get(path).copied();
         let preview = produce_preview_bytes(path, hint).map(|(jpeg, w, h)| Preview {
             jpeg: Arc::new(jpeg),

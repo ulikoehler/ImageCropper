@@ -6,6 +6,7 @@
 
 pub mod actions;
 pub mod http;
+pub mod io_gate;
 pub mod manifest;
 pub mod preview_store;
 pub mod proto;
@@ -24,6 +25,7 @@ use axum::{routing::get, Router};
 use tokio::sync::broadcast;
 
 pub use actions::{Action, ActionDone, ActionEnvelope, ActionKind, ActionQueue, RotateOp};
+pub use io_gate::IoGate;
 pub use manifest::{Manifest, ManifestItem, ManifestPatch, ServeMode};
 pub use preview_store::{Preview, PreviewStore};
 pub use proto::*;
@@ -50,6 +52,14 @@ pub struct ServerState {
     /// Bumped on every resync broadcast — per-client push queues reset on it
     /// because the resync reassigned all manifest ids.
     pub resync_seq: std::sync::atomic::AtomicU64,
+    /// Paths that left the album (deleted/moved) with the signature they had
+    /// when they left. A rescan that listed the directory *before* the op
+    /// landed re-inserts them otherwise — that is how already-deleted files
+    /// used to come back.
+    gone: std::sync::Mutex<std::collections::HashMap<PathBuf, (u64, std::time::Instant)>>,
+    /// Client-first IO priority: live client requests mark it, background
+    /// work (deletes/moves, crops, speculative preload) yields to it.
+    pub io_gate: Arc<IoGate>,
 }
 
 impl ServerState {
@@ -64,7 +74,14 @@ impl ServerState {
         move_dir: Option<PathBuf>,
     ) -> Arc<Self> {
         let manifest = Manifest::build(&files, &roots, mode, mouse_select, 1);
-        let previews = Arc::new(PreviewStore::new(parallel, 2048));
+        // One gate for the whole server: preview production marks live
+        // client requests on it, deletes/crops/preload yield to them.
+        let io_gate = IoGate::new();
+        let previews = Arc::new(PreviewStore::with_gate(
+            parallel,
+            2048,
+            Arc::clone(&io_gate),
+        ));
         for item in &manifest.items {
             if let Some(path) = manifest.path_of(item.id) {
                 previews.note_dims(&path, (item.w, item.h));
@@ -76,10 +93,11 @@ impl ServerState {
             manifest: Arc::new(RwLock::new(manifest)),
             roots,
             previews,
-            actions: Arc::new(ActionQueue::new(
+            actions: Arc::new(ActionQueue::with_gate(
                 parallel.max(1).min(4),
                 parallel.max(32),
                 move_dir,
+                Arc::clone(&io_gate),
             )),
             events,
             mode,
@@ -87,7 +105,63 @@ impl ServerState {
             token,
             initial_credit: push_credit_kb as u64 * 1024,
             resync_seq: std::sync::atomic::AtomicU64::new(0),
+            gone: std::sync::Mutex::new(std::collections::HashMap::new()),
+            io_gate,
         })
+    }
+
+    /// How long a departed path stays suppressed. Long enough to cover a
+    /// rescan that started before the delete landed; a file re-created with
+    /// different content is let straight through.
+    const GONE_TTL: Duration = Duration::from_secs(300);
+
+    /// Remember that `path` left the album so a stale directory listing can't
+    /// put it back. The signature is kept so a *re-created* file (different
+    /// size/mtime) is still accepted.
+    fn note_gone(&self, path: &Path) {
+        let sig = {
+            let m = self.manifest.read().unwrap();
+            m.position_of(path)
+                .and_then(|id| m.items.get(id as usize).map(|i| i.sig))
+                .unwrap_or(0)
+        };
+        let mut gone = self.gone.lock().unwrap();
+        if gone.len() > 4096 {
+            let ttl = Self::GONE_TTL;
+            gone.retain(|_, (_, at)| at.elapsed() < ttl);
+        }
+        let entry = gone
+            .entry(path.to_path_buf())
+            .or_insert((sig, std::time::Instant::now()));
+        // A later call (post-success) can no longer read the item's sig —
+        // keep the one recorded while it was still live.
+        if entry.0 == 0 {
+            entry.0 = sig;
+        }
+    }
+
+    /// True while `path` must stay out of the manifest: it left the album and
+    /// either no longer exists or still holds the content it had when it left.
+    fn is_gone(&self, path: &Path) -> bool {
+        let mut gone = self.gone.lock().unwrap();
+        let Some(&(sig, at)) = gone.get(path) else {
+            return false;
+        };
+        if at.elapsed() >= Self::GONE_TTL {
+            gone.remove(path);
+            return false;
+        }
+        match crate::fs_utils::previews::preview_sig_u64(path) {
+            // Gone from disk (or unreadable) — keep it out of the listing.
+            None => true,
+            // Same content as when it left: a stale listing, not a new file.
+            Some(now) if sig != 0 && now == sig => true,
+            // Re-created with different content — it is a new file.
+            Some(_) => {
+                gone.remove(path);
+                false
+            }
+        }
     }
 
     /// Manifest id → absolute path.
@@ -118,8 +192,10 @@ impl ServerState {
         let sniffed: Vec<(PathBuf, u32, u32, u64, u64)> = files
             .into_iter()
             // Queued for delete/move — "marked for deletion", must not
-            // resurface before the op lands.
-            .filter(|(p, _)| !self.actions.is_pending(p))
+            // resurface before the op lands. Already departed (a scan batch
+            // enumerated the directory before the rename) — must not come
+            // back either.
+            .filter(|(p, _)| !self.actions.is_pending(p) && !self.is_gone(p))
             .map(|(p, known_bytes)| {
                 let (w, h) = image::image_dimensions(&p).unwrap_or((0, 0));
                 let bytes = known_bytes
@@ -254,6 +330,9 @@ impl ServerState {
     /// the path resolves to whatever id currently holds it, so a rescan
     /// mid-action can't tombstone the wrong slot.
     pub fn remove_path(&self, path: &Path) {
+        // Remember the departure *before* the slot is tombstoned: a rescan
+        // that already listed this directory must not put it back.
+        self.note_gone(path);
         let id = self.manifest.read().unwrap().position_of(path);
         if let Some(id) = id {
             self.remove_ids(&[id]);
@@ -265,6 +344,9 @@ impl ServerState {
     /// Falls back to [`Self::upsert_files`] when a rescan already compacted
     /// the slot away.
     pub fn restore_path(&self, path: &Path) {
+        // The op failed, so the file never left: forget the departure or the
+        // item could never come back.
+        self.gone.lock().unwrap().remove(path);
         enum Out {
             Live,
             Missing,
@@ -412,10 +494,12 @@ impl ServerState {
     /// Returns the new manifest for broadcast/patch purposes.
     pub fn rebuild_manifest(&self, files: Vec<PathBuf>, roots: &[PathBuf]) {
         // Paths queued for delete/move are "marked for deletion" — a rebuild
-        // must not resurrect them just because the file still exists.
+        // must not resurrect them just because the file still exists. Paths
+        // that already left (the listing predates the rename) must not come
+        // back either.
         let files: Vec<PathBuf> = files
             .into_iter()
-            .filter(|p| !self.actions.is_pending(p))
+            .filter(|p| !self.actions.is_pending(p) && !self.is_gone(p))
             .collect();
         // Reuse stored dims/sig for files whose (size, mtime) signature is
         // unchanged — a rescan then stats each file instead of re-parsing
@@ -534,26 +618,31 @@ pub fn build_router(state: Arc<ServerState>) -> Router {
         .with_state(state)
 }
 
-/// Ctrl-C shutdown: stop preview generation immediately, then wait for
-/// queued deletes/moves/etc. to drain — destructive ops are preferential.
-/// The wait is bounded well below `ACTION_TIMEOUT`: a wedged op
-/// must not hold the process hostage.
+/// Ctrl-C shutdown: stop preview generation immediately, then finish every
+/// queued delete/move/crop. There is deliberately no deadline — the queue is
+/// the user's work and it must land. A second Ctrl-C abandons the drain.
 async fn shutdown(state: &ServerState) {
     state.previews.stop();
-    let started = std::time::Instant::now();
-    let deadline = started + std::time::Duration::from_secs(10);
     let mut last = usize::MAX;
-    while state.actions.pending() > 0 && std::time::Instant::now() < deadline {
+    let mut last_report = std::time::Instant::now();
+    loop {
         let n = state.actions.pending();
+        if n == 0 {
+            break;
+        }
         if n != last {
             eprintln!("shutdown: finishing {n} queued action(s)…");
             last = n;
+            last_report = std::time::Instant::now();
+        } else if last_report.elapsed() >= std::time::Duration::from_secs(5) {
+            eprintln!("shutdown: still finishing {n} queued action(s)… (Ctrl-C again to quit)");
+            last_report = std::time::Instant::now();
+        }
+        if crate::fs_utils::sigint_count() > 1 {
+            eprintln!("shutdown: {n} action(s) left unfinished");
+            break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
-    let left = state.actions.pending();
-    if left > 0 {
-        eprintln!("shutdown: {left} action(s) still unfinished after 10s");
     }
 }
 

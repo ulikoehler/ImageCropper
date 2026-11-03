@@ -229,3 +229,50 @@ fn finish_scan_broadcasts_resync_patch() {
     assert_eq!(m.items[0].name, "a.png");
     assert_eq!(m.path_of(0).unwrap(), root.join("a.png"));
 }
+
+/// A delete that already landed must not come back when a rescan that was
+/// started *before* the rename delivers its (stale) listing. This is what
+/// made already-deleted files reappear in the web UI.
+#[test]
+fn a_completed_delete_stays_gone_through_stale_rescans() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let path_a = root.join("a.png");
+    write_image(&path_a, &solid_image(10, 10, [7, 8, 9, 255]));
+
+    let state = ServerState::new(
+        vec![path_a.clone()],
+        vec![root.to_path_buf()],
+        ServeMode::Album,
+        imagecropper::cli::MouseSelectMode::Sequence,
+        1,
+        None,
+        4096,
+        None,
+    );
+    assert_eq!(state.item_count(), 1);
+
+    // Eager tombstone (as /data does on CL_ACTION), then the rename lands.
+    state.remove_path(&path_a);
+    std::fs::remove_file(&path_a).unwrap();
+
+    // Stale listing from a scan that enumerated the directory earlier.
+    state.rebuild_manifest(vec![path_a.clone()], &[root.to_path_buf()]);
+    assert!(
+        state.manifest.read().unwrap().items.is_empty(),
+        "a departed path must not be re-listed"
+    );
+
+    // Nor may a late scan-feeder batch re-add it.
+    assert_eq!(state.upsert_files(vec![(path_a.clone(), None)]), 0);
+    assert_eq!(state.position_of(&path_a), None);
+
+    // A genuinely new file at the same path is listed again.
+    write_image(&path_a, &solid_image(12, 12, [1, 1, 1, 255]));
+    assert_eq!(
+        state.upsert_files(vec![(path_a.clone(), None)]),
+        1,
+        "a re-created file is new content, not the deleted one"
+    );
+    assert!(state.position_of(&path_a).is_some());
+}
