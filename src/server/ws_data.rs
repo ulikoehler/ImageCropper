@@ -170,18 +170,17 @@ async fn handle(socket: WebSocket, state: Arc<ServerState>) {
                         None => queue.lock().await.mark_pushed(id),
                     }
                 }
-                // Start every produce before awaiting any of them.
+                // Start every produce before awaiting any of them, then
+                // send in COMPLETION order — awaiting in spawn order lets
+                // one cold produce stall a batch of instant cache hits.
                 let previews = state.previews.clone();
-                let mut handles = Vec::new();
+                let mut handles = futures_util::stream::FuturesUnordered::new();
                 for (id, path, sig) in jobs {
                     let previews = previews.clone();
                     let produce_path = path.clone();
-                    handles.push((
-                        id,
-                        path,
-                        sig,
-                        tokio::task::spawn_blocking(move || previews.get_or_produce(&produce_path)),
-                    ));
+                    handles.push(tokio::task::spawn_blocking(move || {
+                        (id, path, sig, previews.get_or_produce(&produce_path))
+                    }));
                 }
                 if handles.is_empty() {
                     // Every id in this batch is queued for delete/move — give
@@ -189,8 +188,10 @@ async fn handle(socket: WebSocket, state: Arc<ServerState>) {
                     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                     continue;
                 }
-                for (id, path, sig, handle) in handles {
-                    let produced = handle.await.ok().flatten();
+                while let Some(done) = handles.next().await {
+                    let Ok((id, path, sig, produced)) = done else {
+                        continue;
+                    };
                     let mut q = queue.lock().await;
                     match produced {
                         Some(p) => {
