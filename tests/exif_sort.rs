@@ -43,7 +43,8 @@ fn exif_datetime_key_reads_datetime_original() {
     let tmp = tempdir().unwrap();
     let path = tmp.path().join("with_exif.jpg");
     let mut file = std::fs::File::create(&path).unwrap();
-    file.write_all(&jpeg_with_exif("2020:01:02 03:04:05")).unwrap();
+    file.write_all(&jpeg_with_exif("2020:01:02 03:04:05"))
+        .unwrap();
     drop(file);
 
     assert_eq!(exif_datetime_key(&path), Some((2020, 1, 2, 3, 4, 5)));

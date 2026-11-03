@@ -28,7 +28,6 @@ fn collect_images_includes_supported_extensions() {
     assert_eq!(files, expected);
 }
 
-
 #[test]
 fn collect_images_respects_recursive_flag() {
     let tmp = tempdir().unwrap();
@@ -120,9 +119,11 @@ fn move_with_unique_name_avoids_overwrites() {
         .collect();
     assert_eq!(moved_files.len(), 2);
     assert!(moved_files.iter().any(|p| p == &existing));
-    assert!(moved_files
-        .iter()
-        .any(|p| p.file_name().unwrap().to_string_lossy().starts_with("image-")));
+    assert!(moved_files.iter().any(|p| p
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .starts_with("image-")));
 }
 
 #[test]
@@ -163,7 +164,7 @@ fn backup_original_moves_file_to_originals_dir() {
 fn collect_images_handles_multiple_paths_and_mixed_inputs() {
     let tmp = tempdir().unwrap();
     let root = tmp.path();
-    
+
     // Create structure:
     // root/
     //   dir1/
@@ -171,30 +172,30 @@ fn collect_images_handles_multiple_paths_and_mixed_inputs() {
     //   dir2/
     //     img2.jpg
     //   img3.avif
-    
+
     let dir1 = root.join("dir1");
     fs::create_dir(&dir1).unwrap();
     fs::write(dir1.join("img1.png"), []).unwrap();
-    
+
     let dir2 = root.join("dir2");
     fs::create_dir(&dir2).unwrap();
     fs::write(dir2.join("img2.jpg"), []).unwrap();
-    
+
     let img3 = root.join("img3.avif");
     fs::write(&img3, []).unwrap();
-    
+
     // Test 1: Multiple directories
     let paths = vec![dir1.clone(), dir2.clone()];
     let mut files = collect_images(&paths, false).unwrap();
     files.sort();
     assert_eq!(files, vec![dir1.join("img1.png"), dir2.join("img2.jpg")]);
-    
+
     // Test 2: Mixed directory and file
     let paths = vec![dir1.clone(), img3.clone()];
     let mut files = collect_images(&paths, false).unwrap();
     files.sort();
     assert_eq!(files, vec![dir1.join("img1.png"), img3.clone()]);
-    
+
     // Test 3: Just files
     let paths = vec![dir1.join("img1.png"), img3.clone()];
     let mut files = collect_images(&paths, false).unwrap();
@@ -216,7 +217,8 @@ fn collect_images_with_glob_filters_applies_blacklist_and_whitelist_precedence()
         .unwrap()
         .unwrap();
 
-    let mut files = collect_images_with_filter(&[root.to_path_buf()], false, Some(&filter)).unwrap();
+    let mut files =
+        collect_images_with_filter(&[root.to_path_buf()], false, Some(&filter)).unwrap();
     files.sort();
 
     // The whitelist overrides the blacklist for keep-me.png and restricts
@@ -285,13 +287,19 @@ fn format_savings_summary_reports_per_file_min_max() {
     stats.record(1024, 2048); // grew by 1.0 KB
     let s = format_savings_summary(&stats);
     assert!(s.contains("in 3 file(s) (re)saved"));
-    assert!(s.contains("per file min/avg/max: -1.0 KB / 682 B / 3.0 KB"), "got: {s}");
+    assert!(
+        s.contains("per file min/avg/max: -1.0 KB / 682 B / 3.0 KB"),
+        "got: {s}"
+    );
 }
 
 #[test]
 fn format_deletion_summary_reports_deleted_bytes() {
     assert_eq!(format_deletion_summary(0), "Total deleted file size: 0 B");
-    assert_eq!(format_deletion_summary(2048), "Total deleted file size: 2.0 KB");
+    assert_eq!(
+        format_deletion_summary(2048),
+        "Total deleted file size: 2.0 KB"
+    );
 }
 
 #[test]

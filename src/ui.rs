@@ -69,4 +69,3 @@ pub struct KeyboardState {
     pub select_all: bool,
     pub skip: bool,
 }
-

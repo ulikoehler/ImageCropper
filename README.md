@@ -99,6 +99,12 @@ All previews are actively generated in the background for **all** images (priori
 
 Album mode accepts the same scanning options as `crop`: `-r/--recursive`, `--whitelist`, `--blacklist`, `--filter-syntax`, `-o/--order`, `-i/--inverse-order`, `-j/--parallel`, `-d/--dry-run` and `-v/--verbose`.
 
+Use `-m/--move DIR` to designate a destination directory (created if missing) — pressing **m** then moves all selected images there through a background queue, like deletion but non-destructive:
+
+```sh
+imagecropper album -m ~/keep -r ~/incoming-photos
+```
+
 ### Album controls
 
 *   **Mouse Click**: Select a single image.
@@ -109,6 +115,7 @@ Album mode accepts the same scanning options as `crop`: `-r/--recursive`, `--whi
 *   **Space**: Toggle the focused image's selection.
 *   **Ctrl + A**: Select all images.
 *   **Delete**: Move all selected images to `.imagecropper-trash` via a background deletion queue.
+*   **m**: Move all selected images to the `-m/--move` directory via a background queue; they disappear from the grid. (No-op with a status hint when `-m` was not given.)
 *   **+ / -**: Fine-grained zoom of the tile size.
 *   **W / w** (Shift+W / w): Increase / decrease the tile width in coarse steps.
 *   **Esc**: Clear the selection; with no selection, exit.

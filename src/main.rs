@@ -1,218 +1,21 @@
-use std::cmp::Ordering;
 use std::path::PathBuf;
 
-use anyhow::{anyhow, Result};
-use clap::{Args, Parser, Subcommand};
+use anyhow::Result;
+use clap::Parser;
 use eframe::egui;
-use rand::seq::SliceRandom;
 
 use imagecropper::album::{AlbumCropApp, AlbumOptions};
 use imagecropper::app::{AppOptions, ImageCropperApp};
-use imagecropper::fs_utils::{
-    collect_images_with_filter, exif_datetime_key, FilterSyntax, PathFilter,
-};
-use imagecropper::image_utils::OutputFormat;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
-enum SortOrder {
-    Filename,
-    Randomize,
-    Modified,
-    /// By file size, smallest first (same as size+)
-    Size,
-    /// By file size, smallest first
-    #[value(name = "size+")]
-    SizeAsc,
-    /// By file size, largest first
-    #[value(name = "size-")]
-    SizeDesc,
-    /// By EXIF capture time, oldest first (same as exif+)
-    Exif,
-    /// By EXIF capture time, oldest first
-    #[value(name = "exif+")]
-    ExifAsc,
-    /// By EXIF capture time, newest first
-    #[value(name = "exif-")]
-    ExifDesc,
-}
-
-#[derive(Parser, Debug)]
-#[command(
-    author,
-    version,
-    about = "Fullscreen image cropper with deletion workflow"
-)]
-struct Cli {
-    #[command(subcommand)]
-    command: Commands,
-}
-
-#[derive(Subcommand, Debug)]
-enum Commands {
-    /// Interactively crop images in a fullscreen UI
-    Crop(CropArgs),
-    /// Browse images as a space-filling album grid of previews
-    Album(AlbumArgs),
-}
-
-/// Arguments shared by all subcommands: input paths, recursion, filters,
-/// sorting and verbosity.
-#[derive(Args, Debug)]
-struct ScanArgs {
-    /// Directories or files to process
-    #[arg(value_name = "PATHS", required = true)]
-    paths: Vec<PathBuf>,
-
-    /// Recurse into subdirectories to find images (disabled by default)
-    #[arg(short = 'r', long = "recursive", default_value_t = false)]
-    recursive: bool,
-
-    /// Pattern syntax for whitelist and blacklist filters
-    #[arg(long, value_enum, default_value_t = FilterSyntax::Glob)]
-    filter_syntax: FilterSyntax,
-
-    /// Only include paths matching this filter (also overrides the blacklist)
-    #[arg(long, value_name = "PATTERN")]
-    whitelist: Vec<String>,
-
-    /// Exclude paths matching this filter unless they also match a whitelist
-    #[arg(long, value_name = "PATTERN")]
-    blacklist: Vec<String>,
-
-    /// Number of parallel image processing threads
-    #[arg(short = 'j', long = "parallel", default_value_t = 16)]
-    parallel: usize,
-
-    /// Skip destructive operations and just print what would happen
-    #[arg(short = 'd', long, default_value_t = false)]
-    dry_run: bool,
-
-    /// Report file sizes and actions as they complete
-    #[arg(short = 'v', long, default_value_t = false)]
-    verbose: bool,
-
-    /// Invert order of processed images (ignored for randomize)
-    #[arg(short = 'i', long = "inverse-order", default_value_t = false)]
-    inverse: bool,
-
-    /// Order in which images are processed
-    #[arg(short, long, value_enum, default_value_t = SortOrder::Filename)]
-    order: SortOrder,
-}
-
-#[derive(Args, Debug)]
-struct CropArgs {
-    #[command(flatten)]
-    scan: ScanArgs,
-
-    /// Quality of the output image (1-100)
-    #[arg(short, long, default_value_t = 70)]
-    quality: u8,
-
-    /// Output format for saved images
-    #[arg(short, long, value_enum, default_value_t = OutputFormat::Avif)]
-    format: OutputFormat,
-
-    /// Automatically resave images to the selected format when navigating away
-    #[arg(long, default_value_t = false)]
-    resave: bool,
-
-    /// Show performance diagnostics
-    #[arg(long, default_value_t = false)]
-    benchmark: bool,
-}
-
-#[derive(Args, Debug)]
-struct AlbumArgs {
-    #[command(flatten)]
-    scan: ScanArgs,
-
-    /// Quality of the output image (1-100) when cropping from the album
-    #[arg(short, long, default_value_t = 70)]
-    quality: u8,
-
-    /// Output format for saved images when cropping from the album
-    #[arg(short, long, value_enum, default_value_t = OutputFormat::Avif)]
-    format: OutputFormat,
-}
+use imagecropper::cli::{collect_sorted_files, AlbumArgs, Cli, Commands, CropArgs, HeadlessArgs};
+use imagecropper::fs_utils::previews::produce_preview_bytes;
+use imagecropper::image_utils::decode_image_bytes;
+use imagecropper::server::{run_server, ServeMode, ServerState};
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Commands::Crop(args) => run_crop(args),
         Commands::Album(args) => run_album(args),
-    }
-}
-
-/// Collect the input images, apply filters and sort them the same way for
-/// every subcommand.
-fn collect_sorted_files(scan: &ScanArgs) -> Result<Vec<PathBuf>> {
-    let file_filter = PathFilter::compile(
-        scan.filter_syntax,
-        &scan.whitelist,
-        &scan.blacklist,
-    )?;
-    let mut files =
-        collect_images_with_filter(&scan.paths, scan.recursive, file_filter.as_ref())?;
-    if files.is_empty() {
-        return Err(anyhow!(
-            "No supported image files found in the provided paths. Supported formats are: {}",
-            imagecropper::fs_utils::SUPPORTED_EXTENSIONS.join(", ")
-        ));
-    }
-    sort_files(&mut files, scan.order, scan.inverse);
-    Ok(files)
-}
-
-fn sort_files(files: &mut Vec<PathBuf>, order: SortOrder, inverse: bool) {
-    match order {
-        SortOrder::Filename => files.sort(),
-        SortOrder::Randomize => files.shuffle(&mut rand::rng()),
-        SortOrder::Modified => files.sort_by_key(|path| {
-            std::fs::metadata(path)
-                .and_then(|m| m.modified())
-                .ok()
-        }),
-        SortOrder::Size | SortOrder::SizeAsc => files.sort_by_key(|path| {
-            std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
-        }),
-        SortOrder::SizeDesc => files.sort_by_key(|path| {
-            std::cmp::Reverse(std::fs::metadata(path).map(|m| m.len()).unwrap_or(0))
-        }),
-        SortOrder::Exif | SortOrder::ExifAsc | SortOrder::ExifDesc => {
-            let descending = order == SortOrder::ExifDesc;
-            let mut keyed: Vec<_> = files
-                .drain(..)
-                .map(|path| (exif_datetime_key(&path), path))
-                .collect();
-            keyed.sort_by(|(a, _), (b, _)| exif_cmp(a, b, descending));
-            files.extend(keyed.into_iter().map(|(_, path)| path));
-        }
-    }
-
-    // If the inverse flag is set and ordering isn't randomized, invert the order
-    if inverse && order != SortOrder::Randomize {
-        files.reverse();
-    }
-}
-
-/// Compare two optional EXIF keys; files without EXIF data always sort last.
-fn exif_cmp(
-    a: &Option<(u32, u32, u32, u32, u32, u32)>,
-    b: &Option<(u32, u32, u32, u32, u32, u32)>,
-    descending: bool,
-) -> Ordering {
-    match (a, b) {
-        (Some(x), Some(y)) => {
-            if descending {
-                y.cmp(x)
-            } else {
-                x.cmp(y)
-            }
-        }
-        (Some(_), None) => Ordering::Less,
-        (None, Some(_)) => Ordering::Greater,
-        (None, None) => Ordering::Equal,
     }
 }
 
@@ -224,7 +27,13 @@ fn fullscreen_window() -> eframe::NativeOptions {
 }
 
 fn run_crop(args: CropArgs) -> Result<()> {
+    if let Some(addr) = args.headless.serve {
+        return serve(args.scan, addr, &args.headless, ServeMode::Crop, None);
+    }
     let files = collect_sorted_files(&args.scan)?;
+    if args.headless.no_gui {
+        return headless_crop(&args, files);
+    }
     let options = AppOptions {
         dry_run: args.scan.dry_run,
         quality: args.quality,
@@ -240,26 +49,34 @@ fn run_crop(args: CropArgs) -> Result<()> {
     eframe::run_native(
         "ImageCropper",
         fullscreen_window(),
-        Box::new(
-            move |cc| match ImageCropperApp::new(cc, files_for_app.clone(), options.clone()) {
+        Box::new(move |cc| {
+            match ImageCropperApp::new(cc, files_for_app.clone(), options.clone()) {
                 Ok(app) => Ok(Box::new(app) as Box<dyn eframe::App>),
                 Err(err) => {
                     eprintln!("{err:#}");
                     std::process::exit(1);
                 }
-            },
-        ),
+            }
+        }),
     )?;
 
     Ok(())
 }
 
 fn run_album(args: AlbumArgs) -> Result<()> {
+    let move_dir = imagecropper::cli::resolve_move_dir(&args.move_dir)?;
+    if let Some(addr) = args.headless.serve {
+        return serve(args.scan, addr, &args.headless, ServeMode::Album, move_dir);
+    }
     let files = collect_sorted_files(&args.scan)?;
+    if args.headless.no_gui {
+        return headless_album(&args, files);
+    }
     let options = AlbumOptions {
         dry_run: args.scan.dry_run,
         verbose: args.scan.verbose,
         parallel: args.scan.parallel,
+        move_dir,
         crop: AppOptions {
             dry_run: args.scan.dry_run,
             quality: args.quality,
@@ -275,10 +92,118 @@ fn run_album(args: AlbumArgs) -> Result<()> {
     eframe::run_native(
         "ImageCropper Album",
         fullscreen_window(),
-        Box::new(move |_cc| {
-            Ok(Box::new(AlbumCropApp::new(files, options)) as Box<dyn eframe::App>)
-        }),
+        Box::new(
+            move |_cc| Ok(Box::new(AlbumCropApp::new(files, options)) as Box<dyn eframe::App>),
+        ),
     )?;
 
     Ok(())
+}
+
+/// Shared `--serve` path: collect files, build server state, run.
+fn serve(
+    scan: imagecropper::cli::ScanArgs,
+    addr: std::net::SocketAddr,
+    headless: &HeadlessArgs,
+    mode: ServeMode,
+    move_dir: Option<PathBuf>,
+) -> Result<()> {
+    let files = collect_sorted_files(&scan)?;
+    let state = ServerState::new(
+        files,
+        scan.paths.clone(),
+        mode,
+        scan.parallel,
+        headless.token.clone().or_else(|| {
+            // Keep it usable without a token on loopback; generate one when
+            // binding a non-loopback address.
+            if addr.ip().is_loopback() {
+                None
+            } else {
+                Some(random_token())
+            }
+        }),
+        headless.push_credit_kb,
+        move_dir,
+    );
+    let _watcher = imagecropper::server::watch::spawn(state.clone(), scan.clone());
+    run_server(addr, state, !headless.no_gui)
+}
+
+/// `album -G`: pregenerate every preview, then exit.
+fn headless_album(args: &AlbumArgs, files: Vec<PathBuf>) -> Result<()> {
+    pregenerate_all(&files, args.scan.parallel);
+    Ok(())
+}
+
+/// Worker-pool pregeneration of all previews (shared by `album -G` and
+/// usable by tests). Concurrency self-tunes to the storage device.
+fn pregenerate_all(files: &[PathBuf], parallel: usize) {
+    use imagecropper::fs_utils::adaptive_pool::AdaptivePool;
+    use std::time::Duration;
+
+    let total = files.len();
+    let pool = AdaptivePool::new(2, parallel.max(1), |p| produce_preview_bytes(p));
+    pool.request_all(files.iter());
+
+    let mut done = 0usize;
+    while done < total {
+        for _ in pool.poll() {
+            done += 1;
+            if done % 25 == 0 || done == total {
+                eprint!("\rPregenerated previews {done}/{total}");
+            }
+        }
+        if done < total {
+            std::thread::sleep(Duration::from_millis(15));
+        }
+    }
+    if total > 0 {
+        eprintln!(" ({} worker(s))", pool.workers());
+    }
+}
+
+/// `crop -G`: batch resave all files to the selected format/quality.
+fn headless_crop(args: &CropArgs, files: Vec<PathBuf>) -> Result<()> {
+    if !args.resave && args.format == imagecropper::image_utils::OutputFormat::Avif {
+        eprintln!("crop -G without --resave does nothing (pass --resave and/or -f).");
+        return Ok(());
+    }
+    let mut saver = imagecropper::app::saver::Saver::new(args.scan.parallel.max(1));
+    let mut queued = 0usize;
+    for f in &files {
+        let Ok(bytes) = std::fs::read(f) else {
+            continue;
+        };
+        let Ok(img) = decode_image_bytes(f, &bytes) else {
+            continue;
+        };
+        let out = f.with_extension(args.format.extension());
+        saver.queue_save(imagecropper::image_utils::SaveRequest {
+            image: img,
+            path: out,
+            original_path: f.clone(),
+            quality: args.quality,
+            format: args.format,
+        })?;
+        queued += 1;
+    }
+    eprintln!("Queued {queued} resaves; waiting for completion…");
+    loop {
+        let done = saver.check_completions();
+        if saver.pending_saves.is_empty() && done.is_empty() {
+            break;
+        }
+        for (path, result, _) in done {
+            if let Err(e) = result {
+                eprintln!("{}: {e}", path.display());
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    Ok(())
+}
+
+fn random_token() -> String {
+    format!("{:032x}", rand::random::<u128>())
 }

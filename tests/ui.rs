@@ -1,6 +1,6 @@
-use imagecropper::ui::*;
-use imagecropper::selection::Selection;
 use eframe::egui::{self, Rect, Vec2};
+use imagecropper::selection::Selection;
+use imagecropper::ui::*;
 
 #[test]
 fn image_metrics_center_image_and_compute_scale() {

@@ -1,7 +1,10 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     path::PathBuf,
-    sync::{mpsc::{self, Receiver, Sender}, Arc, Mutex},
+    sync::{
+        mpsc::{self, Receiver, Sender},
+        Arc, Mutex,
+    },
     thread,
     time::Instant,
 };
@@ -54,7 +57,7 @@ impl Loader {
     ) -> (Receiver<PreloadedImage>, Sender<PathBuf>) {
         let (preload_tx, preload_rx) = mpsc::channel();
         let (path_tx, path_rx) = mpsc::channel::<PathBuf>();
-        
+
         let path_rx = Arc::new(Mutex::new(path_rx));
         let device = device.map(Arc::new);
         let queue = queue.map(Arc::new);
@@ -76,98 +79,100 @@ impl Loader {
                     };
 
                     let start = Instant::now();
-                
-                let read_start = Instant::now();
-                let file_bytes = std::fs::read(&path);
-                let read_duration = read_start.elapsed();
 
-                match file_bytes {
-                    Ok(bytes) => {
-                        let decode_start = Instant::now();
-                        let img_result = decode_image_bytes(&path, &bytes);
-                        let decode_duration = decode_start.elapsed();
-                        drop(bytes); // Free memory early
+                    let read_start = Instant::now();
+                    let file_bytes = std::fs::read(&path);
+                    let read_duration = read_start.elapsed();
 
-                        match img_result {
-                            Ok(image) => {
-                                let resize_start = Instant::now();
-                                // Resize if too large to speed up texture upload and save memory
-                                // Assuming 4K max dimension is enough for cropping
-                                let image = resize_to_fit(image, 3840, 2160);
-                                let resize_duration = resize_start.elapsed();
+                    match file_bytes {
+                        Ok(bytes) => {
+                            let decode_start = Instant::now();
+                            let img_result = decode_image_bytes(&path, &bytes);
+                            let decode_duration = decode_start.elapsed();
+                            drop(bytes); // Free memory early
 
-                                let (texture, texture_gen_duration) =
-                                    if let (Some(device), Some(queue)) = (&device, &queue) {
-                                        let texture_gen_start = Instant::now();
-                                        let rgba = image.to_rgba8();
-                                        let width = rgba.width();
-                                        let height = rgba.height();
+                            match img_result {
+                                Ok(image) => {
+                                    let resize_start = Instant::now();
+                                    // Resize if too large to speed up texture upload and save memory
+                                    // Assuming 4K max dimension is enough for cropping
+                                    let image = resize_to_fit(image, 3840, 2160);
+                                    let resize_duration = resize_start.elapsed();
 
-                                        let texture_size = wgpu::Extent3d {
-                                            width,
-                                            height,
-                                            depth_or_array_layers: 1,
+                                    let (texture, texture_gen_duration) =
+                                        if let (Some(device), Some(queue)) = (&device, &queue) {
+                                            let texture_gen_start = Instant::now();
+                                            let rgba = image.to_rgba8();
+                                            let width = rgba.width();
+                                            let height = rgba.height();
+
+                                            let texture_size = wgpu::Extent3d {
+                                                width,
+                                                height,
+                                                depth_or_array_layers: 1,
+                                            };
+
+                                            let texture =
+                                                device.create_texture(&wgpu::TextureDescriptor {
+                                                    size: texture_size,
+                                                    mip_level_count: 1,
+                                                    sample_count: 1,
+                                                    dimension: wgpu::TextureDimension::D2,
+                                                    format: wgpu::TextureFormat::Rgba8Unorm,
+                                                    usage: wgpu::TextureUsages::TEXTURE_BINDING
+                                                        | wgpu::TextureUsages::COPY_DST,
+                                                    label: Some("image_texture"),
+                                                    view_formats: &[],
+                                                });
+
+                                            queue.write_texture(
+                                                wgpu::TexelCopyTextureInfo {
+                                                    texture: &texture,
+                                                    mip_level: 0,
+                                                    origin: wgpu::Origin3d::ZERO,
+                                                    aspect: wgpu::TextureAspect::All,
+                                                },
+                                                &rgba,
+                                                wgpu::TexelCopyBufferLayout {
+                                                    offset: 0,
+                                                    bytes_per_row: Some(4 * width),
+                                                    rows_per_image: Some(height),
+                                                },
+                                                texture_size,
+                                            );
+
+                                            (Some(texture), texture_gen_start.elapsed())
+                                        } else {
+                                            (None, std::time::Duration::default())
                                         };
 
-                                        let texture = device.create_texture(&wgpu::TextureDescriptor {
-                                            size: texture_size,
-                                            mip_level_count: 1,
-                                            sample_count: 1,
-                                            dimension: wgpu::TextureDimension::D2,
-                                            format: wgpu::TextureFormat::Rgba8Unorm,
-                                            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-                                            label: Some("image_texture"),
-                                            view_formats: &[],
-                                        });
-
-                                        queue.write_texture(
-                                            wgpu::TexelCopyTextureInfo {
-                                                texture: &texture,
-                                                mip_level: 0,
-                                                origin: wgpu::Origin3d::ZERO,
-                                                aspect: wgpu::TextureAspect::All,
-                                            },
-                                            &rgba,
-                                            wgpu::TexelCopyBufferLayout {
-                                                offset: 0,
-                                                bytes_per_row: Some(4 * width),
-                                                rows_per_image: Some(height),
-                                            },
-                                            texture_size,
-                                        );
-
-                                        (Some(texture), texture_gen_start.elapsed())
-                                    } else {
-                                        (None, std::time::Duration::default())
-                                    };
-
-                                let load_duration = start.elapsed();
-                                if preload_tx
-                                    .send(PreloadedImage {
-                                        path,
-                                        image,
-                                        color_image: None,
-                                        texture,
-                                        load_duration,
-                                        read_duration,
-                                        decode_duration,
-                                        resize_duration,
-                                        texture_gen_duration,
-                                    })
-                                    .is_err()
-                                {
-                                    break;
+                                    let load_duration = start.elapsed();
+                                    if preload_tx
+                                        .send(PreloadedImage {
+                                            path,
+                                            image,
+                                            color_image: None,
+                                            texture,
+                                            load_duration,
+                                            read_duration,
+                                            decode_duration,
+                                            resize_duration,
+                                            texture_gen_duration,
+                                        })
+                                        .is_err()
+                                    {
+                                        break;
+                                    }
+                                }
+                                Err(err) => {
+                                    eprintln!("Failed to decode {}: {err:#}", path.display());
                                 }
                             }
-                            Err(err) => {
-                                eprintln!("Failed to decode {}: {err:#}", path.display());
-                            }
+                        }
+                        Err(err) => {
+                            eprintln!("Failed to read {}: {err:#}", path.display());
                         }
                     }
-                    Err(err) => {
-                        eprintln!("Failed to read {}: {err:#}", path.display());
-                    }
-                }
                 }
             });
         }
@@ -204,4 +209,3 @@ impl Loader {
         self.history.pop_back()
     }
 }
-

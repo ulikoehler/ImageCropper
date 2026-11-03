@@ -14,8 +14,14 @@ use image::DynamicImage;
 use wgpu;
 
 use crate::{
-    fs_utils::{format_savings_summary, format_deletion_summary, format_overall_summary, format_size, move_with_unique_name, prepare_dir, ConversionStats, TRASH_DIR},
-    image_utils::{build_output_image, combine_crops, to_color_image, OutputFormat, PreloadedImage, SaveRequest},
+    fs_utils::{
+        format_deletion_summary, format_overall_summary, format_savings_summary, format_size,
+        move_with_unique_name, prepare_dir, ConversionStats, TRASH_DIR,
+    },
+    image_utils::{
+        build_output_image, combine_crops, to_color_image, OutputFormat, PreloadedImage,
+        SaveRequest,
+    },
     ui::{ImageMetrics, KeyboardState},
 };
 
@@ -124,13 +130,13 @@ impl ImageCropperApp {
         Ok(app)
     }
 
-fn conversion_summary(&self) -> String {
-         if self.conversion_stats.files == 0 {
-             "Total conversion savings: 0 B".to_string()
-         } else {
-             format_savings_summary(&self.conversion_stats)
-         }
-     }
+    fn conversion_summary(&self) -> String {
+        if self.conversion_stats.files == 0 {
+            "Total conversion savings: 0 B".to_string()
+        } else {
+            format_savings_summary(&self.conversion_stats)
+        }
+    }
 
     fn deletion_summary(&self) -> String {
         if self.deleted_files == 0 {
@@ -141,10 +147,7 @@ fn conversion_summary(&self) -> String {
     }
 
     fn exit_summary(&self) -> String {
-        format_overall_summary(
-            &self.conversion_stats,
-            self.total_deleted_bytes,
-        )
+        format_overall_summary(&self.conversion_stats, self.total_deleted_bytes)
     }
 
     fn print_exit_summary(&mut self) {
@@ -169,7 +172,11 @@ fn conversion_summary(&self) -> String {
         self.files.get(self.current_index).map(|p| p.as_path())
     }
 
-    fn load_current_image(&mut self, _ctx: &egui::Context, render_state: Option<&RenderState>) -> Result<()> {
+    fn load_current_image(
+        &mut self,
+        _ctx: &egui::Context,
+        render_state: Option<&RenderState>,
+    ) -> Result<()> {
         let start = std::time::Instant::now();
         self.loader.update();
         let path = self
@@ -189,12 +196,14 @@ fn conversion_summary(&self) -> String {
                     preloaded.texture_gen_duration
                 );
             }
-            self.image_size =
-                egui::Vec2::new(preloaded.image.width() as f32, preloaded.image.height() as f32);
+            self.image_size = egui::Vec2::new(
+                preloaded.image.width() as f32,
+                preloaded.image.height() as f32,
+            );
             self.canvas.clear();
-            
+
             let texture_start = std::time::Instant::now();
-            
+
             // Free previous texture
             if let Some((id, _)) = self.texture.take() {
                 if let Some(rs) = render_state {
@@ -205,13 +214,20 @@ fn conversion_summary(&self) -> String {
             if let Some(texture) = preloaded.texture {
                 if let Some(rs) = render_state {
                     let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-                    let id = rs.renderer.write().register_native_texture(&rs.device, &view, wgpu::FilterMode::Linear);
+                    let id = rs.renderer.write().register_native_texture(
+                        &rs.device,
+                        &view,
+                        wgpu::FilterMode::Linear,
+                    );
                     self.texture = Some((id, texture));
                 }
             }
 
             if self.benchmark {
-                println!("[Benchmark] Texture upload took {:?}", texture_start.elapsed());
+                println!(
+                    "[Benchmark] Texture upload took {:?}",
+                    texture_start.elapsed()
+                );
             }
 
             self.image = Some(preloaded.image);
@@ -242,7 +258,7 @@ fn conversion_summary(&self) -> String {
 
             self.loader.load_image(path.clone());
         }
-        
+
         if self.benchmark {
             println!("[Benchmark] load_current_image took {:?}", start.elapsed());
         }
@@ -281,7 +297,12 @@ fn conversion_summary(&self) -> String {
         self.advance_inner(ctx, render_state, false);
     }
 
-    fn advance_inner(&mut self, ctx: &egui::Context, render_state: Option<&RenderState>, skip_resave: bool) {
+    fn advance_inner(
+        &mut self,
+        ctx: &egui::Context,
+        render_state: Option<&RenderState>,
+        skip_resave: bool,
+    ) {
         let start = std::time::Instant::now();
         if self.files.is_empty() {
             self.request_shutdown(ctx);
@@ -387,7 +408,7 @@ fn conversion_summary(&self) -> String {
                 self.image_size =
                     egui::Vec2::new(entry.image.width() as f32, entry.image.height() as f32);
                 self.canvas.clear();
-                
+
                 // Free previous texture
                 if let Some((id, _)) = self.texture.take() {
                     if let Some(rs) = render_state {
@@ -398,7 +419,11 @@ fn conversion_summary(&self) -> String {
                 if let Some(texture) = entry.texture {
                     if let Some(rs) = render_state {
                         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-                        let id = rs.renderer.write().register_native_texture(&rs.device, &view, wgpu::FilterMode::Linear);
+                        let id = rs.renderer.write().register_native_texture(
+                            &rs.device,
+                            &view,
+                            wgpu::FilterMode::Linear,
+                        );
                         self.texture = Some((id, texture));
                     }
                 }
@@ -445,11 +470,7 @@ fn conversion_summary(&self) -> String {
             self.deleted_files += 1;
             self.total_deleted_bytes = self.total_deleted_bytes.saturating_add(meta.len());
             if self.verbose {
-                let msg = format!(
-                    "Deleted {} ({})",
-                    path.display(),
-                    format_size(meta.len())
-                );
+                let msg = format!("Deleted {} ({})", path.display(), format_size(meta.len()));
                 println!("{}", msg);
                 self.status = msg.clone();
             }
@@ -529,7 +550,12 @@ fn conversion_summary(&self) -> String {
         true
     }
 
-    fn rotate_current_image(&mut self, _ctx: &egui::Context, render_state: Option<&RenderState>, cw: bool) {
+    fn rotate_current_image(
+        &mut self,
+        _ctx: &egui::Context,
+        render_state: Option<&RenderState>,
+        cw: bool,
+    ) {
         if let Some(image) = &self.image {
             let start = std::time::Instant::now();
             let new_image = if cw {
@@ -539,7 +565,7 @@ fn conversion_summary(&self) -> String {
             };
 
             self.image_size = egui::Vec2::new(new_image.width() as f32, new_image.height() as f32);
-            
+
             // Free previous texture
             if let Some((id, _)) = self.texture.take() {
                 if let Some(rs) = render_state {
@@ -552,7 +578,7 @@ fn conversion_summary(&self) -> String {
                 let rgba = new_image.to_rgba8();
                 let width = rgba.width();
                 let height = rgba.height();
-                
+
                 let texture_size = wgpu::Extent3d {
                     width,
                     height,
@@ -587,13 +613,17 @@ fn conversion_summary(&self) -> String {
                 );
 
                 let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-                let id = rs.renderer.write().register_native_texture(&rs.device, &view, wgpu::FilterMode::Linear);
+                let id = rs.renderer.write().register_native_texture(
+                    &rs.device,
+                    &view,
+                    wgpu::FilterMode::Linear,
+                );
                 self.texture = Some((id, texture));
             }
 
             self.image = Some(new_image);
             self.canvas.clear(); // Clear selections as they are now invalid
-            
+
             if self.benchmark {
                 println!("[Benchmark] Rotation took {:?}", start.elapsed());
             }
@@ -601,7 +631,9 @@ fn conversion_summary(&self) -> String {
     }
 
     fn generate_preview(&mut self, ctx: &egui::Context) {
-        let Some(image) = self.image.clone() else { return };
+        let Some(image) = self.image.clone() else {
+            return;
+        };
 
         let mut crops = Vec::new();
         for selection in &self.canvas.selections {
@@ -623,11 +655,8 @@ fn conversion_summary(&self) -> String {
         };
 
         let color_image = to_color_image(&final_image);
-        self.preview_texture = Some(ctx.load_texture(
-            "preview-texture",
-            color_image,
-            egui::TextureOptions::LINEAR,
-        ));
+        self.preview_texture =
+            Some(ctx.load_texture("preview-texture", color_image, egui::TextureOptions::LINEAR));
     }
 }
 
@@ -743,7 +772,10 @@ impl App for ImageCropperApp {
                         ui.heading("All images processed!");
                         if !self.saver.pending_saves.is_empty() {
                             ui.add_space(10.0);
-                            ui.label(format!("Processing {} images...", self.saver.pending_saves.len()));
+                            ui.label(format!(
+                                "Processing {} images...",
+                                self.saver.pending_saves.len()
+                            ));
                         }
                         ui.add_space(10.0);
                         ui.label(self.conversion_summary());

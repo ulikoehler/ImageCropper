@@ -1,7 +1,7 @@
-use imagecropper::app::saver::Saver;
-use imagecropper::image_utils::{OutputFormat, SaveRequest};
-use imagecropper::fs_utils::ORIGINALS_DIR;
 use image::{GenericImageView, ImageFormat, ImageReader};
+use imagecropper::app::saver::Saver;
+use imagecropper::fs_utils::ORIGINALS_DIR;
+use imagecropper::image_utils::{OutputFormat, SaveRequest};
 use std::{
     fs,
     io::Read,

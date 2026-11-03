@@ -1,7 +1,7 @@
+use eframe::egui;
 use imagecropper::app::canvas::Canvas;
 use imagecropper::selection::Selection;
 use imagecropper::ui::{ImageMetrics, KeyboardState, ARROW_MOVE_STEP};
-use eframe::egui;
 
 fn selection_from_coords(min: (f32, f32), max: (f32, f32)) -> Selection {
     Selection {
@@ -12,7 +12,9 @@ fn selection_from_coords(min: (f32, f32), max: (f32, f32)) -> Selection {
 #[test]
 fn handle_arrow_movement_translates_selection() {
     let mut canvas = Canvas::new();
-    canvas.selections.push(selection_from_coords((10.0, 10.0), (20.0, 20.0)));
+    canvas
+        .selections
+        .push(selection_from_coords((10.0, 10.0), (20.0, 20.0)));
     let keys = KeyboardState {
         next_image: false,
         prev_image: false,
@@ -43,7 +45,12 @@ fn begin_selection_outside_image_clamps_to_image_border() {
     let canvas_rect = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(200.0, 200.0));
     let metrics = ImageMetrics::new(canvas_rect, egui::vec2(100.0, 100.0));
 
-    canvas.begin_selection(egui::pos2(-40.0, 80.0), &metrics, egui::vec2(100.0, 100.0), false);
+    canvas.begin_selection(
+        egui::pos2(-40.0, 80.0),
+        &metrics,
+        egui::vec2(100.0, 100.0),
+        false,
+    );
 
     let selection = canvas.selections.last().unwrap();
     assert_eq!(selection.rect.min.x, 0.0);

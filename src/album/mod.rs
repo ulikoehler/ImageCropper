@@ -1,5 +1,6 @@
 pub mod deleter;
 pub mod layout;
+pub mod mover;
 pub mod thumbnails;
 
 use std::{
@@ -15,12 +16,13 @@ use eframe::{
 
 use crate::{
     app::{AppOptions, ImageCropperApp},
-    fs_utils::{format_deletion_summary, format_size, format_signed_size},
+    fs_utils::{format_deletion_summary, format_signed_size, format_size},
 };
 
 use self::{
     deleter::Deleter,
     layout::{layout_justified, JustifiedLayout},
+    mover::Mover,
     thumbnails::Thumbnailer,
 };
 
@@ -40,6 +42,8 @@ pub struct AlbumOptions {
     pub dry_run: bool,
     pub verbose: bool,
     pub parallel: usize,
+    /// Target dir for `m` moves; `None` disables the move key.
+    pub move_dir: Option<PathBuf>,
     /// Options used when launching the embedded crop UI via `c`.
     pub crop: AppOptions,
 }
@@ -76,6 +80,7 @@ struct AlbumKeys {
     toggle: bool,
     select_all: bool,
     delete: bool,
+    move_sel: bool,
     crop: bool,
     escape: bool,
     zoom_in: bool,
@@ -90,6 +95,7 @@ pub struct AlbumApp {
     positions: HashMap<PathBuf, usize>,
     thumbnailer: Thumbnailer,
     deleter: Deleter,
+    mover: Option<Mover>,
     selected: BTreeSet<usize>,
     focus: usize,
     anchor: usize,
@@ -104,7 +110,9 @@ pub struct AlbumApp {
     is_exiting: bool,
     windowed_mode_set: bool,
     deleted_files: usize,
+    moved_files: usize,
     total_deleted_bytes: u64,
+    total_moved_bytes: u64,
     summary_printed: bool,
     scroll_to_focus: bool,
     enqueue_cursor: usize,
@@ -119,6 +127,7 @@ impl AlbumApp {
             positions: HashMap::new(),
             thumbnailer: Thumbnailer::new(parallel),
             deleter: Deleter::new(parallel),
+            mover: options.move_dir.clone().map(|d| Mover::new(parallel, d)),
             selected: BTreeSet::new(),
             focus: 0,
             anchor: 0,
@@ -133,7 +142,9 @@ impl AlbumApp {
             is_exiting: false,
             windowed_mode_set: false,
             deleted_files: 0,
+            moved_files: 0,
             total_deleted_bytes: 0,
+            total_moved_bytes: 0,
             summary_printed: false,
             scroll_to_focus: false,
             enqueue_cursor: 0,
@@ -167,6 +178,7 @@ impl AlbumApp {
             toggle: input.key_pressed(egui::Key::Space),
             select_all: input.key_pressed(egui::Key::A) && input.modifiers.command,
             delete: input.key_pressed(egui::Key::Delete),
+            move_sel: input.key_pressed(egui::Key::M) && !input.modifiers.command,
             crop: input.key_pressed(egui::Key::C) && !input.modifiers.command,
             escape: input.key_pressed(egui::Key::Escape),
             zoom_in: input.key_pressed(egui::Key::Plus) || input.key_pressed(egui::Key::Equals),
@@ -200,17 +212,32 @@ impl AlbumApp {
                     self.deleted_files += 1;
                     self.total_deleted_bytes += bytes;
                     if self.verbose {
-                        println!(
-                            "Deleted {} ({})",
-                            result.path.display(),
-                            format_size(bytes)
-                        );
+                        println!("Deleted {} ({})", result.path.display(), format_size(bytes));
                     }
                 }
                 Err(err) => {
                     let msg = format!("Failed to delete {}: {err:#}", result.path.display());
                     eprintln!("{}", msg);
                     self.status = msg;
+                }
+            }
+        }
+
+        if let Some(mover) = self.mover.as_mut() {
+            for result in mover.poll() {
+                match result.result {
+                    Ok(bytes) => {
+                        self.moved_files += 1;
+                        self.total_moved_bytes += bytes;
+                        if self.verbose {
+                            println!("Moved {} ({})", result.path.display(), format_size(bytes));
+                        }
+                    }
+                    Err(err) => {
+                        let msg = format!("Failed to move {}: {err:#}", result.path.display());
+                        eprintln!("{}", msg);
+                        self.status = msg;
+                    }
                 }
             }
         }
@@ -336,6 +363,47 @@ impl AlbumApp {
         }
     }
 
+    fn move_selected(&mut self) {
+        if self.mover.is_none() {
+            self.status = "No -m/--move directory configured".into();
+            return;
+        }
+        let targets = self.delete_targets();
+        let mover = self.mover.as_mut().unwrap();
+        if targets.is_empty() {
+            self.status = "Nothing selected".into();
+            return;
+        }
+        let paths: Vec<PathBuf> = targets
+            .iter()
+            .map(|&i| self.entries[i].path.clone())
+            .collect();
+
+        if self.dry_run {
+            for path in &paths {
+                println!("Dry run: would move {}", path.display());
+            }
+            self.status = format!("Dry run: skipped moving {} image(s)", paths.len());
+        } else {
+            for path in &paths {
+                mover.queue(path.clone());
+            }
+            self.status = format!("Queued {} image(s) for moving", paths.len());
+        }
+
+        let remove: std::collections::HashSet<&PathBuf> = paths.iter().collect();
+        self.entries.retain(|e| !remove.contains(&e.path));
+        self.selected.clear();
+        self.rebuild_index();
+        if self.entries.is_empty() {
+            self.focus = 0;
+            self.anchor = 0;
+        } else {
+            self.focus = self.focus.min(self.entries.len() - 1);
+            self.anchor = self.focus;
+        }
+    }
+
     pub fn take_crop_request(&mut self) -> Option<PathBuf> {
         self.crop_request.take()
     }
@@ -395,8 +463,10 @@ impl AlbumApp {
         let ctx = ui.ctx().clone();
         self.drain_results();
 
+        let pending_moves = self.mover.as_ref().map(|m| m.pending.len()).unwrap_or(0);
+        let pending_total = self.deleter.pending.len() + pending_moves;
         if self.is_exiting {
-            if self.deleter.pending.is_empty() {
+            if pending_total == 0 {
                 if !self.summary_printed {
                     println!("{}", format_deletion_summary(self.total_deleted_bytes));
                     self.summary_printed = true;
@@ -412,8 +482,8 @@ impl AlbumApp {
             egui::CentralPanel::default().show(ui, |ui| {
                 ui.centered_and_justified(|ui| {
                     ui.heading(format!(
-                        "Finishing deletions... ({} remaining)",
-                        self.deleter.pending.len()
+                        "Finishing deletions/moves... ({} remaining)",
+                        pending_total
                     ));
                 });
             });
@@ -494,6 +564,9 @@ impl AlbumApp {
 
             if keys.delete {
                 self.delete_selected();
+            }
+            if keys.move_sel {
+                self.move_selected();
             }
 
             if keys.crop {
@@ -655,7 +728,7 @@ impl AlbumApp {
                 &ctx,
                 panel_rect.right_bottom() + egui::vec2(-12.0, -12.0),
                 Align2::RIGHT_BOTTOM,
-                "Click: Select | Ctrl+Click: Toggle | Shift+Click: Range | Space: Toggle | Arrows: Move | Shift+Arrows: Extend | Del: Trash | c/2xClick: Crop | +/-: Zoom | w/W: Width | Esc: Clear/Quit".to_string(),
+                "Click: Select | Ctrl+Click: Toggle | Shift+Click: Range | Space: Toggle | Arrows: Move | Shift+Arrows: Extend | Del: Trash | m: Move | c/2xClick: Crop | +/-: Zoom | w/W: Width | Esc: Clear/Quit".to_string(),
                 FontId::monospace(16.0),
                 Color32::from_gray(200),
             );
@@ -680,10 +753,21 @@ impl AlbumApp {
         if !self.deleter.pending.is_empty() {
             line += &format!(" — deleting {}", self.deleter.pending.len());
         }
+        if let Some(mover) = &self.mover {
+            if !mover.pending.is_empty() {
+                line += &format!(" — moving {}", mover.pending.len());
+            }
+        }
         if self.total_deleted_bytes > 0 {
             line += &format!(
                 " — deleted {}",
                 format_signed_size(self.total_deleted_bytes as i64)
+            );
+        }
+        if self.total_moved_bytes > 0 {
+            line += &format!(
+                " — moved {}",
+                format_signed_size(self.total_moved_bytes as i64)
             );
         }
         line

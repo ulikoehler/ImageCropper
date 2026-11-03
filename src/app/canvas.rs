@@ -126,7 +126,13 @@ impl Canvas {
         }
     }
 
-    pub fn draw(&mut self, ui: &egui::Ui, painter: &egui::Painter, metrics: &ImageMetrics, image_size: egui::Vec2) {
+    pub fn draw(
+        &mut self,
+        ui: &egui::Ui,
+        painter: &egui::Painter,
+        metrics: &ImageMetrics,
+        image_size: egui::Vec2,
+    ) {
         self.draw_selection(painter, metrics);
         self.draw_handles(ui, painter, metrics, image_size);
     }
@@ -140,11 +146,22 @@ impl Canvas {
                 0.0,
                 Color32::from_rgba_unmultiplied(255, 255, 255, 24),
             );
-            painter.rect_stroke(rect, 0.0, egui::Stroke::new(2.0, color), egui::StrokeKind::Middle);
+            painter.rect_stroke(
+                rect,
+                0.0,
+                egui::Stroke::new(2.0, color),
+                egui::StrokeKind::Middle,
+            );
         }
     }
 
-    fn draw_handles(&mut self, ui: &egui::Ui, painter: &egui::Painter, metrics: &ImageMetrics, image_size: egui::Vec2) {
+    fn draw_handles(
+        &mut self,
+        ui: &egui::Ui,
+        painter: &egui::Painter,
+        metrics: &ImageMetrics,
+        image_size: egui::Vec2,
+    ) {
         if self.selections.is_empty() {
             return;
         }
@@ -202,4 +219,3 @@ impl Canvas {
         }
     }
 }
-

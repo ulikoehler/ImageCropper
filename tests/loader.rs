@@ -16,7 +16,7 @@ fn loader_populates_cache_from_preloader() {
 
     let mut loader = Loader::new();
     loader.load_image(img_path.clone());
-    
+
     for _ in 0..10 {
         loader.update();
         if loader.cache.contains_key(&img_path) {

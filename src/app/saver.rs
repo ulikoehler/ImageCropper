@@ -10,10 +10,10 @@ use std::{
 use anyhow::{anyhow, Result};
 use image::codecs::avif::AvifEncoder;
 
-use img_parts::{ImageEXIF, ImageICC};
 use img_parts::jpeg::Jpeg;
 use img_parts::png::Png;
 use img_parts::webp::WebP;
+use img_parts::{ImageEXIF, ImageICC};
 
 use crate::{
     fs_utils::{backup_original, prepare_dir, TEMP_DIR},
@@ -70,12 +70,12 @@ impl Saver {
                     let backed_up_path = backup_original(&req.original_path)?;
 
                     // Save to temp file first
-                    let parent = req.path.parent().unwrap_or_else(|| std::path::Path::new("."));
-                    let temp_dir = prepare_dir(parent, TEMP_DIR)?;
-                    let file_name = req
+                    let parent = req
                         .path
-                        .file_name()
-                        .ok_or_else(|| anyhow!("No filename"))?;
+                        .parent()
+                        .unwrap_or_else(|| std::path::Path::new("."));
+                    let temp_dir = prepare_dir(parent, TEMP_DIR)?;
+                    let file_name = req.path.file_name().ok_or_else(|| anyhow!("No filename"))?;
                     let temp_path = temp_dir.join(file_name);
 
                     {
@@ -94,7 +94,8 @@ impl Saver {
                                 req.image.write_with_encoder(encoder)?;
                             }
                             OutputFormat::Webp => {
-                                let encoder = image::codecs::webp::WebPEncoder::new_lossless(writer);
+                                let encoder =
+                                    image::codecs::webp::WebPEncoder::new_lossless(writer);
                                 req.image.write_with_encoder(encoder)?;
                             }
                             OutputFormat::Avif => {
@@ -111,13 +112,15 @@ impl Saver {
                     // Try to copy EXIF/ICC from original to new file
                     // We read the temp file, inject metadata, and write to final path.
                     // If injection fails, we just move the temp file.
-                    
+
                     let copy_metadata = || -> Result<()> {
                         let input_data = std::fs::read(&backed_up_path)?;
                         let temp_data = std::fs::read(&temp_path)?;
-                        
+
                         // Detect input format and extract metadata
-                        let (exif, icc) = if let Ok(input_jpeg) = Jpeg::from_bytes(input_data.clone().into()) {
+                        let (exif, icc) = if let Ok(input_jpeg) =
+                            Jpeg::from_bytes(input_data.clone().into())
+                        {
                             (input_jpeg.exif(), input_jpeg.icc_profile())
                         } else if let Ok(input_png) = Png::from_bytes(input_data.clone().into()) {
                             (input_png.exif(), input_png.icc_profile())
@@ -137,30 +140,48 @@ impl Saver {
                         let output_bytes = match req.format {
                             OutputFormat::Jpg => {
                                 if let Ok(mut out_jpeg) = Jpeg::from_bytes(temp_data.into()) {
-                                    if let Some(exif) = exif { out_jpeg.set_exif(Some(exif)); }
-                                    if let Some(icc) = icc { out_jpeg.set_icc_profile(Some(icc)); }
+                                    if let Some(exif) = exif {
+                                        out_jpeg.set_exif(Some(exif));
+                                    }
+                                    if let Some(icc) = icc {
+                                        out_jpeg.set_icc_profile(Some(icc));
+                                    }
                                     let mut out = Vec::new();
                                     out_jpeg.encoder().write_to(&mut out)?;
                                     Some(out)
-                                } else { None }
+                                } else {
+                                    None
+                                }
                             }
                             OutputFormat::Png => {
                                 if let Ok(mut out_png) = Png::from_bytes(temp_data.into()) {
-                                    if let Some(exif) = exif { out_png.set_exif(Some(exif)); }
-                                    if let Some(icc) = icc { out_png.set_icc_profile(Some(icc)); }
+                                    if let Some(exif) = exif {
+                                        out_png.set_exif(Some(exif));
+                                    }
+                                    if let Some(icc) = icc {
+                                        out_png.set_icc_profile(Some(icc));
+                                    }
                                     let mut out = Vec::new();
                                     out_png.encoder().write_to(&mut out)?;
                                     Some(out)
-                                } else { None }
+                                } else {
+                                    None
+                                }
                             }
                             OutputFormat::Webp => {
                                 if let Ok(mut out_webp) = WebP::from_bytes(temp_data.into()) {
-                                    if let Some(exif) = exif { out_webp.set_exif(Some(exif)); }
-                                    if let Some(icc) = icc { out_webp.set_icc_profile(Some(icc)); }
+                                    if let Some(exif) = exif {
+                                        out_webp.set_exif(Some(exif));
+                                    }
+                                    if let Some(icc) = icc {
+                                        out_webp.set_icc_profile(Some(icc));
+                                    }
                                     let mut out = Vec::new();
                                     out_webp.encoder().write_to(&mut out)?;
                                     Some(out)
-                                } else { None }
+                                } else {
+                                    None
+                                }
                             }
                             OutputFormat::Avif => {
                                 // img-parts doesn't support AVIF yet?
@@ -228,4 +249,3 @@ impl Saver {
         completed
     }
 }
-

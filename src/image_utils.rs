@@ -7,11 +7,12 @@ use eframe::egui;
 use fast_image_resize::images::Image;
 use fast_image_resize::{PixelType, ResizeOptions, Resizer};
 use image::{DynamicImage, GenericImage, RgbaImage};
+use serde::{Deserialize, Serialize};
 use zune_jpeg::JpegDecoder;
 
 use crate::selection::Selection;
 
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum, Debug)]
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum, Debug, Serialize, Deserialize)]
 pub enum OutputFormat {
     Jpg,
     Png,
@@ -70,8 +71,8 @@ pub fn decode_image_bytes(path: &Path, bytes: &[u8]) -> image::ImageResult<Dynam
 
     if is_jpeg {
         // Allow incomplete JPEGs to still be rendered
-        let options = zune_jpeg::zune_core::options::DecoderOptions::default()
-            .set_strict_mode(false);
+        let options =
+            zune_jpeg::zune_core::options::DecoderOptions::default().set_strict_mode(false);
         let mut decoder = JpegDecoder::new(Cursor::new(bytes));
         decoder.set_options(options);
 
@@ -173,7 +174,10 @@ pub fn combine_crops(mut crops: Vec<DynamicImage>) -> DynamicImage {
     crops.sort_by_key(|i| std::cmp::Reverse(i.height()));
 
     // Calculate total area to estimate canvas size
-    let total_area: u64 = crops.iter().map(|i| i.width() as u64 * i.height() as u64).sum();
+    let total_area: u64 = crops
+        .iter()
+        .map(|i| i.width() as u64 * i.height() as u64)
+        .sum();
     let max_width = (total_area as f64).sqrt().ceil() as u32 * 2; // Heuristic: start with something wider
 
     // Simple shelf algorithm
@@ -247,4 +251,3 @@ pub fn build_output_image(image: &DynamicImage, selections: &[Selection]) -> Opt
         Some(combine_crops(crops))
     }
 }
-

@@ -1,6 +1,6 @@
+use eframe::egui::Rect;
 use imagecropper::image_utils::*;
 use imagecropper::selection::Selection;
-use eframe::egui::Rect;
 
 mod common;
 use common::solid_image;
@@ -51,7 +51,8 @@ fn build_output_image_returns_entire_image_for_empty_selection_list() {
     assert_eq!(output.width(), 4);
     assert_eq!(output.height(), 3);
     assert!(output
-        .as_chunks::<4>().0
+        .as_chunks::<4>()
+        .0
         .iter()
         .all(|chunk| *chunk == [10, 20, 30, 255]));
 }

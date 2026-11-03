@@ -10,6 +10,9 @@ use globset::{Glob, GlobSet, GlobSetBuilder};
 use regex::RegexSet;
 use walkdir::WalkDir;
 
+pub mod adaptive_pool;
+pub mod previews;
+
 pub const TRASH_DIR: &str = ".imagecropper-trash";
 pub const ORIGINALS_DIR: &str = ".imagecropper-originals";
 pub const TEMP_DIR: &str = ".imagecropper-tmp";
@@ -158,9 +161,7 @@ pub fn collect_images_with_filter(
                     let entry = entry
                         .with_context(|| format!("Unable to read entry in {}", path.display()))?;
                     let p = entry.path();
-                    if p.is_file()
-                        && is_supported_image(&p)
-                        && filter.is_none_or(|f| f.matches(&p))
+                    if p.is_file() && is_supported_image(&p) && filter.is_none_or(|f| f.matches(&p))
                     {
                         files.push(p);
                     }
@@ -268,7 +269,12 @@ fn parse_exif_datetime(s: &str) -> Option<(u32, u32, u32, u32, u32, u32)> {
     let mut d = date.split(':').map(|p| p.parse::<u32>().ok());
     let mut t = time.split(':').map(|p| p.parse::<u32>().ok());
     Some((
-        d.next()??, d.next()??, d.next()??, t.next()??, t.next()??, t.next()??,
+        d.next()??,
+        d.next()??,
+        d.next()??,
+        t.next()??,
+        t.next()??,
+        t.next()??,
     ))
 }
 
@@ -393,4 +399,3 @@ pub fn format_overall_summary(stats: &ConversionStats, deleted_bytes: u64) -> St
         parts.join(" | ")
     }
 }
-

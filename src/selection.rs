@@ -63,16 +63,20 @@ impl Selection {
                 self.rect.min.y = (self.rect.min.y + delta.y).clamp(0.0, self.rect.max.y - 1.0);
             }
             SelectionHandle::TopRight => {
-                self.rect.max.x = (self.rect.max.x + delta.x).clamp(self.rect.min.x + 1.0, bounds.x);
+                self.rect.max.x =
+                    (self.rect.max.x + delta.x).clamp(self.rect.min.x + 1.0, bounds.x);
                 self.rect.min.y = (self.rect.min.y + delta.y).clamp(0.0, self.rect.max.y - 1.0);
             }
             SelectionHandle::BottomLeft => {
                 self.rect.min.x = (self.rect.min.x + delta.x).clamp(0.0, self.rect.max.x - 1.0);
-                self.rect.max.y = (self.rect.max.y + delta.y).clamp(self.rect.min.y + 1.0, bounds.y);
+                self.rect.max.y =
+                    (self.rect.max.y + delta.y).clamp(self.rect.min.y + 1.0, bounds.y);
             }
             SelectionHandle::BottomRight => {
-                self.rect.max.x = (self.rect.max.x + delta.x).clamp(self.rect.min.x + 1.0, bounds.x);
-                self.rect.max.y = (self.rect.max.y + delta.y).clamp(self.rect.min.y + 1.0, bounds.y);
+                self.rect.max.x =
+                    (self.rect.max.x + delta.x).clamp(self.rect.min.x + 1.0, bounds.x);
+                self.rect.max.y =
+                    (self.rect.max.y + delta.y).clamp(self.rect.min.y + 1.0, bounds.y);
             }
         }
         self.clamp_within(bounds);
@@ -120,8 +124,14 @@ pub enum SelectionHandle {
 
 impl SelectionHandle {
     pub const ALL: [Self; 8] = [
-        Self::Top, Self::Bottom, Self::Left, Self::Right,
-        Self::TopLeft, Self::TopRight, Self::BottomLeft, Self::BottomRight,
+        Self::Top,
+        Self::Bottom,
+        Self::Left,
+        Self::Right,
+        Self::TopLeft,
+        Self::TopRight,
+        Self::BottomLeft,
+        Self::BottomRight,
     ];
 
     pub fn id_suffix(self) -> &'static str {
@@ -190,4 +200,3 @@ pub fn selection_color(index: usize) -> Color32 {
     let [r, g, b] = egui::ecolor::Hsva::new(h, 0.8, 1.0, 1.0).to_rgb();
     Color32::from_rgb((r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8)
 }
-

@@ -15,10 +15,7 @@ fn completed_rows_fill_the_width_exactly() {
     assert_eq!(layout.rows[1].end, 8);
 
     // The completed first row must fill the width exactly: 4 tiles + 3 gaps.
-    let row0_width: f32 = (0..4)
-        .map(|i| layout.tiles[i].width())
-        .sum::<f32>()
-        + 3.0 * gap;
+    let row0_width: f32 = (0..4).map(|i| layout.tiles[i].width()).sum::<f32>() + 3.0 * gap;
     assert!((row0_width - width).abs() < 0.01, "got {row0_width}");
 
     // Completed rows may stretch beyond the target height to fill the space.

@@ -1,14 +1,11 @@
-use imagecropper::selection::*;
 use eframe::egui::{self, Rect, Vec2};
+use imagecropper::selection::*;
 
 #[test]
 fn from_points_clamps_to_bounds() {
     let bounds = Vec2::new(100.0, 80.0);
-    let selection = Selection::from_points(
-        egui::pos2(-10.0, -20.0),
-        egui::pos2(120.0, 90.0),
-        bounds,
-    );
+    let selection =
+        Selection::from_points(egui::pos2(-10.0, -20.0), egui::pos2(120.0, 90.0), bounds);
     assert_eq!(selection.rect.min, egui::pos2(0.0, 0.0));
     assert_eq!(selection.rect.max, egui::pos2(100.0, 80.0));
 }
@@ -16,11 +13,8 @@ fn from_points_clamps_to_bounds() {
 #[test]
 fn translate_respects_bounds() {
     let bounds = Vec2::new(50.0, 50.0);
-    let mut selection = Selection::from_points(
-        egui::pos2(10.0, 10.0),
-        egui::pos2(20.0, 20.0),
-        bounds,
-    );
+    let mut selection =
+        Selection::from_points(egui::pos2(10.0, 10.0), egui::pos2(20.0, 20.0), bounds);
     selection.translate(egui::vec2(100.0, -15.0), bounds);
     assert_eq!(selection.rect.max.x, 50.0);
     assert_eq!(selection.rect.min.y, 0.0);
@@ -41,14 +35,11 @@ fn to_u32_bounds_filters_tiny_selections() {
 #[test]
 fn adjusted_updates_handles_correctly() {
     let bounds = Vec2::new(100.0, 100.0);
-    let selection = Selection::from_points(
-        egui::pos2(10.0, 10.0),
-        egui::pos2(30.0, 30.0),
-        bounds,
-    );
-    let adjusted = selection
-        .clone()
-        .adjusted(SelectionHandle::TopLeft, egui::vec2(-5.0, -5.0), bounds);
+    let selection = Selection::from_points(egui::pos2(10.0, 10.0), egui::pos2(30.0, 30.0), bounds);
+    let adjusted =
+        selection
+            .clone()
+            .adjusted(SelectionHandle::TopLeft, egui::vec2(-5.0, -5.0), bounds);
     assert_eq!(adjusted.rect.min, egui::pos2(5.0, 5.0));
     assert_eq!(adjusted.rect.max, selection.rect.max);
 }
