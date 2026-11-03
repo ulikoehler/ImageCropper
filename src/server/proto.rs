@@ -27,6 +27,7 @@ pub const CL_PAUSE: u8 = 0x16;
 pub const CL_RESUME: u8 = 0x17;
 pub const CL_PING: u8 = 0x18;
 pub const CL_CANCEL: u8 = 0x19;
+pub const CL_BAD_PREVIEW: u8 = 0x1a;
 
 // /bulk channel
 pub const BK_MANIFEST: u8 = 0x20;
@@ -151,6 +152,19 @@ pub fn decode_focus(payload: &[u8]) -> Option<u32> {
         return None;
     }
     Some(u32::from_le_bytes(payload[0..4].try_into().ok()?))
+}
+
+/// BAD_PREVIEW payload: {u32 id, u64 sig} — the pushed thumbnail failed to
+/// decode client-side; drop the cached preview, regenerate, and re-push.
+/// `sig` = the manifest sig the client holds; 0 means "unknown".
+pub fn decode_bad_preview(payload: &[u8]) -> Option<(u32, u64)> {
+    if payload.len() != 12 {
+        return None;
+    }
+    Some((
+        u32::from_le_bytes(payload[0..4].try_into().ok()?),
+        u64::from_le_bytes(payload[4..12].try_into().ok()?),
+    ))
 }
 
 /// CREDIT payload: {u64 bytes}

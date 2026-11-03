@@ -19,6 +19,10 @@ use super::{proto::*, ActionEnvelope, PushQueue, ServerEvent, ServerState};
 /// Bound on how long the pump waits for one thumbnail produce — a wedged
 /// read (network mount) must not stall pushes for every other image.
 const PRODUCE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// Per-path cooldown on client-reported corrupt previews: a source file
+/// that is itself undecodable would otherwise trigger a regenerate on every
+/// client backoff round, forever.
+const REGEN_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(30);
 
 pub async fn handler(
     ws: WebSocketUpgrade,
@@ -295,6 +299,9 @@ async fn handle(socket: WebSocket, state: Arc<ServerState>) {
         })
     };
 
+    // Per-path cooldown for CL_BAD_PREVIEW regeneration, per connection.
+    let mut regen_recent: HashMap<std::path::PathBuf, std::time::Instant> = HashMap::new();
+
     // Inbound control loop.
     while let Some(Ok(msg)) = stream.next().await {
         let Message::Binary(bytes) = msg else {
@@ -361,6 +368,57 @@ async fn handle(socket: WebSocket, state: Arc<ServerState>) {
                                 );
                             }
                         });
+                    }
+                }
+            }
+            CL_BAD_PREVIEW => {
+                // The pushed thumbnail failed to decode client-side — the
+                // cached preview is presumed corrupt (truncated write, disk
+                // damage). Drop it everywhere, regenerate, and push fresh
+                // bytes back to this client.
+                if let Some((id, sig)) = decode_bad_preview(&frame.payload) {
+                    let found = {
+                        let m = state.manifest.read().unwrap();
+                        m.path_of(id)
+                            .map(|p| (p, m.items.get(id as usize).map(|i| i.sig).unwrap_or(0)))
+                    };
+                    if let Some((path, cur_sig)) = found {
+                        // sig 0 = client doesn't know; nonzero must match —
+                        // a stale id must never regenerate an unrelated
+                        // file's preview.
+                        let fresh = sig == 0 || sig == cur_sig;
+                        let cooled = regen_recent
+                            .get(&path)
+                            .map(|t| t.elapsed() > REGEN_COOLDOWN)
+                            .unwrap_or(true);
+                        if fresh && cooled && !state.actions.is_pending(&path) {
+                            regen_recent.insert(path.clone(), std::time::Instant::now());
+                            state
+                                .dbg
+                                .bad_recv
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            let previews = state.previews.clone();
+                            let out_tx = out_tx.clone();
+                            let req_id = frame.req_id;
+                            tokio::spawn(async move {
+                                let produced = tokio::time::timeout(
+                                    PRODUCE_TIMEOUT,
+                                    tokio::task::spawn_blocking(move || {
+                                        previews.regenerate(&path)
+                                    }),
+                                )
+                                .await;
+                                if let Ok(Ok(Some(p))) = produced {
+                                    let _ = out_tx
+                                        .send(Frame::new(
+                                            EV_THUMB,
+                                            req_id,
+                                            thumb_payload(id, cur_sig, &p.jpeg),
+                                        ))
+                                        .await;
+                                }
+                            });
+                        }
                     }
                 }
             }

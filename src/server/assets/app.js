@@ -5,7 +5,7 @@
 const EV_EVENT=0x01, EV_THUMB=0x02, EV_THUMB_BATCH=0x03, EV_PONG=0x06;
 const CL_HELLO=0x10, CL_WANT=0x11, CL_VIEWPORT=0x12, CL_FOCUS=0x13,
       CL_ACTION=0x14, CL_CREDIT=0x15, CL_PAUSE=0x16, CL_RESUME=0x17,
-      CL_PING=0x18;
+      CL_PING=0x18, CL_BAD_PREVIEW=0x1a;
 const BK_MANIFEST=0x20, BK_FULL_HEAD=0x22, BK_FULL_CHUNK=0x21,
       BK_GET_MANIFEST=0x28, BK_GET_FULL=0x29;
 
@@ -275,15 +275,23 @@ function onDecoded(id,bmp,err){
     r.n++;
     r.next=Date.now()+Math.min(60000,250*(1<<Math.min(r.n,8)));
     decRetry.set(id,r);
+    // Tell the server the cached preview is presumed corrupt — it drops
+    // the persisted file, regenerates, and pushes fresh bytes. The
+    // server-side cooldown absorbs repeat reports for one file.
+    const it=items[id];
+    if(it&&!it.removed&&dataWs&&dataWs.readyState===1){
+      const b=new Uint8Array(12),v=new DataView(b.buffer);
+      v.setUint32(0,id,true);
+      v.setBigUint64(4,BigInt(it.sig||"0"),true);
+      dataWs.send(frame(CL_BAD_PREVIEW,0,b));
+      icStats.badSent=(icStats.badSent||0)+1;
+    }
   }
   scheduleDraw();
 }
 
 function onThumb(id,sig,jpeg,reqId){
   pending.delete(id);
-  // First bytes of the pushed payload — is it actually a JPEG (FF D8)?
-  jpeg.slice(0,8).arrayBuffer().then(ab=>{
-    icStats.lastThumbMagic=[...new Uint8Array(ab)]});
   // Free the want-worker slot that asked for this id (sweep pushes carry
   // req_id 0 and free nothing).
   const slot=wantSlots.get(reqId);
@@ -307,6 +315,12 @@ function onData(f){
   if(f.type===EV_THUMB){
     icStats.thumbRecv++;
     const v=new DataView(f.payload.buffer,f.payload.byteOffset);
+    // Raw payload magic — no Blob involved, so this can't fail the way
+    // createImageBitmap does. FF D8 = valid JPEG SOI; anything else means
+    // the server pushed corrupt bytes (→ badMagic, CL_BAD_PREVIEW regen).
+    const jb=f.payload.subarray(12,20);
+    icStats.lastThumbMagic=[...jb];
+    if(jb.length<2||jb[0]!==0xFF||jb[1]!==0xD8)icStats.badMagic=(icStats.badMagic||0)+1;
     onThumb(v.getUint32(0,true),v.getBigUint64(4,true).toString(),
       new Blob([f.payload.subarray(12)],{type:"image/jpeg"}),f.reqId);
   } else if(f.type===EV_THUMB_BATCH){
@@ -323,6 +337,9 @@ function onData(f){
     for(let i=0;i<n;i++){
       const id=v.getUint32(off,true),sig=v.getBigUint64(off+4,true).toString();
       const len=v.getUint32(off+12,true);off+=16;
+      const jb=f.payload.subarray(off,off+Math.min(len,8));
+      icStats.lastThumbMagic=[...jb];
+      if(jb.length<2||jb[0]!==0xFF||jb[1]!==0xD8)icStats.badMagic=(icStats.badMagic||0)+1;
       const slice=blob.slice(off,off+len,"image/jpeg");
       off+=len;
       onThumb(id,sig,slice,f.reqId);

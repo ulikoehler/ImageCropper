@@ -320,6 +320,22 @@ impl PreviewStore {
         self.ram.lock().unwrap().cache.pop(path);
     }
 
+    /// Test hook: insert a preview into the RAM cache directly.
+    #[doc(hidden)]
+    pub fn ram_insert_for_test(&self, path: PathBuf, preview: Preview) {
+        self.ram.lock().unwrap().insert(path, preview);
+    }
+
+    /// Drop every cached copy of `path`'s preview (RAM + persisted file)
+    /// and produce a fresh one synchronously. Called when a client reports
+    /// the served bytes as undecodable — the cached file is presumed
+    /// corrupt and must not be served again.
+    pub fn regenerate(&self, path: &PathBuf) -> Option<Preview> {
+        self.invalidate(path);
+        crate::fs_utils::previews::invalidate_preview_bytes(path);
+        self.get_or_produce(path)
+    }
+
     /// Stop all preview generation (Ctrl-C shutdown): queued jobs are
     /// dropped, workers retire, and every production entry point (pool
     /// requests, inline `get_or_produce`) refuses new work. In-flight

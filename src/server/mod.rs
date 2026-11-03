@@ -78,6 +78,8 @@ pub struct DbgStats {
     pub want_sent: std::sync::atomic::AtomicU64,
     /// CL_WANT ids received across all connections.
     pub want_recv: std::sync::atomic::AtomicU64,
+    /// CL_BAD_PREVIEW corrupt-preview reports honored.
+    pub bad_recv: std::sync::atomic::AtomicU64,
     /// Produces that returned `None` (unsupported/corrupt/stopped).
     pub produce_none: std::sync::atomic::AtomicU64,
     /// Produces abandoned by the 30 s wait bound (hung reads).

@@ -408,13 +408,22 @@ pub fn produce_preview_bytes(
     let expected = previews_dir_for(path).join(&expected_name);
 
     if let Ok(bytes) = std::fs::read(&expected) {
-        let dims = dims_hint
-            .or_else(|| image::image_dimensions(path).ok())
-            .unwrap_or((0, 0));
-        if verbose() {
-            eprintln!("preview cache hit [disk]: {}", path.display());
+        if jpeg_plausible(&bytes) {
+            let dims = dims_hint
+                .or_else(|| image::image_dimensions(path).ok())
+                .unwrap_or((0, 0));
+            if verbose() {
+                eprintln!("preview cache hit [disk]: {}", path.display());
+            }
+            return Some((bytes, dims.0, dims.1));
         }
-        return Some((bytes, dims.0, dims.1));
+        // Corrupt/truncated cache file (killed mid-write, disk damage) —
+        // serving it would wedge clients into decode-fail loops. Drop it
+        // and fall through to regeneration below.
+        if verbose() {
+            eprintln!("preview cache corrupt [disk]: {}", path.display());
+        }
+        let _ = std::fs::remove_file(&expected);
     }
 
     let bytes = std::fs::read(path).ok()?;
@@ -454,6 +463,31 @@ pub fn produce_preview_bytes(
     Some((jpeg, w, h))
 }
 
+/// Cheap structural check on cached preview bytes: SOI + EOI markers and a
+/// sane minimum length. Anything failing this is corrupt (truncated write,
+/// disk damage) and must be regenerated rather than served.
+fn jpeg_plausible(bytes: &[u8]) -> bool {
+    bytes.len() >= 32
+        && bytes[0] == 0xFF
+        && bytes[1] == 0xD8
+        && bytes[bytes.len() - 2] == 0xFF
+        && bytes[bytes.len() - 1] == 0xD9
+}
+
+/// Delete the persisted thumbnail for `path` (the current-signature file
+/// only), forcing the next produce to regenerate. Called when a client
+/// reports the cached preview as undecodable — the file is presumed corrupt.
+pub fn invalidate_preview_bytes(path: &Path) {
+    let Some((len, nanos)) = source_signature(path) else {
+        return;
+    };
+    let Some(name) = path.file_name().map(|n| n.to_string_lossy().into_owned()) else {
+        return;
+    };
+    let expected = previews_dir_for(path).join(preview_file_name(&name, len, nanos));
+    let _ = std::fs::remove_file(expected);
+}
+
 /// Prune stale signature variants of `source` in `dir`, keeping
 /// `expected_name`. Runs on the write path only — cache hits never scan.
 fn prune_stale_previews(dir: &Path, source: &Path, expected_name: &str) {
@@ -463,17 +497,15 @@ fn prune_stale_previews(dir: &Path, source: &Path, expected_name: &str) {
 }
 
 fn persist_preview(source: &Path, expected_name: &str, thumb: &DynamicImage) {
-    let parent = source.parent().unwrap_or_else(|| Path::new("."));
-    if let Ok(preview_dir) = prepare_dir(parent, PREVIEWS_DIR) {
-        prune_stale_previews(&preview_dir, source, expected_name);
-        let preview_path = preview_dir.join(expected_name);
-        if let Ok(file) = std::fs::File::create(&preview_path) {
-            let writer = std::io::BufWriter::new(file);
-            let rgb = thumb.to_rgb8();
-            let encoder =
-                image::codecs::jpeg::JpegEncoder::new_with_quality(writer, PREVIEW_JPEG_QUALITY);
-            let _ = rgb.write_with_encoder(encoder);
-        }
+    let mut jpeg = Vec::new();
+    let ok = {
+        let writer = std::io::BufWriter::new(std::io::Cursor::new(&mut jpeg));
+        let encoder =
+            image::codecs::jpeg::JpegEncoder::new_with_quality(writer, PREVIEW_JPEG_QUALITY);
+        thumb.to_rgb8().write_with_encoder(encoder).is_ok()
+    };
+    if ok {
+        persist_preview_bytes(source, expected_name, &jpeg);
     }
 }
 
@@ -481,6 +513,15 @@ fn persist_preview_bytes(source: &Path, expected_name: &str, jpeg: &[u8]) {
     let parent = source.parent().unwrap_or_else(|| Path::new("."));
     if let Ok(preview_dir) = prepare_dir(parent, PREVIEWS_DIR) {
         prune_stale_previews(&preview_dir, source, expected_name);
-        let _ = std::fs::write(preview_dir.join(expected_name), jpeg);
+        // tmp + rename: a crash mid-write must never leave a truncated file
+        // that looks like a finished preview — readers and later runs would
+        // serve corrupt bytes forever.
+        let target = preview_dir.join(expected_name);
+        let tmp = preview_dir.join(format!("{expected_name}.tmp-{}", std::process::id()));
+        if std::fs::write(&tmp, jpeg).is_ok() {
+            let _ = std::fs::rename(&tmp, &target);
+        } else {
+            let _ = std::fs::remove_file(&tmp);
+        }
     }
 }

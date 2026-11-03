@@ -32,6 +32,7 @@ fn scan_args(root: &std::path::Path) -> ScanArgs {
         verbose: false,
         inverse: false,
         order: SortOrder::Filename,
+        no_gpu: false,
     }
 }
 
