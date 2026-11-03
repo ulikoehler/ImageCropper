@@ -88,6 +88,9 @@ fn fullscreen_window() -> eframe::NativeOptions {
 
 fn run_crop(args: CropArgs) -> Result<()> {
     imagecropper::fs_utils::set_verbose(args.scan.verbose);
+    if args.scan.no_gpu {
+        imagecropper::gpujpeg::disable();
+    }
     if let Some(addr) = args.headless.serve {
         return serve(
             args.scan,
@@ -133,6 +136,9 @@ fn run_crop(args: CropArgs) -> Result<()> {
 
 fn run_album(args: AlbumArgs) -> Result<()> {
     imagecropper::fs_utils::set_verbose(args.scan.verbose);
+    if args.scan.no_gpu {
+        imagecropper::gpujpeg::disable();
+    }
     let move_dir = imagecropper::cli::resolve_move_dir(&args.move_dir)?;
     if let Some(addr) = args.headless.serve {
         return serve(

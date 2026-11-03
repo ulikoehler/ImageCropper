@@ -80,11 +80,19 @@ impl Drop for GpuActive {
 
 const FILTER_LANCZOS: i32 = coeffs::LANCZOS;
 
+/// One-way latch set by `--no-gpu`: refuse GPU work for the rest of
+/// the process, same as `IC_NO_GPUJPEG=1`.
+static USER_DISABLED: AtomicBool = AtomicBool::new(false);
+pub fn disable() {
+    USER_DISABLED.store(true, Ordering::SeqCst);
+}
+
 #[inline]
 fn disabled() -> bool {
     static D: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *D.get_or_init(|| std::env::var("IC_NO_GPUJPEG").is_ok())
-}
+        || USER_DISABLED.load(Ordering::SeqCst)
+} // latch is checked every call — safe to set any time before workers
 
 /// wgpu device + pipelines are usable (adapter found, push constants
 /// supported, WGSL compiled). Lazily initializes on first call.

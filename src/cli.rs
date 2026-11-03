@@ -105,6 +105,12 @@ pub struct ScanArgs {
     /// Order in which images are processed
     #[arg(short, long, value_enum, default_value_t = SortOrder::Filename)]
     pub order: SortOrder,
+
+    /// Disable GPU image processing (JPEG decode/resize/encode) and use
+    /// CPU paths only — for machines without a usable GPU or driver.
+    /// Same effect as IC_NO_GPUJPEG=1. Does not affect UI rendering.
+    #[arg(long = "no-gpu", default_value_t = false)]
+    pub no_gpu: bool,
 }
 
 /// WebSocket auth mode for `--serve`.
