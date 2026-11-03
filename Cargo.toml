@@ -14,6 +14,7 @@ eframe = { version = "0.36", default-features = false, features = ["wgpu", "defa
 fast_image_resize = "6"
 globset = "0.4"
 img-parts = "0.4.0"
+kamadak-exif = "0.6.1"
 rand = "0.10"
 regex = "1"
 walkdir = "2.5"

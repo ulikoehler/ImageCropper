@@ -1,3 +1,4 @@
+pub mod album;
 pub mod app;
 pub mod fs_utils;
 pub mod image_utils;

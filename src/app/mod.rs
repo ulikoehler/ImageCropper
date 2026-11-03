@@ -30,6 +30,9 @@ pub struct AppOptions {
     pub format: OutputFormat,
     pub parallel: usize,
     pub benchmark: bool,
+    /// When true, shutdown requests set `exit_to_album` instead of closing
+    /// the window — used when the crop UI is embedded inside the album view.
+    pub embedded: bool,
 }
 
 pub struct ImageCropperApp {
@@ -58,6 +61,10 @@ pub struct ImageCropperApp {
     pub deleted_files: usize,
     pub total_deleted_bytes: u64,
     pub exit_summary_printed: bool,
+    pub embedded: bool,
+    /// Set when the app is embedded in the album view and the user asked to
+    /// leave crop mode (Esc, or after the image list completed).
+    pub exit_to_album: bool,
 }
 
 impl ImageCropperApp {
@@ -66,7 +73,18 @@ impl ImageCropperApp {
         files: Vec<PathBuf>,
         options: AppOptions,
     ) -> Result<Self> {
-        let wgpu_render_state = cc.wgpu_render_state.as_ref().expect("WGPU enabled");
+        Self::create(&cc.egui_ctx, cc.wgpu_render_state.as_ref(), files, options)
+    }
+
+    /// Create the app from its parts — used both at startup and when the
+    /// album view embeds a crop session for a single image.
+    pub fn create(
+        ctx: &egui::Context,
+        render_state: Option<&RenderState>,
+        files: Vec<PathBuf>,
+        options: AppOptions,
+    ) -> Result<Self> {
+        let wgpu_render_state = render_state.expect("WGPU enabled");
         let device = wgpu_render_state.device.clone();
         let queue = wgpu_render_state.queue.clone();
         let loader = Loader::with_wgpu(device, queue);
@@ -99,8 +117,10 @@ impl ImageCropperApp {
             deleted_files: 0,
             total_deleted_bytes: 0,
             exit_summary_printed: false,
+            embedded: options.embedded,
+            exit_to_album: false,
         };
-        app.load_current_image(&cc.egui_ctx, Some(wgpu_render_state))?;
+        app.load_current_image(ctx, Some(wgpu_render_state))?;
         Ok(app)
     }
 
@@ -137,6 +157,10 @@ fn conversion_summary(&self) -> String {
     }
 
     fn finalize_shutdown(&mut self, ctx: &egui::Context) {
+        if self.embedded {
+            self.exit_to_album = true;
+            return;
+        }
         self.print_exit_summary();
         ctx.send_viewport_cmd(ViewportCommand::Close);
     }

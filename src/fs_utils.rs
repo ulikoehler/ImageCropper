@@ -13,8 +13,9 @@ use walkdir::WalkDir;
 pub const TRASH_DIR: &str = ".imagecropper-trash";
 pub const ORIGINALS_DIR: &str = ".imagecropper-originals";
 pub const TEMP_DIR: &str = ".imagecropper-tmp";
+pub const PREVIEWS_DIR: &str = ".imagecropper-previews";
 
-const RESERVED_DIRS: &[&str] = &[TRASH_DIR, ORIGINALS_DIR, TEMP_DIR];
+const RESERVED_DIRS: &[&str] = &[TRASH_DIR, ORIGINALS_DIR, TEMP_DIR, PREVIEWS_DIR];
 
 fn is_reserved_dir_name(name: &OsStr) -> bool {
     RESERVED_DIRS.iter().any(|reserved| name == *reserved)
@@ -233,6 +234,42 @@ pub fn backup_original(path: &Path) -> Result<PathBuf> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let dir = prepare_dir(parent, ORIGINALS_DIR)?;
     move_with_unique_name(path, &dir)
+}
+
+/// EXIF capture time as a sortable (year, month, day, hour, minute, second)
+/// tuple. Checks DateTimeOriginal, then DateTimeDigitized, then DateTime.
+/// Returns `None` for files without usable EXIF metadata.
+pub fn exif_datetime_key(path: &Path) -> Option<(u32, u32, u32, u32, u32, u32)> {
+    let file = fs::File::open(path).ok()?;
+    let mut reader = std::io::BufReader::new(file);
+    let exif = exif::Reader::new().read_from_container(&mut reader).ok()?;
+    // Tag numbers: 0x9003 = DateTimeOriginal, 0x9004 = DateTimeDigitized,
+    // 0x0132 = DateTime. Match by number so fields are found regardless of
+    // which IFD a camera stored them in.
+    let mut fallback = None;
+    for field in exif.fields() {
+        let tag = field.tag.number();
+        if tag == 0x9003 {
+            if let Some(key) = parse_exif_datetime(&field.display_value().to_string()) {
+                return Some(key);
+            }
+        } else if fallback.is_none() && matches!(tag, 0x9004 | 0x0132) {
+            fallback = parse_exif_datetime(&field.display_value().to_string());
+        }
+    }
+    fallback
+}
+
+/// Parse an EXIF datetime string ("YYYY:MM:DD HH:MM:SS") into a tuple that
+/// sorts chronologically.
+fn parse_exif_datetime(s: &str) -> Option<(u32, u32, u32, u32, u32, u32)> {
+    let s = s.trim().trim_matches('"');
+    let (date, time) = s.split_once(' ')?;
+    let mut d = date.split(':').map(|p| p.parse::<u32>().ok());
+    let mut t = time.split(':').map(|p| p.parse::<u32>().ok());
+    Some((
+        d.next()??, d.next()??, d.next()??, t.next()??, t.next()??, t.next()??,
+    ))
 }
 
 /// Format bytes into a short human readable string using 1024-based units.

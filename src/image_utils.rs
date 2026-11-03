@@ -1,9 +1,13 @@
-use std::path::PathBuf;
+use std::io::Cursor;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use clap::ValueEnum;
 use eframe::egui;
+use fast_image_resize::images::Image;
+use fast_image_resize::{PixelType, ResizeOptions, Resizer};
 use image::{DynamicImage, GenericImage, RgbaImage};
+use zune_jpeg::JpegDecoder;
 
 use crate::selection::Selection;
 
@@ -53,6 +57,106 @@ pub struct SaveStatus {
     pub original_size: Option<u64>,
     /// Size of the newly-written file (in bytes), if available
     pub new_size: Option<u64>,
+}
+
+/// Decode image bytes, using the fast zune-jpeg decoder for JPEG files
+/// (with fallback to the standard loader for incomplete/failed JPEGs).
+pub fn decode_image_bytes(path: &Path, bytes: &[u8]) -> image::ImageResult<DynamicImage> {
+    let is_jpeg = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.eq_ignore_ascii_case("jpg") || s.eq_ignore_ascii_case("jpeg"))
+        .unwrap_or(false);
+
+    if is_jpeg {
+        // Allow incomplete JPEGs to still be rendered
+        let options = zune_jpeg::zune_core::options::DecoderOptions::default()
+            .set_strict_mode(false);
+        let mut decoder = JpegDecoder::new(Cursor::new(bytes));
+        decoder.set_options(options);
+
+        match decoder.decode() {
+            Ok(pixels) => {
+                let info = decoder.info().unwrap();
+                image::RgbImage::from_raw(info.width as u32, info.height as u32, pixels)
+                    .map(image::DynamicImage::ImageRgb8)
+                    .ok_or_else(|| {
+                        image::ImageError::Decoding(image::error::DecodingError::new(
+                            image::error::ImageFormatHint::Exact(image::ImageFormat::Jpeg),
+                            "Failed to create buffer",
+                        ))
+                    })
+            }
+            Err(_e) => image::load_from_memory(bytes),
+        }
+    } else {
+        image::load_from_memory(bytes)
+    }
+}
+
+/// Resize the image so it fits within `max_w` x `max_h`, preserving aspect
+/// ratio. Returns the image unchanged if it already fits.
+pub fn resize_to_fit(image: DynamicImage, max_w: u32, max_h: u32) -> DynamicImage {
+    if image.width() <= max_w && image.height() <= max_h {
+        return image;
+    }
+
+    let ratio = image.width() as f64 / image.height() as f64;
+    let (new_w, new_h) = if ratio > max_w as f64 / max_h as f64 {
+        (max_w, (max_w as f64 / ratio) as u32)
+    } else {
+        ((max_h as f64 * ratio) as u32, max_h)
+    };
+
+    let src_image = match image {
+        image::DynamicImage::ImageRgb8(ref rgb) => Image::from_vec_u8(
+            rgb.width(),
+            rgb.height(),
+            rgb.as_raw().clone(),
+            PixelType::U8x3,
+        )
+        .ok(),
+        image::DynamicImage::ImageRgba8(ref rgba) => Image::from_vec_u8(
+            rgba.width(),
+            rgba.height(),
+            rgba.as_raw().clone(),
+            PixelType::U8x4,
+        )
+        .ok(),
+        _ => {
+            let rgba = image.to_rgba8();
+            Image::from_vec_u8(
+                rgba.width(),
+                rgba.height(),
+                rgba.into_raw(),
+                PixelType::U8x4,
+            )
+            .ok()
+        }
+    };
+
+    let Some(src_image) = src_image else {
+        return image;
+    };
+
+    let mut dst_image = Image::new(new_w, new_h, src_image.pixel_type());
+    let mut resizer = Resizer::new();
+    if resizer
+        .resize(&src_image, &mut dst_image, &ResizeOptions::default())
+        .is_err()
+    {
+        return image;
+    }
+
+    match src_image.pixel_type() {
+        PixelType::U8x3 => image::DynamicImage::ImageRgb8(
+            image::RgbImage::from_raw(new_w, new_h, dst_image.into_vec()).unwrap(),
+        ),
+        PixelType::U8x4 => image::DynamicImage::ImageRgba8(
+            image::RgbaImage::from_raw(new_w, new_h, dst_image.into_vec()).unwrap(),
+        ),
+        _ => unreachable!("We only created U8x3 or U8x4 images"),
+    }
 }
 
 pub fn to_color_image(img: &DynamicImage) -> egui::ColorImage {

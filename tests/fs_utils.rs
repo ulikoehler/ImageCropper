@@ -52,7 +52,7 @@ fn collect_images_skips_reserved_dirs_recursively() {
     let tmp = tempdir().unwrap();
     let root = tmp.path();
     fs::write(root.join("keep.png"), []).unwrap();
-    for reserved in [TRASH_DIR, ORIGINALS_DIR, TEMP_DIR] {
+    for reserved in [TRASH_DIR, ORIGINALS_DIR, TEMP_DIR, PREVIEWS_DIR] {
         let dir = root.join(reserved);
         fs::create_dir(&dir).unwrap();
         fs::write(dir.join("hidden.png"), []).unwrap();
