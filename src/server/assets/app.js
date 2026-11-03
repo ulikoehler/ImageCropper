@@ -344,9 +344,15 @@ addEventListener("keydown",e=>{
     }
     selected.clear();layout();
     // Scroll to the survivor at the deletion point (or the last
-    // remaining image when the deleted block ran to the end).
+    // remaining image when the deleted block ran to the end) — but
+    // only when it isn't already on screen: deleting visible tiles
+    // reflows the next rows into view on their own.
     const f=firstLiveAtOrAfter(at);
-    if(f>=0){focus=f;anchor=f;scrollToIndex(f);}
+    if(f>=0){
+      focus=f;anchor=f;
+      const r=tileRects().find(t=>t.i===f);
+      if(!(r&&r.y+r.h>scrollY&&r.y<scrollY+canvas.height))scrollToIndex(f);
+    }
     draw();
   }
   else if((e.key==="f"||e.key==="F")&&!e.ctrlKey&&!e.metaKey){
@@ -364,6 +370,20 @@ addEventListener("keydown",e=>{
       for(let i=a;i<=b;i++)selected.add(i);focus=nf}
     else{focus=nf;anchor=nf;selected=new Set([nf])}
     draw();
+  }
+  else if(e.key==="Home"||e.key==="End"){
+    // Jump to the first/last live image — selection stays untouched.
+    const t=items.length?
+      (e.key==="Home"?firstLiveAtOrAfter(0):firstLiveAtOrAfter(items.length-1)):-1;
+    if(t>=0){
+      focus=t;anchor=t;
+      const r=tileRects().find(t2=>t2.i===t),H=canvas.height,m=8*devicePixelRatio;
+      if(r){
+        if(r.y<scrollY)scrollY=Math.max(0,r.y-m);          // above → top-align
+        else if(r.y+r.h>scrollY+H)scrollY=r.y+r.h+m-H;   // below → bottom-align
+      }
+    }
+    draw();e.preventDefault();
   }
   else if(e.key===" "){selected.has(focus)?selected.delete(focus):selected.add(focus);draw();e.preventDefault()}
   else if(e.key==="a"&&e.ctrlKey){for(let i=0;i<items.length;i++)selected.add(i);draw();e.preventDefault()}
