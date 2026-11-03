@@ -13,6 +13,7 @@
 
 mod coeffs;
 mod gpu;
+mod jenc;
 mod jpeg;
 mod shaders;
 
@@ -20,12 +21,10 @@ use crate::image_utils::fit_dims;
 use image::DynamicImage;
 use jpeg::{build_canon, pack_comps, parse_jpg, Jpg};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Mutex;
 
-/// Serializes GPU work (queue submissions are internally synchronized
-/// in wgpu, but this keeps decode+resize batches atomic and bounds
-/// device memory pressure like the C++ version did).
-pub static GPU_LOCK: Mutex<()> = Mutex::new(());
+// GPU jobs (decode/resize/encode) run lock-free: every call owns its
+// buffers and waits only on its own submission indices, so an
+// arbitrary number of images can be in flight concurrently.
 
 /// Shutdown tracking: `stop()` refuses new GPU work (callers fall back
 /// to CPU paths) and `wait_idle()` waits for `GPU_ACTIVE` to reach zero.
@@ -146,7 +145,6 @@ fn open_locked(bytes: &[u8]) -> Option<(GpuJpeg, &'static gpu::GpuCtx)> {
 /// R,G,B,0xFF per pixel). Falls back to None on anything unsupported.
 pub fn decode_rgba(bytes: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
     let _active = GpuActive::enter()?;
-    let _guard = GPU_LOCK.lock().ok()?;
     let (sj, ctx) = open_locked(bytes)?;
     let size = u64::from(sj.width) * u64::from(sj.height) * 4;
     let rgba = ctx.read_buf(sj.px.as_ref()?, size);
@@ -176,7 +174,6 @@ impl Drop for GpuJpeg {
 /// suitable GPU adapter exists, or after [`stop`].
 pub fn open(bytes: &[u8]) -> Option<GpuJpeg> {
     let _active = GpuActive::enter()?;
-    let _guard = GPU_LOCK.lock().ok()?;
     open_locked(bytes).map(|(j, _)| j)
 }
 
@@ -185,7 +182,6 @@ impl GpuJpeg {
         let _active = GpuActive::enter()?;
         let (ow, oh) = fit_dims(self.width, self.height, max_w, max_h);
         let ctx = gpu::ctx()?;
-        let _guard = GPU_LOCK.lock().ok()?;
         let out = ctx.resize_pack(
             self.px.as_ref()?,
             self.width,
@@ -217,4 +213,92 @@ impl GpuJpeg {
         let (rgba, ow, oh) = self.resize_rgba(max_w, max_h)?;
         image::RgbaImage::from_raw(ow, oh, rgba).map(DynamicImage::ImageRgba8)
     }
+
+    /// Resize-to-fit on GPU into an RGBA-word buffer that stays
+    /// device-resident — for feeding [`encode_jpeg_buf`] or further
+    /// GPU passes without a host roundtrip.
+    pub fn resize_to_buffer(&self, max_w: u32, max_h: u32) -> Option<(wgpu::Buffer, u32, u32)> {
+        let _active = GpuActive::enter()?;
+        let (ow, oh) = fit_dims(self.width, self.height, max_w, max_h);
+        let ctx = gpu::ctx()?;
+        let buf = ctx.resize_to_buffer(
+            self.px.as_ref()?,
+            self.width,
+            self.height,
+            ow,
+            oh,
+            FILTER_LANCZOS,
+        );
+        Some((buf, ow, oh))
+    }
+
+    /// Baseline-encode a JPEG of `self` at `quality` (1-100, 4:2:0 or
+    /// gray) entirely on the GPU. Returns JFIF bytes.
+    pub fn encode_jpeg(&self, quality: i32) -> Option<Vec<u8>> {
+        let _active = GpuActive::enter()?;
+        let ctx = gpu::ctx()?;
+        let px = self.px.as_ref()?;
+        let (seg_buf, tab) = ctx.encode_into(px, self.width, self.height, false, quality);
+        let mx = self.width.div_ceil(16);
+        let my = self.height.div_ceil(16);
+        let raw = ctx.read_buf(&seg_buf, enc_buf_len(self.width, self.height, false));
+        Some(jenc::assemble_jpeg(
+            &raw,
+            self.width,
+            self.height,
+            mx,
+            my,
+            false,
+            &tab,
+        ))
+    }
+
+    /// Resize-to-fit + JPEG-encode, all on GPU: decode, resample and
+    /// entropy-encode never bring pixels to the host — only the JPEG
+    /// bytes and (via [`resize_to_buffer`]) nothing else cross back.
+    /// Returns (jpeg, w, h).
+    pub fn encode_resized(
+        &self,
+        max_w: u32,
+        max_h: u32,
+        quality: i32,
+    ) -> Option<(Vec<u8>, u32, u32)> {
+        let _active = GpuActive::enter()?;
+        let ctx = gpu::ctx()?;
+        let (buf, ow, oh) = self.resize_to_buffer(max_w, max_h)?;
+        let (seg_buf, tab) = ctx.encode_into(&buf, ow, oh, false, quality);
+        let (mx, my) = (ow.div_ceil(16), oh.div_ceil(16));
+        let raw = ctx.read_buf(&seg_buf, enc_buf_len(ow, oh, false));
+        Some((
+            jenc::assemble_jpeg(&raw, ow, oh, mx, my, false, &tab),
+            ow,
+            oh,
+        ))
+    }
+}
+
+/// Byte size of the raw encoder output buffer for an `w`x`h` image.
+fn enc_buf_len(w: u32, h: u32, gray: bool) -> u64 {
+    let (mx, my) = if gray {
+        (w.div_ceil(8), h.div_ceil(8))
+    } else {
+        (w.div_ceil(16), h.div_ceil(16))
+    };
+    let total = u64::from((mx * my).max(1));
+    total * 4 + total * 4 * u64::from(jenc::SEG_WORDS)
+}
+
+/// One-shot JPEG encode of CPU-side RGBA bytes (0xAABBGGRR or packed
+/// R,G,B,A per pixel). Uploads, encodes on GPU, returns JFIF bytes.
+pub fn encode_rgba(rgba: &[u8], w: u32, h: u32, quality: i32) -> Option<Vec<u8>> {
+    let _active = GpuActive::enter()?;
+    if disabled() || w == 0 || h == 0 || rgba.len() != (w as usize) * (h as usize) * 4 {
+        return None;
+    }
+    let ctx = gpu::ctx()?;
+    let src = ctx.upload_rgba(rgba, w, h);
+    let (seg_buf, tab) = ctx.encode_into(&src, w, h, false, quality);
+    let (mx, my) = (w.div_ceil(16), h.div_ceil(16));
+    let raw = ctx.read_buf(&seg_buf, enc_buf_len(w, h, false));
+    Some(jenc::assemble_jpeg(&raw, w, h, mx, my, false, &tab))
 }

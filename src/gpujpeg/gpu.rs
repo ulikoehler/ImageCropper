@@ -4,8 +4,8 @@
 
 use super::coeffs;
 use super::jpeg::{
-    pack_flut, pack_tables, scan_mode, survey_scan, FrameGpu, Interval, Jpg,
-    NoCoef, Scan, K_SURVEY_IV,
+    pack_flut, pack_tables, scan_mode, survey_scan, FrameGpu, Interval, Jpg, NoCoef, Scan,
+    K_SURVEY_IV,
 };
 use super::shaders;
 use std::future::Future;
@@ -27,6 +27,8 @@ pub struct GpuCtx {
     r_bgl: wgpu::BindGroupLayout,
     p_resample: wgpu::ComputePipeline,
     p_pack: wgpu::ComputePipeline,
+    e_bgl: wgpu::BindGroupLayout,
+    p_encode: wgpu::ComputePipeline,
 }
 
 fn block_on<F: Future>(f: F) -> F::Output {
@@ -161,6 +163,15 @@ impl GpuCtx {
             bind_group_layouts: &[Some(&r_bgl)],
             immediate_size: 24,
         });
+        let e_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: None,
+            entries: &[bgl_entry(0, RO), bgl_entry(1, RW), bgl_entry(2, RO)],
+        });
+        let e_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: None,
+            bind_group_layouts: &[Some(&e_bgl)],
+            immediate_size: 28,
+        });
         let mk = |src: &str, layout: &wgpu::PipelineLayout, entry: &str| {
             let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: None,
@@ -181,20 +192,27 @@ impl GpuCtx {
             p_upsample: mk(shaders::UPSAMPLE, &d_layout, "main"),
             p_resample: mk(shaders::RESAMPLE, &r_layout, "main"),
             p_pack: mk(shaders::PACK, &r_layout, "main"),
+            p_encode: mk(shaders::ENCODE, &e_layout, "main"),
             device,
             queue,
             d_bgl,
             r_bgl,
+            e_bgl,
         };
         Some(ctx)
     }
 
-    fn wait(&self) {
-        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+    /// Wait until `idx`'s submission completes — other in-flight jobs'
+    /// later submissions are unaffected (arbitrary concurrency).
+    fn wait_sub(&self, idx: wgpu::SubmissionIndex) {
+        let _ = self.device.poll(wgpu::PollType::Wait {
+            submission_index: Some(idx),
+            timeout: None,
+        });
     }
 
     /// Copy `size` bytes of `src` into a mapped staging buffer and return
-    /// them. One submit; the map resolves after a blocking poll.
+    /// them. One submit; the map resolves after that submit completes.
     pub fn read_buf(&self, src: &wgpu::Buffer, size: u64) -> Vec<u8> {
         let staging = buf(
             &self.device,
@@ -203,14 +221,14 @@ impl GpuCtx {
         );
         let mut enc = self.device.create_command_encoder(&Default::default());
         enc.copy_buffer_to_buffer(src, 0, &staging, 0, size);
-        self.queue.submit([enc.finish()]);
+        let idx = self.queue.submit([enc.finish()]);
         let (tx, rx) = std::sync::mpsc::channel();
         staging
             .slice(..size)
             .map_async(wgpu::MapMode::Read, move |r| {
                 let _ = tx.send(r);
             });
-        self.wait();
+        self.wait_sub(idx);
         let _ = rx.recv();
         let out = staging.slice(..size).get_mapped_range().unwrap().to_vec();
         staging.unmap();
@@ -308,11 +326,7 @@ impl GpuCtx {
                         },
                         ms,
                         nm,
-                        if surveyed {
-                            2
-                        } else {
-                            u32::from(g_i > 0)
-                        },
+                        if surveyed { 2 } else { u32::from(g_i > 0) },
                     ]);
                 }
             }
@@ -484,6 +498,7 @@ impl GpuCtx {
         // 1) entropy decode: scan generations grouped by MCU budget
         let coef_len = (fg.total_blocks as u64) * 32 * 4;
         let mut first = true;
+        let mut last_idx = None;
         for &(j0, j1) in &submits {
             // AC-refine surveys run between submits: the host reads the
             // coef buffer only after all prior scans' dispatches land.
@@ -495,7 +510,7 @@ impl GpuCtx {
                         // coef buffer not yet filled — survey on zeros
                         survey_scan(j, &mut sc0, &NoCoef, fg)
                     } else {
-                        self.wait();
+                        self.wait_sub(last_idx.unwrap());
                         let bytes = self.read_buf(&coef_buf, coef_len);
                         let words: Vec<u32> = bytes
                             .chunks_exact(4)
@@ -514,18 +529,12 @@ impl GpuCtx {
                         // covers the whole scan from its data offset
                         // (flag 0 = fresh state); the rest of this
                         // scan's slots get n_mcu=0 and are skipped.
-                        eprintln!(
-                            "gpujpeg: deferred survey failed (scan {si}) — serial fallback"
-                        );
+                        eprintln!("gpujpeg: deferred survey failed (scan {si}) — serial fallback");
                         let n_iv = n_iv_v[si] as usize;
                         let mut ent = vec![0u32; n_iv * 4];
                         ent[0] = sc0.data_off;
                         ent[2] = sc0.total_mcus;
-                        q.write_buffer(
-                            &iv_buf,
-                            (ck_base[si] * 16) as u64,
-                            &u32_bytes(&ent),
-                        );
+                        q.write_buffer(&iv_buf, (ck_base[si] * 16) as u64, &u32_bytes(&ent));
                     }
                     scans[si] = sc0;
                 }
@@ -568,9 +577,9 @@ impl GpuCtx {
                     cp.dispatch_workgroups(n_iv.div_ceil(32), 1, 1);
                 }
             }
-            q.submit([enc.finish()]);
+            last_idx = Some(q.submit([enc.finish()]));
         }
-        self.wait();
+        self.wait_sub(last_idx.unwrap());
         // 2) + 3) reconstruction and upsample in one submit. Upsample
         // applies EXIF orientation: pc.w/h are the ORIENTED output dims
         // (swapped for orient 5-8); uW/uH stay the source plane dims.
@@ -603,8 +612,8 @@ impl GpuCtx {
             cp.set_immediates(0, &pc_bytes(&pc8));
             cp.dispatch_workgroups(ow.div_ceil(16), oh.div_ceil(16), 1);
         }
-        q.submit([enc.finish()]);
-        self.wait();
+        let idx = q.submit([enc.finish()]);
+        self.wait_sub(idx);
         j.scans = scans;
         out_buf
     }
@@ -733,14 +742,14 @@ impl GpuCtx {
             wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
         );
         enc.copy_buffer_to_buffer(&pack_buf, 0, &staging, 0, pack_size);
-        self.queue.submit([enc.finish()]);
+        let idx = self.queue.submit([enc.finish()]);
         let (tx, rx) = std::sync::mpsc::channel();
         staging
             .slice(..pack_size)
             .map_async(wgpu::MapMode::Read, move |r| {
                 let _ = tx.send(r);
             });
-        self.wait();
+        self.wait_sub(idx);
         let _ = rx.recv();
         let mut out = staging
             .slice(..pack_size)
@@ -750,6 +759,165 @@ impl GpuCtx {
         staging.unmap();
         out.truncate(out_bytes as usize);
         Some(out)
+    }
+
+    /// GPU-resident variant of [`resize_pack`]: runs the same separable
+    /// resample passes but returns the RGBA-word buffer instead of a
+    /// readback — for feeding the encoder or further GPU work.
+    /// Identity case returns a copy of `px` (encoder needs its own out).
+    pub fn resize_to_buffer(
+        &self,
+        px: &wgpu::Buffer,
+        in_w: u32,
+        in_h: u32,
+        out_w: u32,
+        out_h: u32,
+        filter: i32,
+    ) -> wgpu::Buffer {
+        let dev = &self.device;
+        let out_rgba = buf(
+            dev,
+            u64::from(out_w) * u64::from(out_h) * 4,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        );
+        let mut enc = dev.create_command_encoder(&Default::default());
+        if out_w == in_w && out_h == in_h {
+            enc.copy_buffer_to_buffer(px, 0, &out_rgba, 0, out_rgba.size());
+        } else {
+            let ax = coeffs::axis_coeffs(in_w as i32, out_w as i32, filter);
+            let ay = coeffs::axis_coeffs(in_h as i32, out_h as i32, filter);
+            let bnd_buf = |b: &[i32]| {
+                let bb = buf(
+                    dev,
+                    (b.len() * 4) as u64,
+                    wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                );
+                self.queue.write_buffer(&bb, 0, &i32_bytes(b));
+                bb
+            };
+            let (bnd_x, cf_x) = (bnd_buf(&ax.bounds), bnd_buf(&ax.coefs));
+            let (bnd_y, cf_y) = (bnd_buf(&ay.bounds), bnd_buf(&ay.coefs));
+            let tmp_buf = buf(
+                dev,
+                u64::from(out_w) * u64::from(in_h) * 4,
+                wgpu::BufferUsages::STORAGE,
+            );
+            let resample_pass = |enc: &mut wgpu::CommandEncoder,
+                                 inp: &wgpu::Buffer,
+                                 bnd: &wgpu::Buffer,
+                                 cf: &wgpu::Buffer,
+                                 outp: &wgpu::Buffer,
+                                 pc: [u32; 6],
+                                 dx: u32,
+                                 dy: u32| {
+                let bg = dev.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: None,
+                    layout: &self.r_bgl,
+                    entries: &[
+                        bg_entry(0, inp),
+                        bg_entry(1, bnd),
+                        bg_entry(2, cf),
+                        bg_entry(3, outp),
+                    ],
+                });
+                let mut cp = enc.begin_compute_pass(&Default::default());
+                cp.set_pipeline(&self.p_resample);
+                cp.set_bind_group(0, &bg, &[]);
+                cp.set_immediates(0, &pc_bytes(&pc));
+                cp.dispatch_workgroups(dx.div_ceil(8), dy.div_ceil(8), 1);
+            };
+            resample_pass(
+                &mut enc,
+                px,
+                &bnd_x,
+                &cf_x,
+                &tmp_buf,
+                [in_w, in_h, out_w, in_h, ax.ksize as u32, 0],
+                out_w,
+                in_h,
+            );
+            resample_pass(
+                &mut enc,
+                &tmp_buf,
+                &bnd_y,
+                &cf_y,
+                &out_rgba,
+                [out_w, in_h, out_w, out_h, ay.ksize as u32, 1],
+                out_w,
+                out_h,
+            );
+        }
+        let idx = self.queue.submit([enc.finish()]);
+        self.wait_sub(idx);
+        out_rgba
+    }
+
+    /// Baseline JPEG encode of an RGBA-word buffer (0xAABBGGRR) entirely
+    /// on the GPU: one workgroup per MCU, restart-parallel (DRI=1).
+    /// Returns the raw encoder buffer (u32 sizes then per-MCU segments);
+    /// [`super::jenc::assemble_jpeg`] wraps it into a JFIF.
+    pub fn encode_into(
+        &self,
+        src: &wgpu::Buffer,
+        w: u32,
+        h: u32,
+        gray: bool,
+        quality: i32,
+    ) -> (wgpu::Buffer, Vec<u32>) {
+        let dev = &self.device;
+        let (mx, my) = if gray {
+            (w.div_ceil(8), h.div_ceil(8))
+        } else {
+            (w.div_ceil(16), h.div_ceil(16))
+        };
+        let total = (mx * my).max(1);
+        let out_buf = buf(
+            dev,
+            u64::from(total) * 4 + u64::from(total) * 4 * u64::from(super::jenc::SEG_WORDS),
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        );
+        let tab = super::jenc::pack_enc_tables(quality);
+        let tab_buf = buf(
+            dev,
+            (tab.len() * 4) as u64,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        );
+        self.queue.write_buffer(&tab_buf, 0, &u32_bytes(&tab));
+        let bg = dev.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &self.e_bgl,
+            entries: &[
+                bg_entry(0, src),
+                bg_entry(1, &out_buf),
+                bg_entry(2, &tab_buf),
+            ],
+        });
+        let mut enc = dev.create_command_encoder(&Default::default());
+        {
+            let mut cp = enc.begin_compute_pass(&Default::default());
+            cp.set_pipeline(&self.p_encode);
+            cp.set_bind_group(0, &bg, &[]);
+            cp.set_immediates(
+                0,
+                &pc_bytes(&[w, h, mx, my, super::jenc::SEG_WORDS, total, gray as u32]),
+            );
+            cp.dispatch_workgroups(total.div_ceil(64), 1, 1);
+        }
+        let idx = self.queue.submit([enc.finish()]);
+        self.wait_sub(idx);
+        (out_buf, tab)
+    }
+
+    /// Upload packed RGBA bytes (R,G,B,A per pixel) into an RGBA-word
+    /// storage buffer — the CPU-side entry point of [`encode_into`].
+    pub fn upload_rgba(&self, rgba: &[u8], w: u32, h: u32) -> wgpu::Buffer {
+        let src = buf(
+            &self.device,
+            u64::from(w) * u64::from(h) * 4,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        );
+        self.queue.write_buffer(&src, 0, rgba);
+        src
     }
 }
 

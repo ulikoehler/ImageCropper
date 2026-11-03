@@ -99,7 +99,7 @@ async function refreshManifest(){
   // now authoritative, so stale pending counters must not linger.
   pendingActions.clear();
   screenBmp=null;screenIdx=-1;
-  layout();scheduleDraw();
+  layoutDirty=true;scheduleDraw();
 }
 
 // ids are positional (items[id]); tombstoned entries keep their slot.
@@ -114,14 +114,14 @@ function applyPatch(p){
     (p.remove||[]).forEach(id=>{if(items[id])items[id].removed=true;thumbs.delete(id)});
     manifest.version=p.version;
     restoreThumbs(snap);
-    layout();scheduleDraw();
+    layoutDirty=true;scheduleDraw();
     return;
   }
   (p.dirs_added||[]).forEach(d=>manifest.dirs.push(d));
   (p.upsert||[]).forEach(it=>{items[it.id]=it});
   (p.remove||[]).forEach(id=>{if(items[id])items[id].removed=true;thumbs.delete(id)});
   manifest.version=p.version;
-  layout();scheduleDraw();
+  layoutDirty=true;scheduleDraw();
 }
 
 async function boot(){
@@ -138,7 +138,7 @@ async function boot(){
   manifest=JSON.parse(new TextDecoder().decode(body));
   mouseSelect=manifest.mouse_select||"sequence";
   items=manifest.items;
-  layout(); draw();
+  layoutDirty=true; draw();
 
   // credits: keep the push pipeline fed
   const grant=()=>{if(data.readyState===1){
@@ -202,6 +202,36 @@ setInterval(()=>{
   // a blank viewport from staying blank after lost/dropped pushes.
   scheduleDraw();
 },1000);
+// Decode worker pool: createImageBitmap on the main thread shares
+// scheduling with draw()/events — under a batch flood that's the real
+// thumb-rate cap. ImageBitmap transfers back at zero cost, so JPEGs
+// decode off-thread and only finished bitmaps cross back.
+const DEC_WORKERS=4;
+const decPool=[];
+try{
+  const decSrc='onmessage=e=>{const{id,b}=e.data;createImageBitmap(b).then(bmp=>postMessage({id,bmp},[bmp]),()=>postMessage({id,bmp:null}))}';
+  const decUrl=URL.createObjectURL(new Blob([decSrc],{type:"text/javascript"}));
+  for(let i=0;i<DEC_WORKERS;i++){
+    const w=new Worker(decUrl);
+    w.onmessage=e=>{const{id,bmp}=e.data;onDecoded(id,bmp)};
+    w.onerror=()=>{};
+    decPool.push(w);
+  }
+}catch(e){/* Worker/createImageBitmap unavailable → main-thread fallback */}
+let decRR=0;
+function decodeThumb(id,jpeg){
+  if(decPool.length){
+    const w=decPool[decRR=(decRR+1)%decPool.length];
+    w.postMessage({id,b:jpeg});   // Blob clones by reference — no copy
+  }else{
+    createImageBitmap(jpeg).then(bmp=>onDecoded(id,bmp),()=>onDecoded(id,null));
+  }
+}
+function onDecoded(id,bmp){
+  if(bmp)thumbs.set(id,bmp);else pending.delete(id);   // null → retry later
+  scheduleDraw();
+}
+
 function onThumb(id,sig,jpeg,reqId){
   pending.delete(id);
   // Free the want-worker slot that asked for this id (sweep pushes carry
@@ -218,9 +248,7 @@ function onThumb(id,sig,jpeg,reqId){
   // this the page can go idle on a viewport full of blank tiles.
   if(it&&(it.removed||(sig!=="0"&&it.sig!==sig))){scheduleDraw();return}
   if(sig!=="0"&&thumbs.has(id)){scheduleDraw();return}   // exact duplicate
-  createImageBitmap(jpeg).then(bmp=>{
-    thumbs.set(id,bmp); scheduleDraw();},
-    ()=>{pending.delete(id);scheduleDraw()});   // undecodable: retry later
+  decodeThumb(id,jpeg);
 }
 
 function onData(f){
@@ -278,7 +306,12 @@ let rows=[];
 let viewW=1.0;
 const viewWpx=()=>canvas.width*viewW;
 const xOff=()=>(canvas.width-viewWpx())/2;
+let layoutDirty=true, layoutW=0;
 function layout(){
+  // Rows only change when items/tombstones, zoom, viewW or the canvas
+  // width change — not on every scroll. Skip the O(N) rebuild otherwise.
+  if(!layoutDirty&&canvas.width===layoutW)return;
+  layoutDirty=false;layoutW=canvas.width;
   rows=[]; const W=viewWpx();
   const target=tileH*zoom;
   let cur=[], curW=0;
@@ -300,6 +333,7 @@ function rowH(row){
 const aspect=i=>{const it=items[i];return (!it||it.removed)?1:(it.h>0?it.w/it.h:1)};
 
 function tileRects(){
+  layout();   // no-op when clean — scrollToIndex may run before a draw
   const out=[];
   let y=0;
   for(const row of rows){
@@ -459,9 +493,9 @@ const nextTag=()=>pendingTagBase+((pendingCtr++)&0xfffff);
 addEventListener("wheel",e=>{if(fsMode)return;scrollY=Math.max(0,scrollY+e.deltaY*devicePixelRatio);scheduleDraw()});
 addEventListener("keydown",e=>{
   const cols=()=>Math.max(1,Math.floor(canvas.width/(tileH*zoom)));
-  if(e.key==="+"||e.key==="="){zoom*=1.1;layout();scheduleDraw()}
-  else if(e.key==="-"){zoom/=1.1;layout();scheduleDraw()}
-  else if(e.key.toLowerCase()==="w"&&!e.ctrlKey&&!e.metaKey){viewW=e.shiftKey?Math.min(1,viewW*1.25):Math.max(0.05,viewW/1.25);layout();scheduleDraw()}
+  if(e.key==="+"||e.key==="="){zoom*=1.1;layoutDirty=true;scheduleDraw()}
+  else if(e.key==="-"){zoom/=1.1;layoutDirty=true;scheduleDraw()}
+  else if(e.key.toLowerCase()==="w"&&!e.ctrlKey&&!e.metaKey){viewW=e.shiftKey?Math.min(1,viewW*1.25):Math.max(0.05,viewW/1.25);layoutDirty=true;scheduleDraw()}
   else if(e.key==="Delete"||(e.key.toLowerCase()==="m"&&!e.ctrlKey&&!e.metaKey)){
     const kind=e.key==="Delete"?"delete":"move";
     // No selection → the focused tile is the target (native parity).
@@ -476,7 +510,7 @@ addEventListener("keydown",e=>{
       dataWs.send(frame(CL_ACTION,0,str(JSON.stringify({
         tag,kind,id:it.id,sig:it.sig}))));
     }
-    selected.clear();layout();
+    selected.clear();layoutDirty=true;
     // Scroll to the survivor at the deletion point (or the last
     // remaining image when the deleted block ran to the end) — but
     // only when it isn't already on screen: deleting visible tiles
@@ -603,7 +637,7 @@ canvas.addEventListener("click",e=>{
     }
   }
 });
-addEventListener("resize",()=>{layout();scheduleDraw()});
+addEventListener("resize",()=>{layoutDirty=true;scheduleDraw()});
 
 boot().catch(e=>{
   // WS upgrade refused — most likely auth (--auth=token / -p password).

@@ -695,6 +695,224 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
+/// Baseline JPEG encoder — one invocation per MCU, restart-parallel
+/// (DRI=1, host wraps segments with RST markers). Port of the
+/// VulkanExamples/VulcanoCam GLSL encoder; input is the decoder's
+/// packed RGBA-word buffer (0xAABBGGRR).
+/// Bindings: 0=src rgba words, 1=out (sizes[total] + segments), 2=tab
+/// (qY,qC,dcY,acY,dcC,acC packed codes — see gpu.rs).
+pub const ENCODE: &str = r#"
+struct Pc { w: u32, h: u32, mcus_x: u32, mcus_y: u32,
+            seg_words: u32, total: u32, gray: u32, }
+
+@group(0) @binding(0) var<storage, read> src: array<u32>;
+@group(0) @binding(1) var<storage, read_write> outp: array<u32>;
+@group(0) @binding(2) var<storage, read> tab: array<u32>;
+var<immediate> pc: Pc;
+
+const ZZ = array<i32, 64>(
+    0,1,8,16,9,2,3,10,17,24,32,25,18,11,4,5,12,19,26,33,40,48,41,34,
+    27,20,13,6,7,14,21,28,35,42,49,56,57,50,43,36,29,22,15,23,30,37,
+    44,51,58,59,52,45,38,31,39,46,53,60,61,54,47,55,62,63);
+const CST = array<f32, 64>(
+    1.0000000000e+00,1.0000000000e+00,1.0000000000e+00,1.0000000000e+00,
+    1.0000000000e+00,1.0000000000e+00,1.0000000000e+00,1.0000000000e+00,
+    9.8078528040e-01,8.3146961230e-01,5.5557023302e-01,1.9509032202e-01,
+    -1.9509032202e-01,-5.5557023302e-01,-8.3146961230e-01,-9.8078528040e-01,
+    9.2387953251e-01,3.8268343237e-01,-3.8268343237e-01,-9.2387953251e-01,
+    -9.2387953251e-01,-3.8268343237e-01,3.8268343237e-01,9.2387953251e-01,
+    8.3146961230e-01,-1.9509032202e-01,-9.8078528040e-01,-5.5557023302e-01,
+    5.5557023302e-01,9.8078528040e-01,1.9509032202e-01,-8.3146961230e-01,
+    7.0710678119e-01,-7.0710678119e-01,-7.0710678119e-01,7.0710678119e-01,
+    7.0710678119e-01,-7.0710678119e-01,-7.0710678119e-01,7.0710678119e-01,
+    5.5557023302e-01,-9.8078528040e-01,1.9509032202e-01,8.3146961230e-01,
+    -8.3146961230e-01,-1.9509032202e-01,9.8078528040e-01,-5.5557023302e-01,
+    3.8268343237e-01,-9.2387953251e-01,9.2387953251e-01,-3.8268343237e-01,
+    -3.8268343237e-01,9.2387953251e-01,-9.2387953251e-01,3.8268343237e-01,
+    1.9509032202e-01,-5.5557023302e-01,8.3146961230e-01,-9.8078528040e-01,
+    9.8078528040e-01,-8.3146961230e-01,5.5557023302e-01,-1.9509032202e-01);
+
+fn px(x: i32, y: i32) -> vec3<f32> {
+    let cx = clamp(x, 0, i32(pc.w) - 1);
+    let cy = clamp(y, 0, i32(pc.h) - 1);
+    let v = src[u32(cy) * pc.w + u32(cx)];
+    return vec3<f32>(f32(v & 0xFFu) / 255.0,
+                     f32((v >> 8u) & 0xFFu) / 255.0,
+                     f32((v >> 16u) & 0xFFu) / 255.0);
+}
+
+// full-range BT.601 levels, level-shifted for the DCT
+fn fetchY(x: i32, y: i32) -> f32 {
+    let c = px(x, y);
+    return dot(c, vec3<f32>(0.299, 0.587, 0.114)) * 255.0 - 128.0;
+}
+fn fetchC(x: i32, y: i32) -> vec2<f32> {
+    var acc = vec3<f32>(0.0);
+    for (var dy = 0; dy < 2; dy += 1) {
+        for (var dx = 0; dx < 2; dx += 1) {
+            acc += px(x * 2 + dx, y * 2 + dy);
+        }
+    }
+    acc *= 0.25;
+    return vec2<f32>(
+        (-0.168736 * acc.r - 0.331264 * acc.g + 0.5 * acc.b + 0.5) * 255.0 - 128.0,
+        (0.5 * acc.r - 0.418688 * acc.g - 0.081312 * acc.b + 0.5) * 255.0 - 128.0);
+}
+
+// ---- bitstream writer (MSB-first, 0xFF byte stuffing) ----
+var<private> bit_buf: u32; var<private> word_acc: u32;
+var<private> seg_base: u32; var<private> byte_cnt: u32;
+var<private> out_word: u32; var<private> bit_len: i32;
+var<private> word_bytes: u32;
+
+fn putb(b: u32) {
+    word_acc |= b << (word_bytes * 8u);
+    word_bytes += 1u;
+    byte_cnt += 1u;
+    if (word_bytes == 4u) {
+        if (out_word < pc.seg_words) { outp[seg_base + out_word] = word_acc; }
+        out_word += 1u;
+        word_acc = 0u;
+        word_bytes = 0u;
+    }
+}
+fn emit_bits(code: u32, len: i32) {
+    bit_buf = (bit_buf << u32(len)) | code;
+    bit_len += len;
+    while (bit_len >= 8) {
+        let b = (bit_buf >> u32(bit_len - 8)) & 0xFFu;
+        bit_len -= 8;
+        bit_buf &= (1u << u32(bit_len)) - 1u;
+        putb(b);
+        if (b == 0xFFu) { putb(0u); }
+    }
+}
+fn emit_h(h: u32) { emit_bits(h & 0xFFFFu, i32(h >> 16u)); }
+
+fn cat_of(v: i32) -> i32 {
+    var a = abs(v); var s = 0;
+    while (a != 0) { s += 1; a >>= 1; }
+    return s;
+}
+fn low_bits(v: i32, s: i32) -> u32 {
+    if (s <= 0) { return 0u; }
+    return u32(select(v, v - 1, v < 0)) & ((1u << u32(s)) - 1u);
+}
+
+// float DCT-II via separable row/col passes + quantization
+// (same 0.25 * CuCv scale convention as the GLSL encoder)
+fn fdctq(f: ptr<function, array<f32, 64>>,
+         q: ptr<function, array<i32, 64>>, chroma: bool) {
+    var tmp: array<f32, 64>;
+    for (var y = 0; y < 8; y += 1) {
+        for (var u = 0; u < 8; u += 1) {
+            var s = 0.0;
+            for (var x = 0; x < 8; x += 1) {
+                s += (*f)[y * 8 + x] * CST[u * 8 + x];
+            }
+            tmp[y * 8 + u] = s;
+        }
+    }
+    for (var v = 0; v < 8; v += 1) {
+        for (var u = 0; u < 8; u += 1) {
+            var s = 0.0;
+            for (var y = 0; y < 8; y += 1) {
+                s += tmp[y * 8 + u] * CST[v * 8 + y];
+            }
+            let c = select(1.0, 0.7071067811865476, u == 0) *
+                    select(1.0, 0.7071067811865476, v == 0);
+            let qt = select(tab[u32(v * 8 + u)], tab[u32(64 + v * 8 + u)],
+                            chroma);
+            (*q)[v * 8 + u] = i32(round(0.25 * c * s / f32(qt)));
+        }
+    }
+}
+
+fn enc_block(q: ptr<function, array<i32, 64>>, pred: ptr<function, i32>,
+             chroma: bool) {
+    let diff = (*q)[0] - *pred;
+    *pred = (*q)[0];
+    let s = cat_of(diff);
+    emit_h(select(tab[128u + u32(s)], tab[400u + u32(s)], chroma));
+    emit_bits(low_bits(diff, s), s);
+    var run = 0;
+    for (var k = 1; k < 64; k += 1) {
+        let v = (*q)[ZZ[k]];
+        if (v == 0) { run += 1; continue; }
+        while (run > 15) {
+            emit_h(select(tab[144u + 240u], tab[416u + 240u], chroma));
+            run -= 16;
+        }
+        let sz = cat_of(v);
+        emit_h(select(tab[144u + u32((run << 4) | sz)],
+                      tab[416u + u32((run << 4) | sz)], chroma));
+        emit_bits(low_bits(v, sz), sz);
+        run = 0;
+    }
+    if (run > 0) {
+        emit_h(select(tab[144u], tab[416u], chroma));
+    }
+}
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let mcu = gid.x;
+    if (mcu >= pc.total) { return; }
+    seg_base = pc.total + mcu * pc.seg_words;
+    bit_buf = 0u; bit_len = 0; word_acc = 0u; word_bytes = 0u;
+    byte_cnt = 0u; out_word = 0u;
+    let mx = i32(mcu % pc.mcus_x);
+    let my = i32(mcu / pc.mcus_x);
+    var pred_y = 0; var pred_cb = 0; var pred_cr = 0;
+
+    if (pc.gray == 1u) {                  // gray8: one 8x8 block per MCU
+        var f: array<f32, 64>;
+        for (var y = 0; y < 8; y += 1) {
+            for (var x = 0; x < 8; x += 1) {
+                f[y * 8 + x] = fetchY(mx * 8 + x, my * 8 + y);
+            }
+        }
+        var q: array<i32, 64>;
+        fdctq(&f, &q, false);
+        enc_block(&q, &pred_y, false);
+    } else {                              // 4:2:0: 4 luma + Cb + Cr
+        for (var b = 0; b < 4; b += 1) {
+            let bx = mx * 16 + (b & 1) * 8;
+            let by = my * 16 + (b >> 1) * 8;
+            var f: array<f32, 64>;
+            for (var y = 0; y < 8; y += 1) {
+                for (var x = 0; x < 8; x += 1) {
+                    f[y * 8 + x] = fetchY(bx + x, by + y);
+                }
+            }
+            var q: array<i32, 64>;
+            fdctq(&f, &q, false);
+            enc_block(&q, &pred_y, false);
+        }
+        for (var c = 0; c < 2; c += 1) {
+            var f: array<f32, 64>;
+            for (var y = 0; y < 8; y += 1) {
+                for (var x = 0; x < 8; x += 1) {
+                    let cc = fetchC(mx * 8 + x, my * 8 + y);
+                    f[y * 8 + x] = select(cc.x, cc.y, c == 1);
+                }
+            }
+            var q: array<i32, 64>;
+            fdctq(&f, &q, true);
+            if (c == 0) { enc_block(&q, &pred_cb, true); }
+            else { enc_block(&q, &pred_cr, true); }
+        }
+    }
+    if (bit_len > 0) {
+        emit_bits((1u << u32(8 - bit_len)) - 1u, 8 - bit_len);
+    }
+    if (word_bytes > 0u) {
+        if (out_word < pc.seg_words) { outp[seg_base + out_word] = word_acc; }
+    }
+    outp[mcu] = byte_cnt;
+}
+"#;
+
 pub const PACK: &str = r#"
 struct Pc { npx: u32, n_comp: u32, }
 

@@ -136,10 +136,7 @@ fn dri0_decodes_on_gpu() {
 fn dri0_progressive_decodes_on_gpu() {
     // DRI=0 progressive: surveys cover DC + AC-first scans upfront and
     // AC-refine scans deferred (coef readback between submits)
-    let Some(jpg) = cjpeg(
-        &gradient_ppm(512, 512),
-        &["-quality", "90", "-progressive"],
-    ) else {
+    let Some(jpg) = cjpeg(&gradient_ppm(512, 512), &["-quality", "90", "-progressive"]) else {
         eprintln!("cjpeg missing — skipping");
         return;
     };
@@ -208,7 +205,10 @@ fn orient_rgb(rgb: &[u8], w: usize, h: usize, o: u8) -> (Vec<u8>, usize, usize) 
 
 #[test]
 fn exif_orientation_applied_on_gpu() {
-    let Some(jpg) = cjpeg(&gradient_ppm(300, 200), &["-quality", "92", "-sample", "1x1"]) else {
+    let Some(jpg) = cjpeg(
+        &gradient_ppm(300, 200),
+        &["-quality", "92", "-sample", "1x1"],
+    ) else {
         eprintln!("cjpeg missing — skipping");
         return;
     };
@@ -240,4 +240,160 @@ fn non_jpeg_falls_back() {
     assert_eq!(gpujpeg::decode_rgba(&[]), None);
     assert!(gpujpeg::open(b"not a jpeg at all").is_none());
     assert!(gpujpeg::open(&[]).is_none());
+}
+
+/// Smooth gradient — no wraparound steps, so lossy JPEG artifacts
+/// (ringing, chroma bleed) stay within a few LSB.
+fn gradient_rgba(w: usize, h: usize) -> Vec<u8> {
+    let mut v = Vec::with_capacity(w * h * 4);
+    for y in 0..h {
+        for x in 0..w {
+            v.extend_from_slice(&[
+                (x * 255 / w.max(1)) as u8,
+                (y * 255 / h.max(1)) as u8,
+                ((x + y) * 255 / (w + h).max(1)) as u8,
+                255,
+            ]);
+        }
+    }
+    v
+}
+
+/// GPU-encode RGBA → JFIF, then verify it decodes (zune) to the same
+/// dims with plausible pixels for a smooth gradient.
+#[test]
+fn encode_rgba_roundtrips() {
+    if !gpujpeg::available() {
+        eprintln!("gpujpeg not compiled in — skipping");
+        return;
+    }
+    let (w, h) = (200usize, 130usize);
+    let rgba = gradient_rgba(w, h);
+    let jpg = gpujpeg::encode_rgba(&rgba, w as u32, h as u32, 90).expect("gpu encode");
+    assert_eq!(&jpg[..2], &[0xFF, 0xD8]);
+    assert_eq!(&jpg[jpg.len() - 2..], &[0xFF, 0xD9]);
+
+    let mut dec = zune_jpeg::JpegDecoder::new(std::io::Cursor::new(&jpg));
+    let rgb = dec.decode().expect("zune decode of gpu jpeg");
+    assert_eq!(rgb.len(), w * h * 3);
+    // Lossy but a smooth gradient: worst diff must stay small.
+    let mut worst = 0i32;
+    for i in 0..w * h {
+        for c in 0..3 {
+            worst = worst.max((rgb[i * 3 + c] as i32 - rgba[i * 4 + c] as i32).abs());
+        }
+    }
+    assert!(worst <= 16, "encode roundtrip max diff {worst}");
+}
+
+/// Session encode_resized: GPU decode+resize+encode, dims fit, decodes.
+#[test]
+fn session_encode_resized_roundtrips() {
+    if !gpujpeg::available() {
+        eprintln!("gpujpeg not compiled in — skipping");
+        return;
+    }
+    let Some(jpg) = cjpeg(&gradient_ppm(320, 240), &["-quality", "90"]) else {
+        eprintln!("cjpeg missing — skipping");
+        return;
+    };
+    let Some(s) = gpujpeg::open(&jpg) else {
+        panic!("session open failed");
+    };
+    let (enc, w, h) = s.encode_resized(64, 64, 85).expect("encode_resized");
+    assert_eq!((w, h), (64, 48));
+    let mut dec = zune_jpeg::JpegDecoder::new(std::io::Cursor::new(&enc));
+    let rgb = dec.decode().expect("zune decode");
+    assert_eq!(rgb.len(), 64 * 48 * 3);
+
+    // Full-res session encode too.
+    let full = s.encode_jpeg(85).expect("encode_jpeg");
+    let mut dec = zune_jpeg::JpegDecoder::new(std::io::Cursor::new(&full));
+    let rgb = dec.decode().expect("zune decode full");
+    assert_eq!(rgb.len(), 320 * 240 * 3);
+}
+
+/// Independent check: libjpeg's `djpeg` must decode our GPU-encoded
+/// JFIF — not just zune — and produce sane pixels.
+#[test]
+fn encode_decodes_with_libjpeg() {
+    if !gpujpeg::available() {
+        eprintln!("gpujpeg not compiled in — skipping");
+        return;
+    }
+    let (w, h) = (176usize, 144usize);
+    let rgba = gradient_rgba(w, h);
+    let jpg = gpujpeg::encode_rgba(&rgba, w as u32, h as u32, 92).expect("gpu encode");
+    let tmp = std::env::temp_dir().join(format!("ic-gpuenc-{}.jpg", std::process::id()));
+    std::fs::write(&tmp, &jpg).unwrap();
+    let out = Command::new("djpeg")
+        .arg("-ppm")
+        .arg("-outfile")
+        .arg("/dev/stdout")
+        .arg(&tmp)
+        .output();
+    let _ = std::fs::remove_file(&tmp);
+    let Ok(out) = out else {
+        eprintln!("djpeg missing — skipping");
+        return;
+    };
+    assert!(out.status.success(), "djpeg rejected gpu jpeg");
+    // P6\n<w> <h>\n255\n then w*h*3 bytes
+    let ppm = &out.stdout;
+    let hdr = format!("P6\n{w} {h}\n255\n").into_bytes();
+    assert!(ppm.starts_with(&hdr), "djpeg header mismatch");
+    let px = &ppm[hdr.len()..];
+    assert_eq!(px.len(), w * h * 3);
+    let mut worst = 0i32;
+    for i in 0..w * h {
+        for c in 0..3 {
+            worst = worst.max((px[i * 3 + c] as i32 - rgba[i * 4 + c] as i32).abs());
+        }
+    }
+    assert!(worst <= 16, "djpeg roundtrip max diff {worst}");
+}
+
+/// Arbitrary in-flight images: several threads decode+resize+encode
+/// concurrently — every result must be individually correct. This is
+/// the regression test for per-submission synchronization (no global
+/// GPU lock, no wait-for-latest-submission).
+#[test]
+fn concurrent_inflight_images() {
+    if !gpujpeg::available() {
+        eprintln!("gpujpeg not compiled in — skipping");
+        return;
+    }
+    let Some(jpg_a) = cjpeg(&gradient_ppm(256, 192), &["-quality", "90"]) else {
+        eprintln!("cjpeg missing — skipping");
+        return;
+    };
+    let Some(jpg_b) = cjpeg(&gradient_ppm(160, 200), &["-quality", "85", "-progressive"]) else {
+        eprintln!("cjpeg missing — skipping");
+        return;
+    };
+    let ja = std::sync::Arc::new(jpg_a);
+    let jb = std::sync::Arc::new(jpg_b);
+
+    let mut handles = Vec::new();
+    for t in 0..8 {
+        let (ja, jb) = (ja.clone(), jb.clone());
+        handles.push(std::thread::spawn(move || {
+            let jpg = if t % 2 == 0 { &ja } else { &jb };
+            let (want_w, want_h) = if t % 2 == 0 { (256, 192) } else { (160, 200) };
+            for i in 0..3 {
+                let Some(s) = gpujpeg::open(jpg) else {
+                    panic!("t{t}i{i}: open failed");
+                };
+                assert_eq!((s.width, s.height), (want_w, want_h), "t{t}i{i}");
+                let (enc, w, h) = s.encode_resized(48, 48, 80).expect("encode_resized");
+                assert_eq!(&enc[..2], &[0xFF, 0xD8]);
+                let mut dec = zune_jpeg::JpegDecoder::new(std::io::Cursor::new(&enc));
+                let rgb = dec.decode().expect("zune decode");
+                assert_eq!(rgb.len(), (w * h) as usize * 3, "t{t}i{i}");
+            }
+        }));
+    }
+    for h in handles {
+        h.join().unwrap();
+    }
 }

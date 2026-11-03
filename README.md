@@ -99,6 +99,8 @@ All previews are actively generated in the background for **all** images (priori
 
 JPEGs decode on the **GPU** via a pure-Rust wgpu/WGSL compute decoder — bit-exact vs libjpeg-turbo and roughly 10× faster than the CPU path for large images. Baseline and progressive files both work; files without restart markers (most camera JPEGs, `DRI=0`) get a host survey pass that synthesizes virtual restart intervals, so serial scans decode in parallel too. EXIF orientation is applied on the GPU. Anything unsupported (non-8-bit, arithmetic-coded, >3 components) or a missing GPU transparently falls back to the fast CPU decoder. Set `IC_NO_GPUJPEG=1` to disable.
 
+JPEG **encoding** runs on the GPU too: a WGSL port of the restart-parallel compute encoder (one work item per MCU — level shift, DCT, quantization, Huffman with 0xFF stuffing; the host only assembles JFIF markers and RST segments). Preview generation for JPEG sources is therefore decode → resize → encode without pixels ever leaving the device — only the finished `.jpg` bytes cross back. GPU jobs are fully pipelined: every call waits only on its own queue submissions, so an arbitrary number of images can be in flight at once across the preview worker pool.
+
 Directory listing runs in the background and streams results in filesystem order — tiles appear and previews generate while the scan is still in flight, which matters on slow SMB/network mounts. The `-o` ordering is applied once the scan completes.
 
 Album mode accepts the same scanning options as `crop`: `-r/--recursive`, `--whitelist`, `--blacklist`, `--filter-syntax`, `-o/--order`, `-i/--inverse-order`, `-j/--parallel`, `-d/--dry-run` and `-v/--verbose`.
