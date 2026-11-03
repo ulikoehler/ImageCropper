@@ -3,12 +3,16 @@
 //! are managed by wgpu handles (no explicit session map needed).
 
 use super::coeffs;
-use super::jpeg::{pack_flut, pack_tables, FrameGpu, Jpg};
+use super::jpeg::{pack_flut, pack_tables, scan_mode, FrameGpu, Jpg};
 use super::shaders;
 use std::future::Future;
 use std::sync::OnceLock;
 
 const CHUNK_MCUS: u32 = 2048;
+/// MCU budget per queue submission: a single multi-second submit can
+/// get killed by the driver's job watchdog on some GPUs, so (scan,
+/// generation) dispatches are grouped into submits under this cap.
+const SUBMIT_MCUS: u32 = 32768;
 
 pub struct GpuCtx {
     device: wgpu::Device,
@@ -126,7 +130,7 @@ impl GpuCtx {
             entries: &[
                 bgl_entry(0, RO),
                 bgl_entry(1, RO),
-                bgl_entry(2, UNI),
+                bgl_entry(2, RO),
                 bgl_entry(3, RW),
                 bgl_entry(4, UNI),
                 bgl_entry(5, RW),
@@ -138,7 +142,7 @@ impl GpuCtx {
         let d_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: None,
             bind_group_layouts: &[Some(&d_bgl)],
-            immediate_size: 36,
+            immediate_size: 88,
         });
         let r_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: None,
@@ -212,62 +216,114 @@ impl GpuCtx {
 
     /// Full JPEG decode -> RGBA u32 buffer on device (0xAABBGGRR words).
     /// Returns the output buffer; caller may keep it (session) or read it.
+    /// Handles baseline (SOF0/1) and progressive (SOF2, multi-scan) files.
     pub fn decode_into(&self, j: &Jpg<'_>, fg: &FrameGpu) -> wgpu::Buffer {
         let dev = &self.device;
         let q = &self.queue;
-        let n_iv = j.intervals.len() as u32;
-        let n_gen = j
-            .intervals
-            .iter()
-            .map(|iv| iv.n_mcu.div_ceil(CHUNK_MCUS))
-            .max()
-            .unwrap_or(1)
-            .max(1);
-        let mut ck = vec![0u32; (n_iv * n_gen * 4) as usize];
-        for g_i in 0..n_gen {
-            for i in 0..n_iv {
-                let iv = &j.intervals[i as usize];
-                let ms = iv.mcu_start + g_i * CHUNK_MCUS;
-                let nm = (iv.mcu_start as i64 + iv.n_mcu as i64 - ms as i64)
-                    .clamp(0, CHUNK_MCUS as i64) as u32;
-                let w = &mut ck[((g_i * n_iv + i) * 4) as usize..][..4];
-                w[0] = if g_i == 0 { iv.byte_start } else { 0 };
-                w[1] = ms;
-                w[2] = nm;
-                w[3] = if g_i > 0 { 1 } else { 0 };
-            }
-        }
+        let n_scans = j.scans.len() as u32;
 
+        // ---- one-time upload: scan data, chunk grid, state slots, tables ----
+        // Whole file as scan buffer: interval byteStarts are file-absolute.
         let scan_buf = buf(
             dev,
-            u64::from(j.scan_len.div_ceil(4) * 4),
+            j.data.len().div_ceil(4) as u64 * 4,
             wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         );
         {
-            let mut scan_bytes =
-                j.data[j.scan_off as usize..(j.scan_off + j.scan_len) as usize].to_vec();
-            scan_bytes.resize(j.scan_len.div_ceil(4) as usize * 4, 0);
-            q.write_buffer(&scan_buf, 0, &scan_bytes);
+            let mut file_bytes = j.data.to_vec();
+            file_bytes.resize(j.data.len().div_ceil(4) * 4, 0);
+            q.write_buffer(&scan_buf, 0, &file_bytes);
+        }
+
+        // per-scan chunk entries concatenated into one buffer
+        let mut ck_all: Vec<u32> = Vec::new();
+        let mut ck_base = vec![0u32; n_scans as usize];
+        let mut n_iv_v = Vec::with_capacity(n_scans as usize);
+        let mut n_gen_v = Vec::with_capacity(n_scans as usize);
+        let mut total_slots = 0u32;
+        for (si, sc) in j.scans.iter().enumerate() {
+            let n_iv = sc.intervals.len() as u32;
+            let n_gen = sc
+                .intervals
+                .iter()
+                .map(|iv| iv.n_mcu.div_ceil(CHUNK_MCUS))
+                .max()
+                .unwrap_or(1)
+                .max(1);
+            ck_base[si] = total_slots;
+            n_iv_v.push(n_iv);
+            n_gen_v.push(n_gen);
+            for g_i in 0..n_gen {
+                for iv in &sc.intervals {
+                    let ms = iv.mcu_start + g_i * CHUNK_MCUS;
+                    let nm = (iv.mcu_start as i64 + iv.n_mcu as i64 - ms as i64)
+                        .clamp(0, CHUNK_MCUS as i64) as u32;
+                    ck_all.extend_from_slice(&[
+                        if g_i == 0 {
+                            sc.data_off + iv.byte_start
+                        } else {
+                            0
+                        },
+                        ms,
+                        nm,
+                        u32::from(g_i > 0),
+                    ]);
+                }
+            }
+            total_slots += n_iv * n_gen;
         }
         let iv_buf = buf(
             dev,
-            (n_iv * n_gen * 16) as u64,
+            (ck_all.len() * 4) as u64,
             wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         );
-        q.write_buffer(&iv_buf, 0, &u32_bytes(&ck));
-        let st_buf = buf(dev, (n_iv * n_gen * 32) as u64, wgpu::BufferUsages::STORAGE);
+        q.write_buffer(&iv_buf, 0, &u32_bytes(&ck_all));
+        let st_buf = buf(
+            dev,
+            (total_slots * 12 * 4) as u64,
+            wgpu::BufferUsages::STORAGE,
+        );
+
+        // per-scan Huffman/quant tables at region si*TAB_WORDS, plus one
+        // recon region (final quant state) at n_scans*TAB_WORDS
         let tab_buf = buf(
             dev,
-            (super::jpeg::TAB_WORDS * 4) as u64,
-            wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        );
-        q.write_buffer(&tab_buf, 0, &i32_bytes(&pack_tables(j)));
-        let flut_buf = buf(
-            dev,
-            (super::jpeg::FLUT_WORDS * 4) as u64,
+            ((n_scans as usize + 1) * super::jpeg::TAB_WORDS * 4) as u64,
             wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         );
-        q.write_buffer(&flut_buf, 0, &u32_bytes(&pack_flut(j)));
+        {
+            let mut words = Vec::with_capacity((n_scans as usize + 1) * super::jpeg::TAB_WORDS);
+            for sc in &j.scans {
+                words.extend_from_slice(&pack_tables(sc));
+            }
+            let mut qt = vec![0i32; super::jpeg::TAB_WORDS];
+            for t in 0..4 {
+                for i in 0..64 {
+                    qt[t * 64 + i] = j.qt[t][i] as i32;
+                }
+            }
+            words.extend_from_slice(&qt);
+            q.write_buffer(&tab_buf, 0, &i32_bytes(&words));
+        }
+
+        // per-scan fast LUTs at region si*FLUT_WORDS (dedup table slots
+        // identical to the previous scan's — cjpeg re-emits some tables)
+        let flut_buf = buf(
+            dev,
+            (n_scans as usize * super::jpeg::FLUT_WORDS * 4) as u64,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        );
+        {
+            let mut all = Vec::with_capacity(n_scans as usize * super::jpeg::FLUT_WORDS);
+            let mut prev: Option<(&super::jpeg::Scan, Vec<u32>)> = None;
+            for sc in &j.scans {
+                let fl = pack_flut(sc, prev.as_ref().map(|(s, f)| (*s, f.as_slice())));
+                all.extend_from_slice(&fl);
+                prev = Some((sc, fl));
+            }
+            q.write_buffer(&flut_buf, 0, &u32_bytes(&all));
+        }
+
         let comp_buf = buf(
             dev,
             256,
@@ -306,48 +362,127 @@ impl GpuCtx {
             ],
         });
 
-        let mut pc = [
+        // ---- dispatch grouping: a single multi-second submit can get
+        // killed by the driver's job watchdog on some GPUs — group
+        // (scan, generation) dispatches into submits bounded by MCU work.
+        struct Job {
+            si: u32,
+            g: u32,
+            mcus: u32,
+        }
+        let mut jobs = Vec::new();
+        for si in 0..n_scans {
+            let sc = &j.scans[si as usize];
+            for g in 0..n_gen_v[si as usize] {
+                let mut w = 0u64;
+                for iv in &sc.intervals {
+                    let ms = iv.mcu_start + g * CHUNK_MCUS;
+                    w += (iv.mcu_start as i64 + iv.n_mcu as i64 - ms as i64)
+                        .clamp(0, CHUNK_MCUS as i64) as u64;
+                }
+                jobs.push(Job {
+                    si,
+                    g,
+                    mcus: w as u32,
+                });
+            }
+        }
+        // greedy grouping into ranges whose total MCUs stay under budget
+        let mut submits: Vec<(u32, u32)> = Vec::new();
+        {
+            let mut acc = 0u32;
+            let mut start = 0usize;
+            for i in 0..=jobs.len() {
+                if i == jobs.len() || (acc > 0 && acc + jobs[i].mcus > SUBMIT_MCUS) {
+                    submits.push((start as u32, i as u32));
+                    start = i;
+                    acc = 0;
+                    if i == jobs.len() {
+                        break;
+                    }
+                }
+                acc += jobs[i].mcus;
+            }
+        }
+
+        let mut pc = [0u32; 22];
+        pc[0] = j.w as u32;
+        pc[1] = j.h as u32;
+        pc[2] = j.mcus_x as u32;
+        pc[3] = j.n_comp as u32;
+        pc[4] = j.max_h as u32;
+        pc[5] = j.max_v as u32;
+        pc[7] = j.data.len() as u32;
+
+        // 1) entropy decode: scan generations grouped by MCU budget
+        let mut first = true;
+        for &(j0, j1) in &submits {
+            let mut enc = dev.create_command_encoder(&Default::default());
+            if first {
+                enc.clear_buffer(&coef_buf, 0, None);
+                first = false;
+            }
+            {
+                let mut cp = enc.begin_compute_pass(&Default::default());
+                cp.set_pipeline(&self.p_entropy);
+                cp.set_bind_group(0, &bg, &[]);
+                let mut last_si = u32::MAX;
+                for ji in j0..j1 {
+                    let jb = &jobs[ji as usize];
+                    let si = jb.si;
+                    let sc = &j.scans[si as usize];
+                    let n_iv = n_iv_v[si as usize];
+                    if si != last_si {
+                        pc[6] = n_iv;
+                        pc[9] = scan_mode(sc);
+                        pc[10] = sc.ns as u32;
+                        pc[11] = sc.ss as u32;
+                        pc[12] = sc.se as u32;
+                        pc[13] = sc.ah as u32;
+                        pc[14] = sc.al as u32;
+                        pc[15] = sc.total_mcus;
+                        for i in 0..sc.ns as usize {
+                            pc[16 + i] = sc.sc[i].comp as u32
+                                | ((sc.sc[i].td as u32) << 8)
+                                | ((sc.sc[i].ta as u32) << 16);
+                        }
+                        pc[20] = si * (super::jpeg::TAB_WORDS as u32) / 4;
+                        pc[21] = si * (super::jpeg::FLUT_WORDS as u32);
+                        last_si = si;
+                    }
+                    pc[8] = ck_base[si as usize] + jb.g * n_iv;
+                    cp.set_immediates(0, &pc_bytes(&pc));
+                    cp.dispatch_workgroups(n_iv.div_ceil(32), 1, 1);
+                }
+            }
+            q.submit([enc.finish()]);
+        }
+        self.wait();
+        // 2) + 3) reconstruction and upsample in one submit
+        let pc8: [u32; 9] = [
             j.w as u32,
             j.h as u32,
             j.mcus_x as u32,
             j.n_comp as u32,
             j.max_h as u32,
             j.max_v as u32,
-            n_iv,
-            j.scan_len,
             0,
+            j.data.len() as u32,
+            n_scans * (super::jpeg::TAB_WORDS as u32) / 4,
         ];
-        // 1) entropy decode: one submit per chunk generation
-        for g_i in 0..n_gen {
-            pc[8] = g_i * n_iv;
-            let mut enc = dev.create_command_encoder(&Default::default());
-            if g_i == 0 {
-                enc.clear_buffer(&coef_buf, 0, None);
-            }
-            {
-                let mut cp = enc.begin_compute_pass(&Default::default());
-                cp.set_pipeline(&self.p_entropy);
-                cp.set_bind_group(0, &bg, &[]);
-                cp.set_immediates(0, &pc_bytes(&pc));
-                cp.dispatch_workgroups(n_iv.div_ceil(32), 1, 1);
-            }
-            q.submit([enc.finish()]);
-            self.wait();
-        }
-        // 2) + 3) reconstruction and upsample in one submit
         let mut enc = dev.create_command_encoder(&Default::default());
         {
             let mut cp = enc.begin_compute_pass(&Default::default());
             cp.set_pipeline(&self.p_recon);
             cp.set_bind_group(0, &bg, &[]);
-            cp.set_immediates(0, &pc_bytes(&pc[..8]));
+            cp.set_immediates(0, &pc_bytes(&pc8));
             cp.dispatch_workgroups((fg.total_blocks as u32).div_ceil(64), 1, 1);
         }
         {
             let mut cp = enc.begin_compute_pass(&Default::default());
             cp.set_pipeline(&self.p_upsample);
             cp.set_bind_group(0, &bg, &[]);
-            cp.set_immediates(0, &pc_bytes(&pc[..8]));
+            cp.set_immediates(0, &pc_bytes(&pc8));
             cp.dispatch_workgroups((j.w as u32).div_ceil(16), (j.h as u32).div_ceil(16), 1);
         }
         q.submit([enc.finish()]);

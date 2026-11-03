@@ -38,7 +38,13 @@ fn photo_ppm(w: usize, h: usize) -> Vec<u8> {
 }
 fn cjpeg(ppm: &[u8], args: &[&str]) -> Option<Vec<u8>> {
     // file-arg invocation — piping >64KB through stdin deadlocks
-    let f = std::env::temp_dir().join(format!("ic-base-{}.ppm", std::process::id()));
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static N: AtomicUsize = AtomicUsize::new(0);
+    let f = std::env::temp_dir().join(format!(
+        "ic-base-{}-{}.ppm",
+        std::process::id(),
+        N.fetch_add(1, Ordering::Relaxed)
+    ));
     std::fs::write(&f, ppm).unwrap();
     let out = Command::new("cjpeg")
         .args(args)
@@ -146,6 +152,140 @@ fn baseline_hashes_match_cpp_impl() {
             eprintln!("{}: cjpeg unavailable — skipping", c.name);
             continue;
         };
+        let (rgba, _, _) = gpujpeg::decode_rgba(&jpg).expect("decode_rgba");
+        assert_eq!(hash(&rgba), c.dec, "{} decode hash", c.name);
+        checked += 1;
+        let s = gpujpeg::open(&jpg).expect("open");
+        for (want, mw, mh) in c.rs {
+            let (rgb, _, _) = s.resize_rgb(*mw, *mh).expect("resize_rgb");
+            assert_eq!(hash(&rgb), *want, "{} resize {mw}x{mh}", c.name);
+            checked += 1;
+        }
+    }
+    assert!(checked > 0, "no cases ran (cjpeg missing?)");
+}
+
+/// Progressive (SOF2) versions of the baseline fixtures. Same source
+/// pixels + same encoder settings produce the same quantized
+/// coefficients, just packaged as multi-scan spectral-selection/
+/// successive-approximation scans — so the expected hashes are the
+/// SAME as the baseline cases above: a built-in cross-check that the
+/// progressive scan machinery reproduces identical pixels.
+#[test]
+fn progressive_hashes_match_cpp_impl() {
+    if !gpujpeg::available() {
+        eprintln!("gpujpeg unavailable — skipping");
+        return;
+    }
+    let cases: Vec<Case> = vec![
+        Case {
+            name: "prog_420_photo",
+            ppm: photo_ppm(801, 601),
+            args: &["-progressive", "-restart", "4", "-quality", "85"],
+            dec: "f0df2c42f9fba34a",
+            rs: &[
+                ("5458580698c45540", 512, 512),
+                ("cb97cb4ba90c1e4a", 1920, 1920),
+                ("da61252ddd0bb1ac", 100, 77),
+            ],
+        },
+        Case {
+            name: "prog_444_grad",
+            ppm: grad_ppm(640, 480),
+            args: &[
+                "-progressive",
+                "-restart",
+                "2",
+                "-quality",
+                "95",
+                "-sample",
+                "1x1",
+            ],
+            dec: "7f24b0d45d7b3607",
+            rs: &[
+                ("07ea15a696777fa9", 512, 512),
+                ("d9a5132cda2c6d59", 1920, 1920),
+                ("94b4ed6cf01fe833", 100, 77),
+            ],
+        },
+        Case {
+            name: "prog_gray",
+            ppm: {
+                let mut g = format!("P5\n300 200\n255\n").into_bytes();
+                for i in 0..300 * 200 {
+                    g.push((i * 7 % 256) as u8);
+                }
+                g
+            },
+            args: &[
+                "-progressive",
+                "-restart",
+                "8",
+                "-quality",
+                "90",
+                "-grayscale",
+            ],
+            dec: "c0157952a893d3bf",
+            rs: &[
+                ("2742733a978aed92", 512, 512),
+                ("2742733a978aed92", 1920, 1920),
+                ("f039bbe2b3491494", 100, 77),
+            ],
+        },
+        Case {
+            name: "prog_422",
+            ppm: photo_ppm(511, 399),
+            args: &[
+                "-progressive",
+                "-restart",
+                "4",
+                "-quality",
+                "75",
+                "-sample",
+                "2x1",
+            ],
+            dec: "a1d9de6225243ae2",
+            rs: &[
+                ("2740ea54830c951a", 512, 512),
+                ("2740ea54830c951a", 1920, 1920),
+                ("22006323db383b08", 100, 77),
+            ],
+        },
+        Case {
+            name: "prog_small",
+            ppm: grad_ppm(96, 80),
+            args: &["-progressive", "-restart", "2", "-quality", "50"],
+            dec: "340714819bfc3bbd",
+            rs: &[
+                ("1998524833d3ce08", 512, 512),
+                ("1998524833d3ce08", 1920, 1920),
+                ("95809f2471da5990", 100, 77),
+            ],
+        },
+        Case {
+            name: "prog_420_big",
+            ppm: photo_ppm(1920, 1080),
+            args: &["-progressive", "-restart", "8", "-quality", "88"],
+            dec: "140e9d6f3cde8130",
+            rs: &[
+                ("cfa37b8b49ffc8b6", 512, 512),
+                ("edcb986bd0f8595b", 1920, 1920),
+                ("c6117fcb4c7b7615", 100, 77),
+            ],
+        },
+    ];
+    let mut checked = 0;
+    for c in &cases {
+        let Some(jpg) = cjpeg(&c.ppm, c.args) else {
+            eprintln!("{}: cjpeg unavailable — skipping", c.name);
+            continue;
+        };
+        // sanity: fixture really is progressive (SOF2)
+        assert!(
+            jpg.windows(2).any(|w| w == [0xFF, 0xC2]),
+            "{} not SOF2",
+            c.name
+        );
         let (rgba, _, _) = gpujpeg::decode_rgba(&jpg).expect("decode_rgba");
         assert_eq!(hash(&rgba), c.dec, "{} decode hash", c.name);
         checked += 1;

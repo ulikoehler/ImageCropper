@@ -43,15 +43,43 @@ pub struct Comp {
     pub ta: i32,
     pub bw: i32,
     pub bh: i32,
+    pub wib: i32, // width_in_blocks (non-interleaved scan grid)
+    pub hib: i32,
     pub w: i32,
     pub h: i32,
 }
 
 #[derive(Clone, Copy)]
 pub struct Interval {
-    pub byte_start: u32,
+    pub byte_start: u32, // relative to the scan's data_off
     pub mcu_start: u32,
     pub n_mcu: u32,
+}
+
+#[derive(Clone, Copy, Default)]
+pub struct ScanComp {
+    pub comp: i32,
+    pub td: i32,
+    pub ta: i32,
+}
+
+pub struct Scan {
+    pub ns: i32,
+    pub sc: [ScanComp; 4],
+    pub ss: i32,
+    pub se: i32,
+    pub ah: i32,
+    pub al: i32,
+    pub dri: i32, // restart interval in effect for this scan
+    pub data_off: u32,
+    pub data_len: u32,
+    pub intervals: Vec<Interval>,
+    pub total_mcus: u32, // MCU count in this scan's units
+    // Tables snapshot AS OF this scan — progressive files commonly
+    // redefine DHT/DQT between scans (per-scan optimized tables).
+    pub dctab: [HuffTable; 4],
+    pub actab: [HuffTable; 4],
+    pub qt: [[u16; 64]; 4],
 }
 
 pub struct Jpg<'a> {
@@ -64,15 +92,14 @@ pub struct Jpg<'a> {
     pub max_v: i32,
     pub mcus_x: i32,
     pub mcus_y: i32,
-    pub dri: i32,
+    pub dri: i32,           // current DRI while scanning headers
     pub qt: [[u16; 64]; 4], // natural order
     pub dctab: [HuffTable; 4],
     pub actab: [HuffTable; 4],
     pub have_dht: bool,
-    pub scan_off: u32,
-    pub scan_len: u32,
-    pub intervals: Vec<Interval>,
+    pub scans: Vec<Scan>,
     pub total_mcus: i32,
+    pub progressive: bool,
 }
 
 impl<'a> Jpg<'a> {
@@ -102,10 +129,9 @@ impl<'a> Jpg<'a> {
                 HuffTable::default(),
             ],
             have_dht: false,
-            scan_off: 0,
-            scan_len: 0,
-            intervals: Vec::new(),
+            scans: Vec::new(),
             total_mcus: 0,
+            progressive: false,
         }
     }
 }
@@ -241,11 +267,12 @@ pub fn parse_jpg(j: &mut Jpg<'_>) -> bool {
                     j.have_dht = true;
                 }
             }
-            0xC0 | 0xC1 => {
-                // SOF0 baseline / SOF1 ext sequential
+            0xC0 | 0xC1 | 0xC2 => {
+                // SOF0 baseline / SOF1 ext sequential / SOF2 progressive
                 if s[0] != 8 {
                     return false;
                 }
+                j.progressive = m == 0xC2;
                 j.h = ((s[1] as i32) << 8) | s[2] as i32;
                 j.w = ((s[3] as i32) << 8) | s[4] as i32;
                 j.n_comp = s[5] as i32;
@@ -263,19 +290,35 @@ pub fn parse_jpg(j: &mut Jpg<'_>) -> bool {
                 }
                 have_sof = true;
             }
-            0xC2 => {
-                return false; // progressive JPEG unsupported
-            }
             0xDD => {
-                // DRI
+                // DRI — takes effect for all scans that follow
                 j.dri = ((s[0] as i32) << 8) | s[1] as i32;
             }
             0xDA => {
                 // SOS — entropy data follows the header
-                let ns = s[0] as i32;
-                if ns != j.n_comp {
+                if slen < 1 {
                     return false;
                 }
+                let ns = s[0] as i32;
+                if ns < 1 || ns > 4 || ns > j.n_comp || slen < (1 + 2 * ns + 3) as usize {
+                    return false;
+                }
+                let mut sc = Scan {
+                    ns,
+                    sc: [ScanComp::default(); 4],
+                    ss: 0,
+                    se: 63,
+                    ah: 0,
+                    al: 0,
+                    dri: j.dri,
+                    data_off: 0,
+                    data_len: 0,
+                    intervals: Vec::new(),
+                    total_mcus: 0,
+                    dctab: j.dctab.clone(),
+                    actab: j.actab.clone(),
+                    qt: j.qt,
+                };
                 for i in 0..ns as usize {
                     let cs = s[1 + i * 2] as i32;
                     let mut ci = None;
@@ -285,29 +328,36 @@ pub fn parse_jpg(j: &mut Jpg<'_>) -> bool {
                         }
                     }
                     let Some(ci) = ci else { return false };
-                    j.comps[ci].td = (s[2 + i * 2] >> 4) as i32;
-                    j.comps[ci].ta = (s[2 + i * 2] & 15) as i32;
-                    if j.comps[ci].td > 3 || j.comps[ci].ta > 3 {
+                    sc.sc[i].comp = ci as i32;
+                    sc.sc[i].td = (s[2 + i * 2] >> 4) as i32;
+                    sc.sc[i].ta = (s[2 + i * 2] & 15) as i32;
+                    if sc.sc[i].td > 3 || sc.sc[i].ta > 3 {
                         return false;
                     }
                 }
-                j.scan_off = (s_off + slen) as u32;
+                sc.ss = s[1 + ns as usize * 2] as i32;
+                sc.se = s[2 + ns as usize * 2] as i32;
+                sc.ah = (s[3 + ns as usize * 2] >> 4) as i32;
+                sc.al = (s[3 + ns as usize * 2] & 15) as i32;
+                sc.data_off = (s_off + slen) as u32;
                 // entropy data ends before the next unstuffed marker
-                let mut q = j.scan_off as usize;
+                let mut q = sc.data_off as usize;
                 while q + 1 < d.len() {
                     if d[q] == 0xFF && d[q + 1] != 0x00 && !(0xD0..=0xD7).contains(&d[q + 1]) {
                         break;
                     }
                     q += 1;
                 }
-                j.scan_len = (q - j.scan_off as usize) as u32;
-                break 'outer;
+                sc.data_len = (q - sc.data_off as usize) as u32;
+                j.scans.push(sc);
+                p = q;
+                continue 'outer;
             }
             _ => {}
         }
         p += 2 + len;
     }
-    if !have_sof || !j.have_dht || j.scan_len == 0 {
+    if !have_sof || !j.have_dht || j.scans.is_empty() {
         return false;
     }
 
@@ -321,44 +371,75 @@ pub fn parse_jpg(j: &mut Jpg<'_>) -> bool {
         c.bh = j.mcus_y * c.vs;
         c.w = (j.w * c.hs + j.max_h - 1) / j.max_h;
         c.h = (j.h * c.vs + j.max_v - 1) / j.max_v;
+        // jdinput.c: width_in_blocks = ceil(W*hs/(maxH*8)) — this can
+        // differ from bw (MCU-aligned); non-interleaved scans iterate
+        // this grid.
+        c.wib = (j.w * c.hs + j.max_h * 8 - 1) / (j.max_h * 8);
+        c.hib = (j.h * c.vs + j.max_v * 8 - 1) / (j.max_v * 8);
     }
 
-    // ---- restart intervals: scan for FFD0..FFD7 boundaries ----
-    j.intervals.push(Interval {
-        byte_start: 0,
-        mcu_start: 0,
-        n_mcu: 0,
-    });
-    let sd = &d[j.scan_off as usize..];
-    let mut found = 0i64;
-    let mut i = 0usize;
-    while i + 1 < j.scan_len as usize {
-        if sd[i] == 0xFF && (0xD0..=0xD7).contains(&sd[i + 1]) {
-            found += 1;
-            let last = j.intervals.last_mut().unwrap();
-            last.n_mcu = (found * i64::from(j.dri.max(1))) as u32 - last.mcu_start;
-            j.intervals.push(Interval {
-                byte_start: (i + 2) as u32,
-                mcu_start: (found as u32) * j.dri.max(1) as u32,
-                n_mcu: 0,
-            });
-            i += 1;
-        }
-        i += 1;
-    }
-    if found == 0 {
-        // no markers (DRI=0 or missing): one interval for everything
-        j.intervals.truncate(1);
-        j.intervals[0] = Interval {
+    // ---- per-scan restart intervals (FFD0..FFD7 boundaries) ----
+    for sc in j.scans.iter_mut() {
+        let total = if sc.ns == 1 {
+            (j.comps[sc.sc[0].comp as usize].wib * j.comps[sc.sc[0].comp as usize].hib) as u32
+        } else {
+            j.total_mcus as u32
+        };
+        sc.total_mcus = total;
+        sc.intervals.push(Interval {
             byte_start: 0,
             mcu_start: 0,
-            n_mcu: j.total_mcus as u32,
-        };
-    } else {
-        let last = j.intervals.last_mut().unwrap();
-        last.n_mcu = j.total_mcus as u32 - last.mcu_start;
+            n_mcu: 0,
+        });
+        let sd = &d[sc.data_off as usize..];
+        let mut found = 0i64;
+        let mut i = 0usize;
+        while i + 1 < sc.data_len as usize {
+            if sd[i] == 0xFF && (0xD0..=0xD7).contains(&sd[i + 1]) {
+                found += 1;
+                let last = sc.intervals.last_mut().unwrap();
+                last.n_mcu = (found * i64::from(sc.dri.max(1))) as u32 - last.mcu_start;
+                sc.intervals.push(Interval {
+                    byte_start: (i + 2) as u32,
+                    mcu_start: (found as u32) * sc.dri.max(1) as u32,
+                    n_mcu: 0,
+                });
+                i += 1;
+            }
+            i += 1;
+        }
+        if found == 0 {
+            // no markers (DRI=0 or missing): one interval for everything
+            sc.intervals.truncate(1);
+            sc.intervals[0] = Interval {
+                byte_start: 0,
+                mcu_start: 0,
+                n_mcu: total,
+            };
+        } else {
+            let last = sc.intervals.last_mut().unwrap();
+            last.n_mcu = total - last.mcu_start;
+        }
     }
     true
+}
+
+/// Scan -> entropy mode. AC bands are always non-interleaved (ns==1);
+/// DC bands may be interleaved or per-component.
+pub fn scan_mode(sc: &Scan) -> u32 {
+    if sc.ss == 0 && sc.se == 63 && sc.ah == 0 && sc.al == 0 {
+        0 // sequential full band
+    } else if sc.ss == 0 {
+        if sc.ah == 0 {
+            1
+        } else {
+            2
+        }
+    } else if sc.ah == 0 {
+        3
+    } else {
+        4
+    }
 }
 
 // ---- GPU buffer layouts ----
@@ -386,10 +467,28 @@ fn extend_ref(v: i32, s: i32) -> i32 {
     }
 }
 
-pub fn pack_flut(j: &Jpg<'_>) -> Vec<u32> {
+fn same_table(a: &HuffTable, b: &HuffTable) -> bool {
+    a.counts == b.counts && a.vals == b.vals
+}
+
+/// Build one scan's fused-LUT region. `prev` dedups unchanged tables:
+/// when a table matches the previous scan's, its region is copied from
+/// `prev_fl` (which the caller must pass along) instead of rebuilt.
+pub fn pack_flut(sc: &Scan, prev: Option<(&Scan, &[u32])>) -> Vec<u32> {
     let mut fl = vec![0u32; FLUT_WORDS];
     for t in 0..8usize {
-        let h = if t < 4 { &j.dctab[t] } else { &j.actab[t - 4] };
+        let h = if t < 4 {
+            &sc.dctab[t]
+        } else {
+            &sc.actab[t - 4]
+        };
+        if let Some((p, pfl)) = prev {
+            let ph = if t < 4 { &p.dctab[t] } else { &p.actab[t - 4] };
+            if same_table(h, ph) {
+                fl[t * 65536..(t + 1) * 65536].copy_from_slice(&pfl[t * 65536..(t + 1) * 65536]);
+                continue;
+            }
+        }
         for x in 0..65536usize {
             // canonical walk for the first code in this prefix
             let mut len = 0i32;
@@ -427,15 +526,19 @@ pub fn pack_flut(j: &Jpg<'_>) -> Vec<u32> {
     fl
 }
 
-pub fn pack_tables(j: &Jpg<'_>) -> Vec<i32> {
+pub fn pack_tables(sc: &Scan) -> Vec<i32> {
     let mut tab = vec![0i32; TAB_WORDS];
     for t in 0..4usize {
         for i in 0..64 {
-            tab[Q_BASE + t * 64 + i] = j.qt[t][i] as i32;
+            tab[Q_BASE + t * 64 + i] = sc.qt[t][i] as i32;
         }
     }
     for t in 0..8usize {
-        let h = if t < 4 { &j.dctab[t] } else { &j.actab[t - 4] };
+        let h = if t < 4 {
+            &sc.dctab[t]
+        } else {
+            &sc.actab[t - 4]
+        };
         let b = HUFF_BASE + t * 816;
         for i in 0..16 {
             tab[b + i] = h.mincode[i];
@@ -456,7 +559,7 @@ pub fn pack_tables(j: &Jpg<'_>) -> Vec<i32> {
 
 // Per-component params, 16 int32 words each:
 //   0 hs  1 vs  2 bw  3 bh  4 w  5 h  6 qt  7 dcTab  8 acTab
-//   9 coefOfs(words)  10 planeOfs(bytes)
+//   9 coefOfs(words)  10 planeOfs(bytes)  11 wib  12 hib  13..15 pad
 pub struct FrameGpu {
     pub comps: [[i32; 16]; 4],
     pub total_blocks: i32,
@@ -484,6 +587,8 @@ pub fn pack_comps(j: &Jpg<'_>) -> FrameGpu {
         cc[8] = 4 + c.ta; // actab[t] -> tabs[4+t]
         cc[9] = coef_of as i32;
         cc[10] = plane_of as i32;
+        cc[11] = c.wib;
+        cc[12] = c.hib;
         if i < j.n_comp as usize {
             coef_of += (c.bw * c.bh) as u32 * 32; // 64 coefs / 2 per word
             plane_of += (c.bw * 8 * c.bh * 8) as u32; // plane bytes

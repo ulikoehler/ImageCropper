@@ -88,20 +88,29 @@ pub fn available() -> bool {
     !disabled() && !stopped() && gpu::ctx().is_some()
 }
 
-/// Returns (width, height, dri) if bytes parse as a baseline JPEG we can
-/// handle, else None. Pure CPU — never touches the GPU.
+/// Returns (width, height, max restart interval across scans) if bytes
+/// parse as a JPEG we can handle (baseline or progressive), else None.
+/// Pure CPU — never touches the GPU.
 pub fn probe(bytes: &[u8]) -> Option<(u32, u32, u32)> {
     let mut j = Jpg::new(bytes);
     if !parse_jpg(&mut j) {
         return None;
     }
-    Some((j.w as u32, j.h as u32, j.dri as u32))
+    let dri = j
+        .scans
+        .iter()
+        .map(|s| s.dri.max(0) as u32)
+        .max()
+        .unwrap_or(0);
+    Some((j.w as u32, j.h as u32, dri))
 }
 
 fn canon(j: &mut Jpg<'_>) {
-    for i in 0..4 {
-        build_canon(&mut j.dctab[i]);
-        build_canon(&mut j.actab[i]);
+    for sc in j.scans.iter_mut() {
+        for i in 0..4 {
+            build_canon(&mut sc.dctab[i]);
+            build_canon(&mut sc.actab[i]);
+        }
     }
 }
 
@@ -109,15 +118,18 @@ fn open_locked(bytes: &[u8]) -> Option<(GpuJpeg, &'static gpu::GpuCtx)> {
     if disabled() {
         return None;
     }
-    let (w, h, dri) = probe(bytes)?;
-    if dri == 0 {
-        return None; // serial entropy stream — zune wins on CPU
-    }
-    let ctx = gpu::ctx()?;
     let mut j = Jpg::new(bytes);
     if !parse_jpg(&mut j) {
         return None;
     }
+    // a file with no restart markers anywhere decodes serially — zune
+    // wins on CPU for those (this rejects DRI=0 baseline AND the common
+    // no-restart progressive file)
+    if !j.scans.iter().any(|s| s.dri > 0) {
+        return None;
+    }
+    let (w, h) = (j.w as u32, j.h as u32);
+    let ctx = gpu::ctx()?;
     canon(&mut j);
     let fg = pack_comps(&j);
     let px = ctx.decode_into(&j, &fg);
@@ -160,9 +172,10 @@ impl Drop for GpuJpeg {
     }
 }
 
-/// Open a baseline JPEG into a GPU-resident RGBA buffer. Returns None
-/// for unsupported JPEGs (progressive, non-8-bit, DRI=0), when no
-/// suitable GPU adapter exists, or after [`stop`].
+/// Open a JPEG into a GPU-resident RGBA buffer. Returns None for
+/// unsupported JPEGs (non-8-bit, arithmetic, >3 components), files
+/// without restart markers (DRI=0 serial streams — zune wins on CPU),
+/// when no suitable GPU adapter exists, or after [`stop`].
 pub fn open(bytes: &[u8]) -> Option<GpuJpeg> {
     let _active = GpuActive::enter()?;
     let _guard = GPU_LOCK.lock().ok()?;

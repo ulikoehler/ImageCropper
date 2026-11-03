@@ -1,18 +1,19 @@
 //! WGSL compute shaders — ports of the GLSL in the old
-//! native/gpujpegdec.cpp. All math is integer-only, so the port is
-//! bit-exact by construction (no fp rounding concerns anywhere in the
-//! decode or resample path).
+//! native/gpujpegdec.cpp and VulkanExamples/p83_progjpegdec.
+//! All math is integer-only, so the port is bit-exact by construction
+//! (no fp rounding concerns anywhere in the decode or resample path).
 
-/// Shared decode pipeline: 9 bindings, up to 36B push constants.
+/// Shared decode pipeline: 9 bindings, up to 88B push constants.
 pub const ENTROPY: &str = r#"
-struct Tabs { t: array<vec4<u32>, 1696>, }
 struct Comps { c: array<array<vec4<i32>, 4>, 4>, }
 struct Pc { w: u32, h: u32, mcus_x: u32, n_comp: u32, max_h: u32,
-            max_v: u32, n_iv: u32, scan_len: u32, gen_ofs: u32, }
+            max_v: u32, n_iv: u32, scan_len: u32, gen_ofs: u32,
+            mode: u32, ns: u32, ss: u32, se: u32, ah: u32, al: u32,
+            total_mcus: u32, scomp: vec4<u32>, tab_ofs: u32, flut_ofs: u32, }
 
 @group(0) @binding(0) var<storage, read> scan: array<u32>;
 @group(0) @binding(1) var<storage, read> ck: array<vec4<u32>>;
-@group(0) @binding(2) var<uniform> tab: Tabs;
+@group(0) @binding(2) var<storage, read> tab: array<vec4<u32>>;
 @group(0) @binding(3) var<storage, read_write> st: array<u32>;
 @group(0) @binding(4) var<uniform> comps: Comps;
 @group(0) @binding(8) var<storage, read> flut: array<i32>;
@@ -23,7 +24,7 @@ fn cm(c: u32, i: u32) -> i32 { return comps.c[c][i >> 2u][i & 3u]; }
 
 struct Br {
     pos: u32, buf: u32, cnt: i32, e_end: bool,
-    wpos: u32, wval: u32, nval: u32,
+    wpos: u32, wval: u32, nval: u32, pad: i32,
 }
 
 fn byte_at(p: u32) -> u32 {
@@ -61,9 +62,13 @@ fn rd_byte(b: ptr<function, Br>) -> u32 {
 }
 
 fn fill_bits(b: ptr<function, Br>) {
+    // pad counts the trailing buffered bits that are marker padding, not
+    // real data — an MCU may only be skipped when nothing but pad remains.
     while ((*b).cnt <= 24) {
-        (*b).buf = ((*b).buf << 8u) | rd_byte(b);
+        let v = rd_byte(b);
+        (*b).buf = ((*b).buf << 8u) | v;
         (*b).cnt += 8;
+        if ((*b).e_end) { (*b).pad += 8; }
     }
 }
 
@@ -80,8 +85,15 @@ fn peek_n(b: ptr<function, Br>, n: u32) -> u32 {
 fn eat(b: ptr<function, Br>, n: u32) {
     if (u32((*b).cnt) >= n) { (*b).cnt -= i32(n); }
     else { (*b).cnt = 0; }
+    if ((*b).pad > (*b).cnt) { (*b).pad = (*b).cnt; }
     if ((*b).cnt < 32) { (*b).buf &= (1u << u32((*b).cnt)) - 1u; }
     // cnt >= 32: buf &= 0xFFFFFFFF is a no-op
+}
+
+fn get1(b: ptr<function, Br>) -> u32 {
+    let v = peek_n(b, 1u);
+    eat(b, 1u);
+    return v;
 }
 
 fn rext(b: ptr<function, Br>, s: i32) -> i32 {
@@ -94,6 +106,224 @@ fn rext(b: ptr<function, Br>, s: i32) -> i32 {
     return i;
 }
 
+// coef buffer: i16 pairs per u32 word, zigzag order — 32 words/block
+fn get_coef(outp: u32, k: u32) -> i32 {
+    let w2 = coef[outp + (k >> 1u)];
+    var v = i32((w2 >> ((k & 1u) * 16u)) & 0xFFFFu);
+    if (v >= 32768) { v -= 65536; }
+    return v;
+}
+fn set_coef(outp: u32, k: u32, v: i32) {
+    let wi = outp + (k >> 1u);
+    var w2 = coef[wi];
+    let sh = (k & 1u) * 16u;
+    w2 = (w2 & ~(0xFFFFu << sh)) | ((bitcast<u32>(v) & 0xFFFFu) << sh);
+    coef[wi] = w2;
+}
+
+// ---- sequential (baseline) block: DC diff + full AC band ----
+fn seq_block(b: ptr<function, Br>, outp: u32, dt: u32, at: u32,
+             pred: i32) -> i32 {
+    // -- DC: fused entry -> sign-extended diff in one lookup
+    var e = flut[pc.flut_ofs + dt * 65536u + peek_n(b, 16u)];
+    var do_ac = true;
+    var diff: i32;
+    if (e < 0) {
+        eat(b, u32(e & 0x1F));
+        diff = ((e >> 13u) & 0xFFFF) - 32768;
+    } else {
+        let len = e & 0x1F;
+        if (len == 0) { do_ac = false; diff = 0; }
+        else {
+            eat(b, u32(len));
+            diff = rext(b, (e >> 8u) & 0xFF);
+        }
+    }
+    let p2 = pred + diff;
+    var pw = 0u;
+    var pv = bitcast<u32>(p2) & 0xFFFFu;
+    // -- AC: ZRL/EOB need no stores; nonzero coefs gather
+    //    into the pending word
+    if (do_ac) {
+        var k = 1;
+        while (k < 64) {
+            e = flut[pc.flut_ofs + at * 65536u + peek_n(b, 16u)];
+            var rr: i32; var ss: i32; var val: i32;
+            if (e < 0) {
+                eat(b, u32(e & 0x1F));
+                rr = (e >> 5u) & 0xF;
+                ss = (e >> 9u) & 0xF;
+                val = ((e >> 13u) & 0xFFFF) - 32768;
+            } else {
+                let len = e & 0x1F;
+                if (len == 0) { break; }
+                eat(b, u32(len));
+                let sym = (e >> 8u) & 0xFF;
+                rr = sym >> 4u;
+                ss = sym & 15;
+                if (ss > 0) { val = rext(b, ss); }
+                else { val = 0; }
+            }
+            if (ss == 0) {
+                if (rr == 15) { k += 16; continue; }
+                break;              // EOB
+            }
+            k += rr;
+            if (k < 64) {
+                let wv = u32(k >> 1u);
+                if (wv != pw) {
+                    coef[outp + pw] = pv;
+                    pw = wv;
+                    pv = 0u;
+                }
+                pv |= (bitcast<u32>(val) & 0xFFFFu) <<
+                      (u32(k & 1) * 16u);
+            }
+            k += 1;
+        }
+    }
+    coef[outp + pw] = pv;
+    return p2;
+}
+
+// ---- progressive modes (jdphuff.c) ----
+
+// DC first: coef[0] = (pred + diff) << Al
+fn dc_first(b: ptr<function, Br>, outp: u32, dt: u32, pred: i32) -> i32 {
+    let e = flut[pc.flut_ofs + dt * 65536u + peek_n(b, 16u)];
+    var diff = 0;
+    if (e < 0) {
+        eat(b, u32(e & 0x1F));
+        diff = ((e >> 13u) & 0xFFFF) - 32768;
+    } else {
+        let len = e & 0x1F;
+        if (len > 0) {
+            eat(b, u32(len));
+            diff = rext(b, (e >> 8u) & 0xFF);
+        }
+    }
+    let p2 = pred + diff;
+    set_coef(outp, 0u, p2 << u32(pc.al));
+    return p2;
+}
+
+// DC refine: one correction bit per block — coef[0] |= (1 << Al)
+fn dc_refine(b: ptr<function, Br>, outp: u32) {
+    if (get1(b) != 0u) {
+        set_coef(outp, 0u, get_coef(outp, 0u) | (1 << u32(pc.al)));
+    }
+}
+
+// AC first: band Ss..Se, v << Al writes, EOBRUN zero-runs
+fn ac_first(b: ptr<function, Br>, outp: u32, at: u32, eob: u32) -> u32 {
+    var eobrun = eob;
+    if (eobrun > 0u) { return eobrun - 1u; }   // EOB block: no bits read
+    var k = i32(pc.ss);
+    while (k <= i32(pc.se)) {
+        let e = flut[pc.flut_ofs + at * 65536u + peek_n(b, 16u)];
+        var rr: i32; var s: i32; var val: i32;
+        if (e < 0) {
+            eat(b, u32(e & 0x1F));
+            rr = (e >> 5u) & 0xF; s = (e >> 9u) & 0xF;
+            val = ((e >> 13u) & 0xFFFF) - 32768;
+        } else {
+            let len = e & 0x1F;
+            if (len == 0) { break; }
+            eat(b, u32(len));
+            let sym = (e >> 8u) & 0xFF;
+            rr = sym >> 4u; s = sym & 15;
+            if (s > 0) { val = rext(b, s); } else { val = 0; }
+        }
+        if (s != 0) {
+            k += rr;
+            if (k <= i32(pc.se)) {
+                set_coef(outp, u32(k), val << u32(pc.al));
+            }
+            k += 1;
+        } else if (rr == 15) {       // ZRL
+            k += 16;
+        } else {                     // EOBr: 2^r + appended bits
+            eobrun = 1u << u32(rr);
+            if (rr > 0) {
+                eobrun += peek_n(b, u32(rr));
+                eat(b, u32(rr));
+            }
+            eobrun -= 1u;            // this block consumed one
+            break;
+        }
+    }
+    return eobrun;
+}
+
+// AC refine: correction bits on already-nonzero coefs, new +-p1 coefs
+fn ac_refine(b: ptr<function, Br>, outp: u32, at: u32, eob: u32) -> u32 {
+    let p1 = 1 << u32(pc.al);
+    let m1 = -p1;
+    var k = i32(pc.ss);
+    var eobrun = eob;
+    if (eobrun == 0u) {
+        while (k <= i32(pc.se)) {
+            let e = flut[pc.flut_ofs + at * 65536u + peek_n(b, 16u)];
+            var r: i32; var s: i32; var newv = 0;
+            if (e < 0) {
+                eat(b, u32(e & 0x1F));
+                r = (e >> 5u) & 0xF; s = (e >> 9u) & 0xF;
+                if (s != 0) {
+                    newv = (((e >> 13u) & 0xFFFF) - 32768) << u32(pc.al);
+                }
+            } else {
+                let len = e & 0x1F;
+                if (len == 0) { break; }
+                eat(b, u32(len));
+                let sym = (e >> 8u) & 0xFF;
+                r = sym >> 4u; s = sym & 15;
+                if (s != 0) {
+                    newv = select(m1, p1, get1(b) != 0u);
+                }
+            }
+            if (s == 0 && r != 15) {   // EOBr: rest of band = corrections
+                eobrun = 1u << u32(r);
+                if (r > 0) {
+                    eobrun += peek_n(b, u32(r));
+                    eat(b, u32(r));
+                }
+                break;
+            }
+            // walk: correction bits on nonzeros, count down r zeros
+            loop {
+                let v = get_coef(outp, u32(k));
+                if (v != 0) {
+                    if (get1(b) != 0u && (v & p1) == 0) {
+                        set_coef(outp, u32(k),
+                                 v + select(m1, p1, v >= 0));
+                    }
+                } else {
+                    r -= 1;
+                    if (r < 0) { break; }   // target zero position
+                }
+                k += 1;
+                if (k > i32(pc.se)) { break; }
+            }
+            if (s != 0 && k <= i32(pc.se)) {
+                set_coef(outp, u32(k), newv);
+            }
+            k += 1;
+        }
+    }
+    if (eobrun > 0u) {
+        // rest of band (or whole block under EOBRUN): correction bits
+        while (k <= i32(pc.se)) {
+            let v = get_coef(outp, u32(k));
+            if (v != 0 && get1(b) != 0u && (v & p1) == 0) {
+                set_coef(outp, u32(k), v + select(m1, p1, v >= 0));
+            }
+            k += 1;
+        }
+        eobrun -= 1u;
+    }
+    return eobrun;
+}
+
 @compute @workgroup_size(32)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (gid.x >= pc.n_iv) { return; }               // dispatch overrun
@@ -102,124 +332,104 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (w.z == 0u) { return; }                      // padded grid cell
     var b: Br;
     var pred: vec4<i32>;
+    var eobrun = 0u;
     if (w.w == 0u) {                                // first chunk
         b.pos = w.x; b.buf = 0u; b.cnt = 0; b.e_end = false;
-        b.wpos = 0xFFFFFFFEu; b.wval = 0u; b.nval = 0u;
+        b.wpos = 0xFFFFFFFEu; b.wval = 0u; b.nval = 0u; b.pad = 0;
         pred = vec4<i32>(0);
     } else {                                        // resume predecessor
-        let s = (idx - pc.n_iv) * 8u;
+        let s = (idx - pc.n_iv) * 12u;
         b.pos = st[s]; b.buf = st[s + 1u]; b.cnt = i32(st[s + 2u]);
         b.e_end = st[s + 3u] != 0u;
         b.wpos = 0xFFFFFFFEu; b.wval = 0u; b.nval = 0u;
+        b.pad = i32(st[s + 9u]);
         pred = vec4<i32>(bitcast<i32>(st[s + 4u]), bitcast<i32>(st[s + 5u]),
                          bitcast<i32>(st[s + 6u]), bitcast<i32>(st[s + 7u]));
+        eobrun = st[s + 8u];
     }
 
-    let mcus_y = (i32(pc.h) + 8 * i32(pc.max_v) - 1) / (8 * i32(pc.max_v));
     for (var m = 0u; m < w.z; m += 1u) {
         let mcu = i32(w.y + m);
-        if (mcu >= i32(pc.mcus_x) * mcus_y) { break; }
-        let mx = mcu % i32(pc.mcus_x);
-        let my = mcu / i32(pc.mcus_x);
-        for (var c = 0u; c < pc.n_comp; c += 1u) {
-            let hs = cm(c, 0u);
-            let vs = cm(c, 1u);
-            let bw = cm(c, 2u);
-            let dt = cm(c, 7u);
-            let at = cm(c, 8u);
-            let cofs = u32(cm(c, 9u));
-            for (var v = 0; v < vs; v += 1) {
-                for (var h = 0; h < hs; h += 1) {
-                    let bi = (my * vs + v) * bw + mx * hs + h;
-                    let outp = cofs + u32(bi) * 32u;
-                    // coef buffer is pre-zeroed; stores below accumulate
-                    // one pending word per block (pw/pv)
-                    // -- DC: fused entry -> sign-extended diff in one lookup
-                    var e = flut[u32(dt) * 65536u + peek_n(&b, 16u)];
-                    var do_ac = true;
-                    var diff: i32;
-                    if (e < 0) {
-                        eat(&b, u32(e & 0x1F));
-                        diff = ((e >> 13u) & 0xFFFF) - 32768;
-                    } else {
-                        let len = e & 0x1F;
-                        if (len == 0) { do_ac = false; diff = 0; }
-                        else {
-                            eat(&b, u32(len));
-                            diff = rext(&b, (e >> 8u) & 0xFF);
+        if (mcu >= i32(pc.total_mcus)) { break; }   // malformed interval table
+        if (b.e_end && b.cnt <= b.pad) { continue; } // no data left: skip MCU
+        if (pc.ns > 1u) {                            // interleaved: MCU grid
+            let mx = mcu % i32(pc.mcus_x);
+            let my = mcu / i32(pc.mcus_x);
+            for (var ci = 0; ci < i32(pc.ns); ci += 1) {
+                let scw = pc.scomp[ci];
+                let comp = scw & 0xFFu;
+                let dt = (scw >> 8u) & 0xFFu;
+                let at = 4u + ((scw >> 16u) & 0xFFu);
+                let hs = cm(comp, 0u);
+                let vs = cm(comp, 1u);
+                let bw = cm(comp, 2u);
+                let cofs = u32(cm(comp, 9u));
+                for (var v = 0; v < vs; v += 1) {
+                    for (var h = 0; h < hs; h += 1) {
+                        let bi = (my * vs + v) * bw + mx * hs + h;
+                        let outp = cofs + u32(bi) * 32u;
+                        switch pc.mode {
+                            case 0u: {
+                                pred[ci] = seq_block(&b, outp, dt, at, pred[ci]);
+                            }
+                            case 1u: {
+                                pred[ci] = dc_first(&b, outp, dt, pred[ci]);
+                            }
+                            case 2u: { dc_refine(&b, outp); }
+                            default: {}
                         }
                     }
-                    pred[c] += diff;
-                    var pw = 0u;
-                    var pv = bitcast<u32>(pred[c]) & 0xFFFFu;
-                    // -- AC: ZRL/EOB need no stores; nonzero coefs gather
-                    //    into the pending word
-                    if (do_ac) {
-                        var k = 1;
-                        while (k < 64) {
-                            e = flut[u32(at) * 65536u + peek_n(&b, 16u)];
-                            var rr: i32; var ss: i32; var val: i32;
-                            if (e < 0) {
-                                eat(&b, u32(e & 0x1F));
-                                rr = (e >> 5u) & 0xF;
-                                ss = (e >> 9u) & 0xF;
-                                val = ((e >> 13u) & 0xFFFF) - 32768;
-                            } else {
-                                let len = e & 0x1F;
-                                if (len == 0) { break; }
-                                eat(&b, u32(len));
-                                let sym = (e >> 8u) & 0xFF;
-                                rr = sym >> 4u;
-                                ss = sym & 15;
-                                if (ss > 0) { val = rext(&b, ss); }
-                                else { val = 0; }
-                            }
-                            if (ss == 0) {
-                                if (rr == 15) { k += 16; continue; }
-                                break;              // EOB
-                            }
-                            k += rr;
-                            if (k < 64) {
-                                let wv = u32(k >> 1u);
-                                if (wv != pw) {
-                                    coef[outp + pw] = pv;
-                                    pw = wv;
-                                    pv = 0u;
-                                }
-                                pv |= (bitcast<u32>(val) & 0xFFFFu) <<
-                                      (u32(k & 1) * 16u);
-                            }
-                            k += 1;
-                        }
-                    }
-                    coef[outp + pw] = pv;
                 }
+            }
+        } else {                                     // non-interleaved: raster
+            let scw = pc.scomp[0];
+            let comp = scw & 0xFFu;
+            let dt = (scw >> 8u) & 0xFFu;
+            let at = 4u + ((scw >> 16u) & 0xFFu);
+            let wib1 = cm(comp, 11u);
+            let bw = cm(comp, 2u);
+            let cofs = u32(cm(comp, 9u));
+            let bx = mcu % wib1;
+            let by = mcu / wib1;
+            let outp = cofs + u32(by * bw + bx) * 32u;
+            switch pc.mode {
+                case 0u: {
+                    pred[0] = seq_block(&b, outp, dt, at, pred[0]);
+                }
+                case 1u: {
+                    pred[0] = dc_first(&b, outp, dt, pred[0]);
+                }
+                case 2u: { dc_refine(&b, outp); }
+                case 3u: { eobrun = ac_first(&b, outp, at, eobrun); }
+                default: { eobrun = ac_refine(&b, outp, at, eobrun); }
             }
         }
     }
 
-    // hand bitstate + DC predictors to the next generation's chunk
-    let s = idx * 8u;
+    // hand bitstate + DC predictors + EOBRUN to the next generation's chunk
+    let s = idx * 12u;
     st[s] = b.pos; st[s + 1u] = b.buf; st[s + 2u] = u32(b.cnt);
     st[s + 3u] = select(0u, 1u, b.e_end);
     st[s + 4u] = bitcast<u32>(pred[0]); st[s + 5u] = bitcast<u32>(pred[1]);
     st[s + 6u] = bitcast<u32>(pred[2]); st[s + 7u] = bitcast<u32>(pred[3]);
+    st[s + 8u] = eobrun; st[s + 9u] = u32(b.pad);
 }
 "#;
 
 pub const RECON: &str = r#"
-struct Tabs { t: array<vec4<u32>, 1696>, }
 struct Comps { c: array<array<vec4<i32>, 4>, 4>, }
 struct Pc8 { w: u32, h: u32, mcus_x: u32, n_comp: u32, max_h: u32,
-             max_v: u32, n_iv: u32, scan_len: u32, }
+             max_v: u32, n_iv: u32, scan_len: u32, tab_ofs: u32, }
 
-@group(0) @binding(2) var<uniform> tab: Tabs;
+@group(0) @binding(2) var<storage, read> tab: array<vec4<u32>>;
 @group(0) @binding(4) var<uniform> comps: Comps;
 @group(0) @binding(5) var<storage, read_write> coef: array<u32>;
 @group(0) @binding(6) var<storage, read_write> planes: array<u32>;
 var<immediate> pc: Pc8;
 
-fn t_at(i: u32) -> i32 { return bitcast<i32>(tab.t[i >> 2u][i & 3u]); }
+fn t_at(i: u32) -> i32 {
+    return bitcast<i32>(tab[pc.tab_ofs + (i >> 2u)][i & 3u]);
+}
 fn cm(c: u32, i: u32) -> i32 { return comps.c[c][i >> 2u][i & 3u]; }
 
 const ZIG = array<i32, 64>(
@@ -345,7 +555,7 @@ fn main(@builtin(global_invocation_id) gid3: vec3<u32>) {
 pub const UPSAMPLE: &str = r#"
 struct Comps { c: array<array<vec4<i32>, 4>, 4>, }
 struct Pc8 { w: u32, h: u32, mcus_x: u32, n_comp: u32, max_h: u32,
-             max_v: u32, n_iv: u32, scan_len: u32, }
+             max_v: u32, n_iv: u32, scan_len: u32, tab_ofs: u32, }
 
 @group(0) @binding(4) var<uniform> comps: Comps;
 @group(0) @binding(6) var<storage, read_write> planes: array<u32>;
