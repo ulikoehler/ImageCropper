@@ -30,13 +30,20 @@ const topEl=document.getElementById("top"), statusEl=document.getElementById("st
 helpEl.textContent="scroll: wheel · zoom: +/- · width: w/W · select: click/ctrl/shift · delete: Del · move: m · fullscreen: f (toggle, ←/→) · crop: c";
 
 let manifest=null, items=[], thumbs=new Map(), pending=new Map();
-let scanning=false, scanErrs=[];
+let scanning=false, scanErrs=[], reloading=false;
 let tileH=180, zoom=1.0, scrollY=0, selected=new Set(), focus=0, anchor=0;
 let creditBudget=8*1024*1024;
 
 function connect(path){ return new Promise((res,rej)=>{
   const ws=new WebSocket(`ws://${location.host}${path}?token=${encodeURIComponent(token)}`);
-  ws.binaryType="arraybuffer"; ws.onopen=()=>res(ws); ws.onerror=rej; });
+  ws.binaryType="arraybuffer";
+  // A stalled upgrade (server mid-restart, proxy swallowing the response)
+  // must surface as a failure, not hang boot() on a silent "0 images" page.
+  const to=setTimeout(()=>rej(new Error("connect timeout")),10000);
+  ws.onopen=()=>{clearTimeout(to);res(ws)};
+  ws.onerror=()=>{clearTimeout(to);rej(new Error("refused"))};
+  ws.onclose=()=>{clearTimeout(to);rej(new Error("closed during connect"))};
+});
 }
 
 // /bulk request router: GET_MANIFEST + GET_FULL replies share the socket,
@@ -45,8 +52,10 @@ let bulkWs=null;
 const bulkReqs=new Map(); let bulkReqId=0x100;
 function bulkRequest(type,payload){
   const reqId=bulkReqId++;
-  return new Promise(res=>{
-    bulkReqs.set(reqId,{parts:[],head:null,res});
+  return new Promise((res,rej)=>{
+    bulkReqs.set(reqId,{parts:[],head:null,res,rej});
+    // A lost response must not hang boot()/refreshManifest forever.
+    setTimeout(()=>{if(bulkReqs.delete(reqId))rej(new Error("bulk timeout"))},30000);
     bulkWs.send(frame(type,reqId,payload));
   });
 }
@@ -103,7 +112,11 @@ async function refreshManifest(){
 }
 
 // ids are positional (items[id]); tombstoned entries keep their slot.
+// Patches arriving while the initial manifest is still in flight are
+// queued — applying them against null throws and permanently loses items.
+let pendingPatches=[];
 function applyPatch(p){
+  if(!manifest){pendingPatches.push(p);return}
   if(p.resync){
     const snap=snapshotThumbs();
     items=[];manifest.dirs=[];thumbs.clear();pending.clear();
@@ -125,19 +138,34 @@ function applyPatch(p){
 }
 
 async function boot(){
+  statusEl.textContent="connecting…";
   const bulk=await connect("/bulk"), data=await connect("/data");
   bulkWs=bulk;dataWs=data;
   bulk.onmessage=e=>onBulk(unframe(e.data));
+  bulk.onclose=()=>{
+    // Dead socket → pending bulkRequests would hang forever otherwise.
+    for(const r of bulkReqs.values())r.rej(new Error("bulk socket closed"));
+    bulkReqs.clear();
+    reloading=true;
+    statusEl.textContent="bulk connection closed — reloading…";
+    setTimeout(()=>location.reload(),1500);};
 
-  // /data: hello then handle thumbs+events
+  // /data: hello then handle thumbs+events. onclose must be armed before
+  // the first await below — a mid-boot death is otherwise invisible.
   data.onmessage=e=>onData(unframe(e.data));
+  data.onclose=()=>{reloading=true;
+    statusEl.textContent="connection closed — reloading…";
+    setTimeout(()=>location.reload(),1500);};
   data.send(frame(CL_HELLO,0,str(JSON.stringify({token,manifest_version:0}))));
 
   // /bulk: manifest (chunked)
+  statusEl.textContent="loading manifest…";
   const {body}=await bulkRequest(BK_GET_MANIFEST,u32s(1,0));
   manifest=JSON.parse(new TextDecoder().decode(body));
   mouseSelect=manifest.mouse_select||"sequence";
   items=manifest.items;
+  // Patches that raced the manifest pull apply now, in order.
+  pendingPatches.forEach(applyPatch);pendingPatches=[];
   layoutDirty=true; draw();
 
   // credits: keep the push pipeline fed
@@ -145,9 +173,6 @@ async function boot(){
     data.send(frame(CL_CREDIT,0,(()=>{const b=new Uint8Array(8),
       v=new DataView(b.buffer);v.setBigUint64(0,BigInt(creditBudget),true);return b})()));}};
   grant(); setInterval(grant, 500);
-
-  data.onclose=()=>{statusEl.textContent="connection closed — reloading…";
-    setTimeout(()=>location.reload(),1500);};
 }
 
 const thumbReqs=[];
@@ -301,7 +326,7 @@ function onData(f){
     if(ev.ev==="scan-error"){scanErrs.push(ev.msg||"?");
       statusEl.textContent=`scan error: ${ev.msg}`;scheduleDraw();}
     if(ev.ev==="manifest-patch"){applyPatch(ev.patch||{});}
-    if(ev.ev==="fs-changed"){refreshManifest();}
+    if(ev.ev==="fs-changed"){refreshManifest().catch(()=>{});}
     if(ev.ev==="progress") statusEl.textContent=
       `previews ${ev.done}/${ev.queued}`;
   }
@@ -648,6 +673,8 @@ canvas.addEventListener("click",e=>{
 addEventListener("resize",()=>{layoutDirty=true;scheduleDraw()});
 
 boot().catch(e=>{
+  // A socket-close already scheduled a reload — don't prompt on top of it.
+  if(reloading)return;
   // WS upgrade refused — most likely auth (--auth=token / -p password).
   statusEl.textContent="connect failed — "+e;
   const t=prompt("Connection refused — enter the server token/password to retry:");
