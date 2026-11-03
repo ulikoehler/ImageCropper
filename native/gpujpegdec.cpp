@@ -921,7 +921,12 @@ static void decodeInto(Gpu& g, const Jpg& j, const FrameGpu& fg,
 }
 
 static Gpu& gpuCtx() {
-    static Gpu g;
+    // Intentionally leaked: worker threads may still be decoding when the
+    // process exits (Ctrl-C tears down while previews are in flight), and
+    // destroying the Vulkan device from a static destructor underneath an
+    // in-flight decode is a use-after-free — that was the shutdown
+    // segfault. The OS reclaims everything at exit.
+    static Gpu& g = *new Gpu();
     static int ok = -1;
     if (ok < 0) {
         try { g.init(); ok = 1; }

@@ -151,6 +151,20 @@ async function boot(){
 }
 
 const thumbReqs=[];
+// N virtual want-workers: keep up to WANT_WORKERS chunked CL_WANT requests
+// in flight so thumb delivery never stalls on one round-trip.
+const WANT_WORKERS=6, WANT_CHUNK=8;
+let wantQ=[], wantInFlight=0;
+function pumpWants(){
+  while(wantInFlight<WANT_WORKERS&&wantQ.length&&dataWs&&dataWs.readyState===1){
+    const chunk=wantQ.splice(0,WANT_CHUNK);
+    const b=new Uint8Array(2+4*chunk.length),v=new DataView(b.buffer);
+    v.setUint16(0,chunk.length,true);
+    chunk.forEach((id,i)=>v.setUint32(2+4*i,id,true));
+    dataWs.send(frame(CL_WANT,0,b));
+    wantInFlight++;
+  }
+}
 function onData(f){
   if(f.type===EV_THUMB){
     const v=new DataView(f.payload.buffer,f.payload.byteOffset);
@@ -158,6 +172,7 @@ function onData(f){
     const sig=v.getBigUint64(4,true).toString();   // manifest sigs are strings
     const jpeg=f.payload.subarray(12);
     pending.delete(id);
+    if(wantInFlight>0)wantInFlight--;   // a want-worker slot freed
     const it=items[id];
     // Drop pushes for a known item whose content no longer matches —
     // the id was reassigned mid-flight, tombstoned, or the file changed.
@@ -343,12 +358,8 @@ function draw(){
     ctx.fillStyle="rgba(78,161,255,0.22)";ctx.fillRect(r.x,y,r.w,r.h);
     ctx.strokeStyle="#4ea1ff";ctx.lineWidth=2;ctx.strokeRect(r.x,y,r.w,r.h);
   }
-  if(want.length&&dataWs&&dataWs.readyState===1){
-    const b=new Uint8Array(2+4*want.length),v=new DataView(b.buffer);
-    v.setUint16(0,want.length,true);
-    want.forEach((id,i)=>v.setUint32(2+4*i,id,true));
-    dataWs.send(frame(CL_WANT,0,b));
-  }
+  want.forEach(id=>wantQ.push(id));
+  pumpWants();
   let delQ=0,movQ=0,live=0;
   for(const k of pendingActions.values()){if(k==="delete")delQ++;else if(k==="move")movQ++}
   for(const it of items)if(it&&!it.removed)live++;

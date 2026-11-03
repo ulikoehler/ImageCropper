@@ -122,8 +122,12 @@ async fn handle(socket: WebSocket, state: Arc<ServerState>) {
             let mut last_resync = state
                 .resync_seq
                 .load(std::sync::atomic::Ordering::Relaxed);
+            // Produce up to PUMP_WIDTH thumbs concurrently per batch — a
+            // serial produce+send loop caps cold-cache delivery at ~20/s.
+            const PUMP_WIDTH: usize = 8;
             loop {
-                let id = {
+                let mut ids = Vec::new();
+                {
                     let mut q = queue.lock().await;
                     // A resync reassigned every id — queued wants/boosts and
                     // the pushed-set now name different files. Restart fresh.
@@ -135,58 +139,74 @@ async fn handle(socket: WebSocket, state: Arc<ServerState>) {
                     // While destructive actions drain, the listing is in flux
                     // — sweeping thumbs for about-to-vanish files is wasted
                     // work competing with action-done delivery.
-                    if state.actions.pending() > 0 || !q.may_send() {
-                        None
-                    } else {
-                        q.next_id()
+                    if state.actions.pending() == 0 && q.may_send() {
+                        while ids.len() < PUMP_WIDTH {
+                            match q.next_id() {
+                                Some(id) => ids.push(id),
+                                None => break,
+                            }
+                        }
                     }
-                };
-                let Some(id) = id else {
+                }
+                if ids.is_empty() {
                     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                     continue;
-                };
-                // Path + sig under one read so the pushed frame can be
-                // labelled consistently — ids shift on resync.
-                let found = {
-                    let m = state.manifest.read().unwrap();
-                    m.path_of(id)
-                        .map(|p| (p, m.items.get(id as usize).map(|i| i.sig).unwrap_or(0)))
-                };
-                let Some((path, sig)) = found else {
-                    queue.lock().await.mark_pushed(id);
-                    continue;
-                };
-                let previews = state.previews.clone();
-                let produce_path = path.clone();
-                let produced = tokio::task::spawn_blocking(move || {
-                    previews.get_or_produce(&produce_path)
-                })
-                .await
-                .ok()
-                .flatten();
-                let mut q = queue.lock().await;
-                match produced {
-                    Some(p) => {
-                        // Re-verify the id still names the produced file —
-                        // a resync/upsert mid-produce would make this push a
-                        // wrong thumbnail for the client's current item.
-                        let still_current = {
-                            let m = state.manifest.read().unwrap();
-                            m.path_of(id).as_deref() == Some(path.as_path())
-                                && m.items.get(id as usize).map(|i| i.sig) == Some(sig)
-                        };
-                        if !still_current {
-                            continue;
-                        }
-                        let bytes = p.jpeg.len() as u64;
-                        q.commit_send(id, bytes);
-                        drop(q);
-                        let _ = out_tx
-                            .send(Frame::new(EV_THUMB, 0, thumb_payload(id, sig, &p.jpeg)))
-                            .await;
+                }
+                // Path + sig under one read so pushed frames are labelled
+                // consistently — ids shift on resync.
+                let mut jobs = Vec::new();
+                for id in ids {
+                    let found = {
+                        let m = state.manifest.read().unwrap();
+                        m.path_of(id)
+                            .map(|p| (p, m.items.get(id as usize).map(|i| i.sig).unwrap_or(0)))
+                    };
+                    match found {
+                        Some((path, sig)) => jobs.push((id, path, sig)),
+                        None => queue.lock().await.mark_pushed(id),
                     }
-                    None => {
-                        q.mark_pushed(id);
+                }
+                // Start every produce before awaiting any of them.
+                let previews = state.previews.clone();
+                let mut handles = Vec::new();
+                for (id, path, sig) in jobs {
+                    let previews = previews.clone();
+                    let produce_path = path.clone();
+                    handles.push((
+                        id,
+                        path,
+                        sig,
+                        tokio::task::spawn_blocking(move || {
+                            previews.get_or_produce(&produce_path)
+                        }),
+                    ));
+                }
+                for (id, path, sig, handle) in handles {
+                    let produced = handle.await.ok().flatten();
+                    let mut q = queue.lock().await;
+                    match produced {
+                        Some(p) => {
+                            // Re-verify the id still names the produced file —
+                            // a resync/upsert mid-produce would make this push
+                            // a wrong thumbnail for the current item.
+                            let still_current = {
+                                let m = state.manifest.read().unwrap();
+                                m.path_of(id).as_deref() == Some(path.as_path())
+                                    && m.items.get(id as usize).map(|i| i.sig) == Some(sig)
+                            };
+                            if !still_current {
+                                continue;
+                            }
+                            let bytes = p.jpeg.len() as u64;
+                            q.commit_send(id, bytes);
+                            drop(q);
+                            let _ = out_tx
+                                .send(Frame::new(EV_THUMB, 0, thumb_payload(id, sig, &p.jpeg)))
+                                .await;
+                        }
+                        None => {
+                            q.mark_pushed(id);
+                        }
                     }
                 }
             }
