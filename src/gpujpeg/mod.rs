@@ -1,7 +1,9 @@
-//! GPU-accelerated baseline JPEG decode + resize — pure Rust/wgpu.
+//! GPU-accelerated JPEG decode + resize — pure Rust/wgpu.
 //!
 //! The decoder (ported from the former C++/Vulkan implementation)
-//! parallelizes over JPEG restart intervals: the scan is decoded on
+//! parallelizes over JPEG restart intervals; DRI=0 scans (no restart
+//! markers) get virtual intervals from a host survey pass that
+//! snapshots decoder state every 256 MCUs. The scan is decoded on
 //! the GPU once into a full-resolution RGBA buffer kept device-side.
 //! `GpuJpeg::resize_*` then runs the PIL-exact separable resampler and
 //! the RGB/RGBA pack pass on the GPU, so only the small resized image
@@ -170,9 +172,8 @@ impl Drop for GpuJpeg {
 }
 
 /// Open a JPEG into a GPU-resident RGBA buffer. Returns None for
-/// unsupported JPEGs (non-8-bit, arithmetic, >3 components), files
-/// without restart markers (DRI=0 serial streams — zune wins on CPU),
-/// when no suitable GPU adapter exists, or after [`stop`].
+/// unsupported JPEGs (non-8-bit, arithmetic, >3 components), when no
+/// suitable GPU adapter exists, or after [`stop`].
 pub fn open(bytes: &[u8]) -> Option<GpuJpeg> {
     let _active = GpuActive::enter()?;
     let _guard = GPU_LOCK.lock().ok()?;

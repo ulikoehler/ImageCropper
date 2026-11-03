@@ -17,14 +17,15 @@ systemd-run --user --scope --quiet -p MemoryMax=6G --unit ic-build --collect \
 - If the scope gets `oom-kill`ed during `Compiling`, lower jobs further.
 - `dav1d` builds against the system `libdav1d-dev` (installed); the
   `SYSTEM_DEPS_DAV1D_BUILD_INTERNAL=always` fallback is no longer needed.
-- GPU JPEG decode: `native/gpujpegdec.cpp` (vendored from
-  `VulkanExamples/p80_gpujpegdec`, bit-exact vs libjpeg-turbo) compiles
-  in via build.rs when `pkg-config` finds `vulkan` + `shaderc`; a stub
-  keeps the build green without them. Only used for baseline JPEGs
-  with restart markers (DRI>0) — that's where the parallel GPU path
-  beats zune; DRI=0/unsupported fall back automatically.
-  `IC_NO_GPUJPEG=1` disables at runtime. Decodes serialize on one
-  Vulkan device via a process-wide mutex.
+- GPU JPEG decode: `src/gpujpeg/` — pure-Rust wgpu/WGSL port of the
+  former C++/Vulkan decoder, bit-exact vs libjpeg-turbo. Baseline and
+  progressive (SOF2) both decode on GPU; DRI=0 scans get virtual
+  restart intervals from a host survey pass (256-MCU snapshots of bit
+  position/DC preds/EOBRUN, deferred to post-submit for AC-refine
+  scans). EXIF orientation applies in the upsample shader.
+  Unsupported files (non-8-bit, arithmetic, >3 comps) and missing GPU
+  fall back to zune automatically. `IC_NO_GPUJPEG=1` disables at
+  runtime. Decodes serialize on one device via a process-wide mutex.
 - Playwright E2E: `cd e2e && npx playwright test` (chromium already installed
   under `~/.cache/ms-playwright`; the config launches `imagecropper album
   --serve=127.0.0.1:8790 -G -m e2e/.move-target e2e/.fixtures` itself and
