@@ -8,13 +8,14 @@
 //! disk at all.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     num::NonZeroUsize,
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Mutex, RwLock,
+        Arc, Condvar, Mutex, RwLock,
     },
+    thread,
 };
 
 use lru::LruCache;
@@ -80,6 +81,26 @@ pub struct PreviewStore {
     /// Client-first IO priority: live requests mark it, background preload
     /// and destructive work yield to it.
     gate: Arc<IoGate>,
+    /// Deferred fullscreen-preview fill (see [`queue_screen`]).
+    screen: Arc<ScreenFill>,
+}
+
+/// Background queue for fullscreen-preview generation. Producing a 4K
+/// preview costs a full-res decode+resize, so it must never run inline on
+/// the thumbnail hot path — a single tier-3 thread drains it, deduped.
+struct ScreenFill {
+    queue: Mutex<VecDeque<PathBuf>>,
+    pending: Mutex<HashSet<PathBuf>>,
+    cv: Condvar,
+}
+
+impl ScreenFill {
+    fn push(&self, path: PathBuf) {
+        if self.pending.lock().unwrap().insert(path.clone()) {
+            self.queue.lock().unwrap().push_back(path);
+            self.cv.notify_one();
+        }
+    }
 }
 
 impl PreviewStore {
@@ -107,7 +128,12 @@ impl PreviewStore {
         // The LRU is sized for pins + the unpinned budget; `Ram::insert`
         // decides what to evict, so pinned entries never fall out.
         let capacity = ram_cache.max(1) + pin_limit;
-        Self {
+        let screen = Arc::new(ScreenFill {
+            queue: Mutex::new(VecDeque::new()),
+            pending: Mutex::new(HashSet::new()),
+            cv: Condvar::new(),
+        });
+        let store = Self {
             pool: AdaptivePool::new(2, concurrency.max(1), move |path| {
                 // Speculative preload: yield to live client requests instead
                 // of competing with them for IO.
@@ -128,7 +154,38 @@ impl PreviewStore {
             dims,
             stopped: AtomicBool::new(false),
             gate,
+            screen,
+        };
+        // Deferred fullscreen-preview fill: `f`-quality previews generate
+        // lazily at tier-3 priority instead of inline on the thumbnail hot
+        // path. `produce_screen_jpeg` still makes one on demand if the user
+        // reaches a file before the fill does.
+        {
+            let screen = Arc::clone(&store.screen);
+            let gate = Arc::clone(&store.gate);
+            thread::spawn(move || loop {
+                let path = {
+                    let Ok(mut q) = screen.queue.lock() else { return };
+                    loop {
+                        if let Some(p) = q.pop_front() {
+                            break p;
+                        }
+                        let Ok((g, _)) = screen
+                            .cv
+                            .wait_timeout(q, std::time::Duration::from_millis(250))
+                        else {
+                            return;
+                        };
+                        q = g;
+                    }
+                };
+                screen.pending.lock().unwrap().remove(&path);
+                // Tier-3: yield to client requests and the scan hold.
+                gate.yield_to_priority(crate::server::io_gate::SCAN_HOLD_PAUSE);
+                crate::fs_utils::previews::ensure_screen_preview(&path, None, None);
+            });
         }
+        store
     }
 
     /// `stop()` was called — no new production should start.
@@ -252,6 +309,9 @@ impl PreviewStore {
         });
         if let Some(p) = &preview {
             self.ram.lock().unwrap().insert(path.clone(), p.clone());
+            // The fullscreen (`f`) preview generates lazily on the tier-3
+            // fill thread — never inline on the thumbnail hot path.
+            self.screen.push(path.clone());
         }
         preview
     }

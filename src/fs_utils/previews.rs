@@ -189,7 +189,11 @@ fn ensure_screen_preview_gpu(
 /// Ensure a fullscreen-size preview exists in the global cache. `decoded`
 /// may pass an already-decoded source image to avoid a second decode;
 /// `sig` carries the caller's `source_signature` to skip a second stat.
-fn ensure_screen_preview(source: &Path, decoded: Option<&DynamicImage>, sig: Option<(u64, u128)>) {
+pub(crate) fn ensure_screen_preview(
+    source: &Path,
+    decoded: Option<&DynamicImage>,
+    sig: Option<(u64, u128)>,
+) {
     let Some((len, nanos)) = sig.or_else(|| source_signature(source)) else {
         return;
     };
@@ -321,7 +325,6 @@ pub fn produce_preview_image(path: &Path) -> Option<DynamicImage> {
     if let Ok(bytes) = std::fs::read(&expected) {
         let (decoded, engine) = decode_image_bytes_tagged(&expected, &bytes);
         if let Ok(img) = decoded {
-            ensure_screen_preview(path, None, Some((len, nanos)));
             if verbose() {
                 eprintln!("preview cache hit [{engine}]: {}", path.display());
             }
@@ -375,7 +378,6 @@ pub fn produce_preview_bytes(
     let expected = previews_dir_for(path).join(&expected_name);
 
     if let Ok(bytes) = std::fs::read(&expected) {
-        ensure_screen_preview(path, None, Some((len, nanos)));
         let dims = dims_hint
             .or_else(|| image::image_dimensions(path).ok())
             .unwrap_or((0, 0));
