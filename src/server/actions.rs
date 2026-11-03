@@ -2,10 +2,10 @@
 //! resave). Crop/resave run on a serial worker (the `Saver` is not `Sync`);
 //! delete/move fan out on a parallel pool. Results broadcast to all clients.
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -259,29 +259,52 @@ struct DestructiveJob {
 
 /// Bounded worker pool for delete/move actions. A bounded pool keeps a
 /// client from spawning one thread per request while still letting a bulk
-/// delete fan out.
+/// delete fan out. Two internal queues: a queued **move always pops before
+/// queued deletes** — moves are the user's stated higher-priority work and
+/// must jump the line ahead of any backlog of deletions (an already
+/// in-flight delete still finishes; you can't un-rename a file).
+struct JobQueues {
+    moves: VecDeque<DestructiveJob>,
+    deletes: VecDeque<DestructiveJob>,
+}
+
 struct DestructivePool {
-    job_tx: Sender<DestructiveJob>,
+    queues: Arc<(Mutex<JobQueues>, Condvar)>,
     result_rx: Mutex<Receiver<ActionDone>>,
 }
 
 impl DestructivePool {
     fn new(workers: usize, move_dir: Option<PathBuf>, gate: Arc<IoGate>) -> Self {
-        let (job_tx, job_rx) = mpsc::channel::<DestructiveJob>();
-        let job_rx = Arc::new(Mutex::new(job_rx));
+        let queues = Arc::new((
+            Mutex::new(JobQueues {
+                moves: VecDeque::new(),
+                deletes: VecDeque::new(),
+            }),
+            Condvar::new(),
+        ));
         let (result_tx, result_rx) = mpsc::channel::<ActionDone>();
         for _ in 0..workers.max(1) {
-            let job_rx = job_rx.clone();
+            let queues = Arc::clone(&queues);
             let result_tx = result_tx.clone();
             let move_dir = move_dir.clone();
             let gate = Arc::clone(&gate);
             thread::spawn(move || loop {
                 let job = {
-                    let Ok(rx) = job_rx.lock() else { return };
-                    match rx.recv_timeout(Duration::from_millis(250)) {
-                        Ok(job) => job,
-                        Err(mpsc::RecvTimeoutError::Timeout) => continue,
-                        Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                    let (jq, cv) = &*queues;
+                    let Ok(mut q) = jq.lock() else { return };
+                    loop {
+                        if let Some(job) = q.moves.pop_front() {
+                            break job;
+                        }
+                        if let Some(job) = q.deletes.pop_front() {
+                            break job;
+                        }
+                        let Ok((g, _)) =
+                            cv.wait_timeout(q, Duration::from_millis(250))
+                        else {
+                            return;
+                        };
+                        q = g;
                     }
                 };
                 // Priority work first: while the web client is waiting for
@@ -331,13 +354,20 @@ impl DestructivePool {
             });
         }
         Self {
-            job_tx,
+            queues,
             result_rx: Mutex::new(result_rx),
         }
     }
 
     fn dispatch(&self, job: DestructiveJob) -> bool {
-        self.job_tx.send(job).is_ok()
+        let (jq, cv) = &*self.queues;
+        let Ok(mut q) = jq.lock() else { return false };
+        match job.kind {
+            ActionKind::Move => q.moves.push_back(job),
+            _ => q.deletes.push_back(job),
+        }
+        cv.notify_one();
+        true
     }
 
     fn poll(&self) -> Vec<ActionDone> {

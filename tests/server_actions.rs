@@ -244,6 +244,53 @@ fn queued_deletes_all_finish() {
     });
 }
 
+/// Moves take precedence over queued deletes: with a single worker and a
+/// delete already in flight, a move dispatched after another delete must
+/// still complete before that queued delete runs.
+#[test]
+fn moves_jump_ahead_of_queued_deletes() {
+    with_temp_workdir(|root| {
+        let move_dir = root.join("moved");
+        std::fs::create_dir(&move_dir).unwrap();
+        let queue = ActionQueue::new(1, 1, Some(move_dir.clone()));
+
+        let mk = |name: &str| {
+            let img = root.join(name);
+            write_image(&img, &solid_image(8, 8, [7, 7, 7, 255]));
+            (img.clone(), preview_sig_u64(&img).unwrap())
+        };
+        let (d1, d1sig) = mk("d1.png");
+        let (d2, d2sig) = mk("d2.png");
+        let (m1, m1sig) = mk("m1.png");
+
+        queue.dispatch(1, Action::Delete { id: 1, sig: d1sig }, d1.clone());
+        // Let the worker dequeue d1 so d2 and m1 are definitely still
+        // queued behind it.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        queue.dispatch(2, Action::Delete { id: 2, sig: d2sig }, d2.clone());
+        queue.dispatch(3, Action::Move { id: 3, sig: m1sig }, m1.clone());
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let mut order: Vec<u32> = Vec::new();
+        while order.len() < 3 && std::time::Instant::now() < deadline {
+            for done in queue.poll() {
+                assert!(done.ok, "job failed: {:?}", done.error);
+                order.push(done.tag);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert_eq!(order.len(), 3, "all three jobs completed");
+        let pos_move = order.iter().position(|&t| t == 3).unwrap();
+        let pos_d2 = order.iter().position(|&t| t == 2).unwrap();
+        assert!(
+            pos_move < pos_d2,
+            "queued move must complete before queued delete: {order:?}"
+        );
+        assert!(move_dir.join("m1.png").exists(), "move landed");
+        assert_eq!(queue.pending(), 0);
+    });
+}
+
 /// Background deletes yield to live client requests but still finish: the
 /// server must not let a busy client starve the queue.
 #[test]
