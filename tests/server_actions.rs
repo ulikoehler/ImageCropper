@@ -186,13 +186,21 @@ fn action_queue_deletes_bulk_in_parallel() {
         for (path, _) in &jobs {
             assert!(!path.exists(), "{} should be trashed", path.display());
         }
-        let remaining: Vec<_> = std::fs::read_dir(previews_dir_for(&jobs[0].0))
-            .unwrap()
-            .flatten()
-            .collect();
-        assert!(
-            remaining.is_empty(),
-            "batched cleanup must purge every preview"
-        );
+        // The batched purge runs on its own thread — wait for it to drain.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            let remaining: Vec<_> = std::fs::read_dir(previews_dir_for(&jobs[0].0))
+                .unwrap()
+                .flatten()
+                .collect();
+            if remaining.is_empty() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "batched cleanup must purge every preview"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
     });
 }
