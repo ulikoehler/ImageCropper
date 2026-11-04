@@ -455,6 +455,65 @@ test.describe("album grid", () => {
     );
   });
 
+  test("selection survives a renumbering resync and a manifest refresh", async ({
+    page,
+  }) => {
+    await openApp(page);
+    await waitAllCached(page);
+
+    // Select two named tiles (ids are positional; names are the identity
+    // the user cares about).
+    const idx = (name) =>
+      page.evaluate((n) => items.findIndex((it) => it && it.name === n), name);
+    const redIdx = await idx("red.png");
+    const purpleIdx = await idx("purple.png");
+    const rects = await tileRects(page);
+    const rectOf = (i) => rects.find((r) => r.i === i);
+
+    await page.mouse.click(
+      rectOf(redIdx).x + rectOf(redIdx).w / 2,
+      rectOf(redIdx).y + rectOf(redIdx).h / 2,
+    );
+    await page.keyboard.down("Control");
+    await page.mouse.click(
+      rectOf(purpleIdx).x + rectOf(purpleIdx).w / 2,
+      rectOf(purpleIdx).y + rectOf(purpleIdx).h / 2,
+    );
+    await page.keyboard.up("Control");
+    await expect(page.locator("#top")).toContainText("2 selected");
+
+    const selNames = () =>
+      page.evaluate(() => [...selected].map((i) => items[i].name).sort());
+    const focusName = () => page.evaluate(() => items[focus] && items[focus].name);
+    expect(await selNames()).toEqual(["purple.png", "red.png"]);
+    const focusBefore = await focusName();
+
+    // Resync with EVERY id reassigned (reversed order) — same files. The
+    // selection must follow the content, not the numbers.
+    await page.evaluate(() => {
+      const live = items.filter(Boolean).map((it) => ({ ...it }));
+      const n = live.length;
+      const renumbered = live.map((it, i) => ({ ...it, id: n - 1 - i }));
+      applyPatch({
+        resync: true,
+        version: (manifest.version || 0) + 1,
+        dirs_added: manifest.dirs.slice(),
+        upsert: renumbered,
+        remove: [],
+      });
+    });
+    await page.waitForTimeout(200);
+    expect(await selNames()).toEqual(["purple.png", "red.png"]);
+    expect(await focusName()).toBe(focusBefore);
+    await expect(page.locator("#top")).toContainText("2 selected");
+
+    // A full manifest re-pull must preserve it too.
+    await page.evaluate(() => refreshManifest());
+    expect(await selNames()).toEqual(["purple.png", "red.png"]);
+    expect(await focusName()).toBe(focusBefore);
+    await expect(page.locator("#top")).toContainText("2 selected");
+  });
+
   test("scrolling loads the tiles that come into view", async ({ page }) => {
     await openApp(page);
     await waitAllCached(page);

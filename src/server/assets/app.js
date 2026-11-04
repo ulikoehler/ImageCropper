@@ -95,23 +95,54 @@ function restoreThumbs(snap){
   }
 }
 
-// Debounced manifest re-pull for the "client and server disagree" paths
-// (thumb sig mismatch) — a burst of mismatches must cost one refresh.
-let refreshTimer=null;
-function scheduleRefresh(){
-  if(refreshTimer)return;
-  refreshTimer=setTimeout(()=>{refreshTimer=null;refreshManifest().catch(()=>{})},2000);
+// Selection is user intent — it must survive every manifest update,
+// including resyncs that renumber all ids. Track it by content key
+// (dir+name+sig), the same identity that preserves thumbnails.
+const itemKey=i=>{
+  const it=items[i];
+  return (it&&manifest&&manifest.dirs)?`${manifest.dirs[it.dir_index]}|${it.name}|${it.sig}`:null;
+};
+function snapshotSelection(){
+  const s=new Set();
+  for(const i of selected){const k=itemKey(i);if(k)s.add(k)}
+  return s;
+}
+function restoreSelection(snap){
+  selected=new Set();
+  if(!snap||!snap.size)return;
+  for(let i=0;i<items.length;i++){
+    const it=items[i];
+    if(!it||it.removed)continue;
+    if(snap.has(itemKey(i)))selected.add(i);
+  }
+}
+// Focus/anchor follow their content across renumbering; fall back to the
+// nearest live index when the item is gone.
+function restoreIndex(key,fallback){
+  if(key)for(let i=0;i<items.length;i++){
+    const it=items[i];
+    if(it&&!it.removed&&itemKey(i)===key)return i;
+  }
+  const f=Math.min(Math.max(fallback,0),Math.max(items.length-1,0));
+  for(let i=f;i<items.length;i++)if(items[i]&&!items[i].removed)return i;
+  for(let i=f-1;i>=0;i--)if(items[i]&&!items[i].removed)return i;
+  return 0;
 }
 
 async function refreshManifest(){
   const snap=snapshotThumbs();
+  const sel=snapshotSelection(), focKey=itemKey(focus), ancKey=itemKey(anchor),
+        focIdx=focus, ancIdx=anchor;
   const {body}=await bulkRequest(BK_GET_MANIFEST,u32s(1,0));
   manifest=JSON.parse(new TextDecoder().decode(body));
   mouseSelect=manifest.mouse_select||"sequence";
   items=manifest.items;
   thumbs.clear();pending.clear();icStats.thumbClears++;decRetry.clear();
   restoreThumbs(snap);
-  selected=new Set();focus=0;anchor=0;scanning=false;
+  // Selection/focus survive the update: ids may have been renumbered.
+  restoreSelection(sel);
+  focus=restoreIndex(focKey,focIdx);anchor=restoreIndex(ancKey,ancIdx);
+  scanning=false;
   // Completions may have been lost on the way — the re-pulled manifest is
   // now authoritative, so stale pending counters must not linger.
   pendingActions.clear();
@@ -128,21 +159,33 @@ function applyPatch(p){
   if(p.resync){
     icStats.resyncs++;icStats.lastResyncAt=Date.now();
     const snap=snapshotThumbs();
+    const sel=snapshotSelection(), focKey=itemKey(focus), ancKey=itemKey(anchor),
+          focIdx=focus, ancIdx=anchor;
     items=[];manifest.dirs=[];thumbs.clear();pending.clear();
     icStats.thumbClears++;
-    selected=new Set();focus=0;anchor=0;scanning=false;
+    scanning=false;
     screenBmp=null;screenIdx=-1;decRetry.clear();
     manifest.dirs=(p.dirs_added||[]).slice();
     (p.upsert||[]).forEach(it=>{items[it.id]=it});
     (p.remove||[]).forEach(id=>{if(items[id])items[id].removed=true;thumbs.delete(id)});
     manifest.version=p.version;
     restoreThumbs(snap);icStats.restored=thumbs.size;
+    // Every id was reassigned — selection/focus are re-anchored by content
+    // so the user's chosen images stay chosen.
+    restoreSelection(sel);
+    focus=restoreIndex(focKey,focIdx);anchor=restoreIndex(ancKey,ancIdx);
     layoutDirty=true;scheduleDraw();
     return;
   }
   (p.dirs_added||[]).forEach(d=>manifest.dirs.push(d));
   (p.upsert||[]).forEach(it=>{items[it.id]=it});
-  (p.remove||[]).forEach(id=>{if(items[id])items[id].removed=true;thumbs.delete(id)});
+  (p.remove||[]).forEach(id=>{
+    if(items[id])items[id].removed=true;
+    thumbs.delete(id);
+    // A tombstoned item cannot stay selected (ids are stable here, but a
+    // removed image must leave the user's set).
+    selected.delete(id);
+  });
   manifest.version=p.version;
   layoutDirty=true;scheduleDraw();
 }
@@ -315,13 +358,13 @@ function onThumb(id,sig,jpeg,reqId){
   if(it&&it.removed){icStats.thumbDrop++;scheduleDraw();return}
   if(it&&sig!=="0"&&it.sig!==sig){
     // Server and client disagree on this file's signature. The push comes
-    // from the authoritative manifest, so adopt its sig and reconcile with
-    // a debounced refresh. Dropping the push instead leaves the tile
-    // permanently missing: the client re-wants it forever while the server
-    // serves identical bytes.
+    // from the authoritative manifest, so adopt its sig and keep the
+    // thumbnail. Dropping it instead leaves the tile permanently missing:
+    // the client re-wants it forever while the server serves identical
+    // bytes. (No manifest re-pull here — that clears thumbnails/screen
+    // state and would make unrelated updates destructive.)
     icStats.thumbResig=(icStats.thumbResig||0)+1;
     it.sig=sig;
-    scheduleRefresh();
   }
   if(sig!=="0"&&thumbs.has(id)){icStats.thumbDup++;scheduleDraw();return}   // exact duplicate
   decodeThumb(id,jpeg);
