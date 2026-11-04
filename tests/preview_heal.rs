@@ -100,6 +100,67 @@ fn preview_store_regenerate_replaces_corrupt_bytes() {
 }
 
 #[test]
+fn preview_persists_content_hash_sidecar() {
+    let tmp = tempdir().unwrap();
+    let src = tmp.path().join("h.png");
+    write_image(&src, &solid_image(90, 60, [1, 2, 3, 255]));
+    produce_preview_bytes(&src, None).expect("produce");
+
+    let preview = the_preview_file(&src);
+    let sidecar = std::path::PathBuf::from(format!("{}.sha256", preview.display()));
+    let stored = std::fs::read_to_string(&sidecar).expect("hash sidecar must exist");
+    let expected = imagecropper::fs_utils::previews::source_content_hash(&src).unwrap();
+    assert_eq!(stored.trim(), expected, "sidecar must hold the source sha256");
+    assert_eq!(
+        imagecropper::fs_utils::previews::stored_content_hash(&src).as_deref(),
+        Some(expected.as_str())
+    );
+}
+
+#[test]
+fn stale_signature_ignored_when_content_is_unchanged() {
+    let tmp = tempdir().unwrap();
+    let src = tmp.path().join("s.png");
+    write_image(&src, &solid_image(120, 90, [9, 9, 9, 255]));
+    produce_preview_bytes(&src, None).expect("produce");
+    let sig_before = imagecropper::fs_utils::previews::preview_sig_u64(&src).unwrap();
+
+    // Touch the file: mtime (and thus the cheap signature) changes, content
+    // does not. Network mounts do this constantly.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    filetime_touch(&src);
+    let sig_after = imagecropper::fs_utils::previews::preview_sig_u64(&src).unwrap();
+    assert_ne!(sig_before, sig_after, "signature must have changed");
+
+    // The stored content hash proves nothing changed — staleness ignored.
+    imagecropper::server::actions::verify_sig(&src, sig_before)
+        .expect("same bytes must not be reported as stale");
+}
+
+#[test]
+fn stale_signature_enforced_when_content_changed() {
+    let tmp = tempdir().unwrap();
+    let src = tmp.path().join("c.png");
+    write_image(&src, &solid_image(100, 100, [0, 0, 0, 255]));
+    produce_preview_bytes(&src, None).expect("produce");
+    let sig_before = imagecropper::fs_utils::previews::preview_sig_u64(&src).unwrap();
+
+    // Different content, same path.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    write_image(&src, &solid_image(140, 70, [255, 0, 0, 255]));
+
+    let err = imagecropper::server::actions::verify_sig(&src, sig_before)
+        .expect_err("changed content must be rejected");
+    assert!(err.to_string().contains("stale signature"), "got: {err}");
+}
+
+/// Set the file's mtime to now (cheap, no extra deps).
+fn filetime_touch(p: &std::path::Path) {
+    let out = std::process::Command::new("touch").arg(p).status();
+    assert!(out.map(|s| s.success()).unwrap_or(false), "touch failed");
+}
+
+#[test]
 fn concurrent_produce_of_same_path_all_succeed() {
     let tmp = tempdir().unwrap();
     let src = tmp.path().join("c.png");

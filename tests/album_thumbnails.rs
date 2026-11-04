@@ -55,9 +55,13 @@ fn thumbnailer_generates_and_persists_previews() {
         .unwrap()
         .flatten()
         .map(|e| e.file_name().to_string_lossy().into_owned())
+        // Content-hash sidecars are metadata, not previews.
+        .filter(|n| n.ends_with(".jpg"))
         .collect();
     assert_eq!(previews.len(), 1);
     assert!(previews[0].starts_with(&preview_file_prefix("photo.png")));
+    // …and its sha256 metadata exists next to it.
+    assert!(dir.join(format!("{}.sha256", previews[0])).is_file());
     assert_eq!(previews_dir_for(&image_path), dir);
 }
 
@@ -88,6 +92,7 @@ fn changed_source_produces_fresh_preview() {
         .unwrap()
         .flatten()
         .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.ends_with(".jpg"))
         .collect();
     assert_eq!(remaining.len(), 1);
     assert_ne!(remaining[0], stale.file_name().unwrap().to_string_lossy());

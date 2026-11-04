@@ -120,12 +120,22 @@ pub const STALE_SIG_MSG: &str = "stale signature: file changed on disk";
 
 /// Look up an id → (path, sig) and verify the on-disk signature matches what
 /// the client saw. Guards against two clients acting on a changed file.
+///
+/// The signature is (len, mtime), which network mounts report
+/// inconsistently — so a mismatch is only a *suspicion*. The preview's
+/// stored sha256 decides: same bytes = same file, staleness ignored.
 pub fn verify_sig(path: &Path, expected: u64) -> Result<()> {
     let actual = preview_sig_u64(path).ok_or_else(|| anyhow!("file no longer readable"))?;
-    if actual != expected {
-        return Err(anyhow!(STALE_SIG_MSG));
+    if actual == expected {
+        return Ok(());
     }
-    Ok(())
+    // Cheap sig differs — compare content before declaring a change.
+    if let Some(stored) = crate::fs_utils::previews::stored_content_hash(path) {
+        if crate::fs_utils::previews::source_content_hash(path).as_deref() == Some(&stored) {
+            return Ok(());
+        }
+    }
+    Err(anyhow!(STALE_SIG_MSG))
 }
 
 /// Execute one action. `path` is the manifest-resolved source path.

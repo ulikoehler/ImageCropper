@@ -273,6 +273,8 @@ pub fn find_cached_preview(dir: &Path, source: &Path, expected_name: &str) -> Op
         }
         if name == expected_name {
             cached = Some(entry.path());
+        } else if name == format!("{expected_name}.sha256") {
+            // Content-hash metadata of the current preview — keep it.
         } else {
             // Stale preview from an older version of the file.
             let _ = std::fs::remove_file(entry.path());
@@ -373,6 +375,7 @@ pub fn produce_preview_image(path: &Path) -> Option<DynamicImage> {
     // JPEGs go entirely through the GPU session — decode + both resizes
     // run on the GPU and the full-res image never reaches the host.
     let bytes = std::fs::read(path).ok()?;
+    let hash = sha256_hex(&bytes);
     let (thumb, engine) = match crate::gpujpeg::open(&bytes) {
         Some(session) => {
             ensure_screen_preview_gpu(path, &session, Some((len, nanos)));
@@ -385,7 +388,7 @@ pub fn produce_preview_image(path: &Path) -> Option<DynamicImage> {
             (resize_to_fit(image, THUMB_MAX_DIM, THUMB_MAX_DIM), "cpu")
         }
     };
-    persist_preview(path, &expected_name, &thumb);
+    persist_preview(path, &expected_name, &thumb, &hash);
     if verbose() {
         eprintln!("preview generated [{engine}]: {}", path.display());
     }
@@ -414,6 +417,14 @@ pub fn produce_preview_bytes(
 
     if let Ok(bytes) = std::fs::read(&expected) {
         if jpeg_plausible(&bytes) {
+            // The content-hash sidecar must exist — it is what proves "same
+            // bytes" when a signature check looks stale. Legacy caches
+            // predate it; backfill from the source instead of re-encoding.
+            if read_hash_sidecar(&expected).is_none() {
+                if let Some(hash) = source_content_hash(path) {
+                    write_hash_sidecar(&expected, &hash);
+                }
+            }
             let dims = dims_hint
                 .or_else(|| image::image_dimensions(path).ok())
                 .unwrap_or((0, 0));
@@ -432,6 +443,9 @@ pub fn produce_preview_bytes(
     }
 
     let bytes = std::fs::read(path).ok()?;
+    // The source is already in memory — the content hash is nearly free and
+    // becomes the preview's authoritative metadata.
+    let hash = sha256_hex(&bytes);
     if let Some(session) = crate::gpujpeg::open(&bytes) {
         let (w, h) = (session.width, session.height);
         // Submit the (bigger) screen chain first, then the thumb chain:
@@ -441,7 +455,7 @@ pub fn produce_preview_bytes(
         let screen_job = screen_encode_start(path, &session, Some((len, nanos)));
         let (jpeg, _, _) =
             session.encode_resized(THUMB_MAX_DIM, THUMB_MAX_DIM, PREVIEW_JPEG_QUALITY.into())?;
-        persist_preview_bytes(path, &expected_name, &jpeg);
+        persist_preview_bytes(path, &expected_name, &jpeg, &hash);
         screen_encode_finish(screen_job, path);
         if verbose() {
             eprintln!("preview generated [gpu]: {}", path.display());
@@ -461,11 +475,86 @@ pub fn produce_preview_bytes(
             image::codecs::jpeg::JpegEncoder::new_with_quality(writer, PREVIEW_JPEG_QUALITY);
         thumb.to_rgb8().write_with_encoder(encoder).ok()?;
     }
-    persist_preview_bytes(path, &expected_name, &jpeg);
+    persist_preview_bytes(path, &expected_name, &jpeg, &hash);
     if verbose() {
         eprintln!("preview generated [cpu]: {}", path.display());
     }
     Some((jpeg, w, h))
+}
+
+/// sha256 of a source file's bytes — the authoritative "did this file
+/// change?" answer. Signatures (len+mtime) are cheap but unstable on
+/// network mounts; content is not.
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(bytes);
+    format!("{:x}", h.finalize())
+}
+
+/// sha256 of the file's current content (full read — call only when a
+/// cheap signature check could not decide).
+pub fn source_content_hash(path: &Path) -> Option<String> {
+    std::fs::read(path).ok().map(|b| sha256_hex(&b))
+}
+
+/// Metadata sidecar next to a persisted preview: the sha256 of the source
+/// bytes the preview was produced from.
+fn preview_hash_path(preview: &Path) -> PathBuf {
+    let mut s = preview.as_os_str().to_owned();
+    s.push(".sha256");
+    PathBuf::from(s)
+}
+
+fn write_hash_sidecar(preview: &Path, hash: &str) {
+    let target = preview_hash_path(preview);
+    let tmp = preview
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(format!(
+            ".tmp-{}-{}",
+            std::process::id(),
+            PERSIST_TMP_CTR.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+    if std::fs::write(&tmp, hash.as_bytes()).is_ok() && std::fs::rename(&tmp, &target).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
+fn read_hash_sidecar(preview: &Path) -> Option<String> {
+    std::fs::read_to_string(preview_hash_path(preview))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// The recorded content hash of `source` from any of its persisted
+/// previews (signature variants come and go; the newest one wins).
+pub fn stored_content_hash(source: &Path) -> Option<String> {
+    let name = source.file_name()?.to_string_lossy().into_owned();
+    let prefix = preview_file_prefix(&name);
+    let mut best: Option<(std::time::SystemTime, String)> = None;
+    for entry in std::fs::read_dir(previews_dir_for(source)).ok()?.flatten() {
+        let fname = entry.file_name().to_string_lossy().into_owned();
+        if !fname.starts_with(&prefix) || !fname.ends_with(".sha256") {
+            continue;
+        }
+        let Ok(hash) = std::fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        let hash = hash.trim().to_string();
+        if hash.is_empty() {
+            continue;
+        }
+        let mtime = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::UNIX_EPOCH);
+        if best.as_ref().map(|(t, _)| mtime > *t).unwrap_or(true) {
+            best = Some((mtime, hash));
+        }
+    }
+    best.map(|(_, h)| h)
 }
 
 /// Cheap structural check on cached preview bytes: SOI + EOI markers and a
@@ -490,7 +579,8 @@ pub fn invalidate_preview_bytes(path: &Path) {
         return;
     };
     let expected = previews_dir_for(path).join(preview_file_name(&name, len, nanos));
-    let _ = std::fs::remove_file(expected);
+    let _ = std::fs::remove_file(&expected);
+    let _ = std::fs::remove_file(preview_hash_path(&expected));
 }
 
 /// Prune stale signature variants of `source` in `dir`, keeping
@@ -501,7 +591,7 @@ fn prune_stale_previews(dir: &Path, source: &Path, expected_name: &str) {
     let _ = find_cached_preview(dir, source, expected_name);
 }
 
-fn persist_preview(source: &Path, expected_name: &str, thumb: &DynamicImage) {
+fn persist_preview(source: &Path, expected_name: &str, thumb: &DynamicImage, hash: &str) {
     let mut jpeg = Vec::new();
     let ok = {
         let writer = std::io::BufWriter::new(std::io::Cursor::new(&mut jpeg));
@@ -510,7 +600,7 @@ fn persist_preview(source: &Path, expected_name: &str, thumb: &DynamicImage) {
         thumb.to_rgb8().write_with_encoder(encoder).is_ok()
     };
     if ok {
-        persist_preview_bytes(source, expected_name, &jpeg);
+        persist_preview_bytes(source, expected_name, &jpeg, hash);
     }
 }
 
@@ -520,11 +610,12 @@ fn persist_preview(source: &Path, expected_name: &str, thumb: &DynamicImage) {
 /// rename could publish a Frankenstein mix of two encodes.
 static PERSIST_TMP_CTR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-fn persist_preview_bytes(source: &Path, expected_name: &str, jpeg: &[u8]) {
+fn persist_preview_bytes(source: &Path, expected_name: &str, jpeg: &[u8], hash: &str) {
     use std::io::Write;
     let parent = source.parent().unwrap_or_else(|| Path::new("."));
     if let Ok(preview_dir) = prepare_dir(parent, PREVIEWS_DIR) {
         prune_stale_previews(&preview_dir, source, expected_name);
+        write_hash_sidecar(&preview_dir.join(expected_name), hash);
         // tmp + rename: a crash mid-write must never leave a truncated file
         // that looks like a finished preview — readers and later runs would
         // serve corrupt bytes forever. `.tmp-` prefix hides the scratch

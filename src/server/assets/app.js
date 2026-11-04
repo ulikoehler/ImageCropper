@@ -318,7 +318,15 @@ function decodeThumb(id,jpeg){
 const decRetry=new Map();   // id -> {n, next:ms}
 function onDecoded(id,bmp,err){
   decJobs.delete(id);
-  if(bmp){icStats.thumbOk++;thumbs.set(id,bmp);decRetry.delete(id)}
+  if(bmp){
+    icStats.thumbOk++;thumbs.set(id,bmp);decRetry.delete(id);
+    // With no manifest dims, the bitmap's aspect is the fallback — and the
+    // layout was computed before this thumb existed. Without a re-layout
+    // the tile keeps its square placeholder geometry and the image is
+    // drawn stretched into it.
+    const it=items[id];
+    if(it&&!(it.w>0&&it.h>0))layoutDirty=true;
+  }
   else{
     icStats.decFail++;icStats.decErr=String(err||"");
     pending.delete(id);
