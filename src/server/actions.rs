@@ -114,12 +114,16 @@ pub struct ActionDone {
     pub bytes: Option<u64>,
 }
 
+/// Error text for a signature mismatch — the server refreshes the manifest
+/// entry on this failure so a retry sees the current sig.
+pub const STALE_SIG_MSG: &str = "stale signature: file changed on disk";
+
 /// Look up an id → (path, sig) and verify the on-disk signature matches what
 /// the client saw. Guards against two clients acting on a changed file.
 pub fn verify_sig(path: &Path, expected: u64) -> Result<()> {
     let actual = preview_sig_u64(path).ok_or_else(|| anyhow!("file no longer readable"))?;
     if actual != expected {
-        return Err(anyhow!("stale signature: file changed on disk"));
+        return Err(anyhow!(STALE_SIG_MSG));
     }
     Ok(())
 }

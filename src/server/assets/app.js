@@ -355,12 +355,34 @@ function onData(f){
     if(ev.ev==="action-done"){
       const act=pendingActions.get(ev.tag);
       if(act!=null){
+        // A stale signature means the manifest entry predated a disk
+        // change. The server re-syncs the entry and broadcasts the
+        // refreshed item BEFORE this ack, so retry once with the new sig.
+        if(!ev.ok&&/stale signature/.test(ev.error||"")&&!act.retried){
+          const it=items[act.ids[0]];
+          if(it&&!it.removed&&dataWs&&dataWs.readyState===1){
+            act.retried=true;act.queued=false;act.at=Date.now();
+            it.removed=true;thumbs.delete(it.id);
+            dataWs.send(frame(CL_ACTION,0,str(JSON.stringify({
+              tag:ev.tag,kind:act.kind,id:it.id,sig:it.sig}))));
+            scheduleDraw();
+            return;
+          }
+        }
         pendingActions.delete(ev.tag);
         // Tombstones and restores arrive as manifest patches (ordered
         // ahead of the ack) — the ack only runs the pending counter and
         // surfaces failures.
         if(!ev.ok)statusEl.textContent=`${act.kind} failed: ${ev.error||"?"}`;
         scheduleDraw();
+      }
+    }
+    if(ev.ev==="thumb-ready"){
+      // The produced preview knows the source's natural dims — if the
+      // manifest entry has none (sniff failed / stale), fill them in.
+      const it=items[ev.id];
+      if(it&&ev.w>0&&ev.h>0&&!(it.w>0&&it.h>0)){
+        it.w=ev.w;it.h=ev.h;layoutDirty=true;scheduleDraw();
       }
     }
     if(ev.ev==="scan-start"){scanning=true;scheduleDraw();}
@@ -410,7 +432,14 @@ function rowH(row){
   if(row.last)return Math.min(target,W/row.ids.reduce((s,i)=>s+aspect(i),0));
   return target*(W/row.w)/1||0;
 }
-const aspect=i=>{const it=items[i];return (!it||it.removed)?1:(it.h>0?it.w/it.h:1)};
+// Item dims are authoritative; when the manifest has none (0x0 — sniff
+// failed or a stale entry), fall back to the decoded thumbnail's real
+// aspect so tiles never render stretched into a wrong box.
+const aspect=i=>{const it=items[i];
+  if(!it||it.removed)return 1;
+  if(it.h>0&&it.w>0)return it.w/it.h;
+  const b=thumbs.get(i);
+  return b&&b.height>0?b.width/b.height:1};
 
 function tileRects(){
   layout();   // no-op when clean — scrollToIndex may run before a draw
@@ -778,6 +807,17 @@ window.ic=function(){
     pendingActions:[...pendingActions].map(([t,a])=>({tag:t,kind:a.kind,
       queued:a.queued,ids:a.ids,ageMs:now-a.at})),
     layout:{rows:rows.length,scrollY,tileH,zoom},
+    // Manifest entry sanity: 0x0 dims here = aspect falls back to 1 and
+    // tiles render square/stretched; a sig that doesn't match the file on
+    // disk = every action fails "stale signature".
+    sample:(function(){const out=[];
+      for(let i=0;i<items.length&&out.length<6;i++){
+        const it=items[i];if(!it)continue;
+        const b=thumbs.get(i);
+        out.push({id:i,name:it.name,w:it.w,h:it.h,sig:String(it.sig),
+          dir:manifest?manifest.dirs[it.dir_index]:undefined,
+          thumb:b?`${b.width}x${b.height}`:null});}
+      return out})(),
   };
   console.log(s);
   return s;

@@ -566,6 +566,20 @@ impl ServerState {
                         }
                         (false, _) => {}
                     }
+                    // Stale signature: our manifest entry predates a disk
+                    // change (or the mount reports a different mtime than at
+                    // scan time). After the tombstone restore above, re-sync
+                    // the entry — dims + sig — and broadcast the patch BEFORE
+                    // the ack below, so a client retry has the current sig
+                    // instead of failing forever.
+                    if !done.ok
+                        && done
+                            .error
+                            .as_deref()
+                            .is_some_and(|e| e.contains(crate::server::actions::STALE_SIG_MSG))
+                    {
+                        state.upsert_files(vec![(done.src.clone(), None)]);
+                    }
                     if crate::fs_utils::verbose() {
                         eprintln!(
                             "action {:?} id={} ok={} err={:?}",
