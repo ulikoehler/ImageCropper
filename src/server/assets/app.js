@@ -95,6 +95,14 @@ function restoreThumbs(snap){
   }
 }
 
+// Debounced manifest re-pull for the "client and server disagree" paths
+// (thumb sig mismatch) — a burst of mismatches must cost one refresh.
+let refreshTimer=null;
+function scheduleRefresh(){
+  if(refreshTimer)return;
+  refreshTimer=setTimeout(()=>{refreshTimer=null;refreshManifest().catch(()=>{})},2000);
+}
+
 async function refreshManifest(){
   const snap=snapshotThumbs();
   const {body}=await bulkRequest(BK_GET_MANIFEST,u32s(1,0));
@@ -304,7 +312,17 @@ function onThumb(id,sig,jpeg,reqId){
   // A dropped frame must still trigger a redraw: the tile is missing and
   // `pending` was just cleared, so the next draw re-requests it. Without
   // this the page can go idle on a viewport full of blank tiles.
-  if(it&&(it.removed||(sig!=="0"&&it.sig!==sig))){icStats.thumbDrop++;scheduleDraw();return}
+  if(it&&it.removed){icStats.thumbDrop++;scheduleDraw();return}
+  if(it&&sig!=="0"&&it.sig!==sig){
+    // Server and client disagree on this file's signature. The push comes
+    // from the authoritative manifest, so adopt its sig and reconcile with
+    // a debounced refresh. Dropping the push instead leaves the tile
+    // permanently missing: the client re-wants it forever while the server
+    // serves identical bytes.
+    icStats.thumbResig=(icStats.thumbResig||0)+1;
+    it.sig=sig;
+    scheduleRefresh();
+  }
   if(sig!=="0"&&thumbs.has(id)){icStats.thumbDup++;scheduleDraw();return}   // exact duplicate
   decodeThumb(id,jpeg);
 }

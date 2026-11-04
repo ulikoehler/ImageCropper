@@ -23,6 +23,11 @@ const PRODUCE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 /// that is itself undecodable would otherwise trigger a regenerate on every
 /// client backoff round, forever.
 const REGEN_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(30);
+/// A want for an id we served this recently means the client did not keep
+/// the thumbnail — serve fresh bytes instead of the identical ones.
+const REWANT_WINDOW: std::time::Duration = std::time::Duration::from_secs(15);
+/// Cap on forced regenerations per id within the window (bad source guard).
+const REWANT_MAX_REGEN: u32 = 4;
 
 pub async fn handler(
     ws: WebSocketUpgrade,
@@ -301,6 +306,11 @@ async fn handle(socket: WebSocket, state: Arc<ServerState>) {
 
     // Per-path cooldown for CL_BAD_PREVIEW regeneration, per connection.
     let mut regen_recent: HashMap<std::path::PathBuf, std::time::Instant> = HashMap::new();
+    // Per-id re-want tracking: (sig, count, last-seen). An id wanted again
+    // moments after we served it means the client did not retain the thumb
+    // (undecodable payload, dropped push) — regenerate instead of serving
+    // the same bytes yet again.
+    let mut want_retries: HashMap<u32, (u64, u32, std::time::Instant)> = HashMap::new();
 
     // Inbound control loop.
     while let Some(Ok(msg)) = stream.next().await {
@@ -330,6 +340,31 @@ async fn handle(socket: WebSocket, state: Arc<ServerState>) {
                                 None => continue,
                             }
                         };
+                        // Re-want heuristic: 2nd+ want for the same id+sig
+                        // within REWANT_WINDOW forces a regenerate (RAM +
+                        // persisted cache dropped, fresh produce, priority
+                        // push). Bounded by REWANT_MAX_REGEN so a source
+                        // that is itself undecodable cannot storm.
+                        let force = {
+                            let now = std::time::Instant::now();
+                            if want_retries.len() > 8192 {
+                                want_retries.clear();
+                            }
+                            let e = want_retries.entry(id).or_insert((sig, 0, now));
+                            if e.0 == sig && now.duration_since(e.2) < REWANT_WINDOW {
+                                e.1 += 1;
+                            } else {
+                                *e = (sig, 1, now);
+                            }
+                            e.2 = now;
+                            e.1 >= 2 && e.1 <= REWANT_MAX_REGEN
+                        };
+                        if force {
+                            state
+                                .dbg
+                                .rewant_regen
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
                         let previews = state.previews.clone();
                         let out_tx = out_tx.clone();
                         let state = state.clone();
@@ -337,7 +372,11 @@ async fn handle(socket: WebSocket, state: Arc<ServerState>) {
                             let res = tokio::time::timeout(
                                 PRODUCE_TIMEOUT,
                                 tokio::task::spawn_blocking(move || {
-                                    previews.get_or_produce(&path)
+                                    if force {
+                                        previews.regenerate(&path)
+                                    } else {
+                                        previews.get_or_produce(&path)
+                                    }
                                 }),
                             )
                             .await;
