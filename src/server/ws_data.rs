@@ -18,7 +18,12 @@ use super::{proto::*, ActionEnvelope, PushQueue, ServerEvent, ServerState};
 
 /// Bound on how long the pump waits for one thumbnail produce — a wedged
 /// read (network mount) must not stall pushes for every other image.
-const PRODUCE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// Server-side produce deadline. Slow mounts (24 MP JPEGs over virtiofs)
+/// legitimately take tens of seconds; the client renews a want every 45 s,
+/// so 60 s covers a fresh produce plus queue time behind the produce gate.
+/// Timing out only detaches the blocking task — the produce still finishes
+/// and caches the result, so the next request hits RAM.
+const PRODUCE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 /// Per-path cooldown on client-reported corrupt previews: a source file
 /// that is itself undecodable would otherwise trigger a regenerate on every
 /// client backoff round, forever.
@@ -340,12 +345,14 @@ async fn handle(socket: WebSocket, state: Arc<ServerState>) {
                                 None => continue,
                             }
                         };
-                        // Re-want heuristic: 2nd+ want for the same id+sig
-                        // within REWANT_WINDOW forces a regenerate (RAM +
-                        // persisted cache dropped, fresh produce, priority
-                        // push). Bounded by REWANT_MAX_REGEN so a source
-                        // that is itself undecodable cannot storm.
-                        let force = {
+                        // Re-want heuristic: a repeated want within
+                        // REWANT_WINDOW is counted for diagnostics — but a
+                        // re-want means "still waiting", not "bad bytes"
+                        // (decode failures arrive explicitly via
+                        // CL_BAD_PREVIEW, which is what regenerates). The
+                        // dedup in get_or_produce joins the produce already
+                        // running instead of restarting it.
+                        {
                             let now = std::time::Instant::now();
                             if want_retries.len() > 8192 {
                                 want_retries.clear();
@@ -357,13 +364,12 @@ async fn handle(socket: WebSocket, state: Arc<ServerState>) {
                                 *e = (sig, 1, now);
                             }
                             e.2 = now;
-                            e.1 >= 2 && e.1 <= REWANT_MAX_REGEN
-                        };
-                        if force {
-                            state
-                                .dbg
-                                .rewant_regen
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if e.1 >= 2 && e.1 <= REWANT_MAX_REGEN {
+                                state
+                                    .dbg
+                                    .rewant_regen
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
                         }
                         let previews = state.previews.clone();
                         let out_tx = out_tx.clone();
@@ -372,11 +378,7 @@ async fn handle(socket: WebSocket, state: Arc<ServerState>) {
                             let res = tokio::time::timeout(
                                 PRODUCE_TIMEOUT,
                                 tokio::task::spawn_blocking(move || {
-                                    if force {
-                                        previews.regenerate(&path)
-                                    } else {
-                                        previews.get_or_produce(&path)
-                                    }
+                                    previews.get_or_produce(&path)
                                 }),
                             )
                             .await;

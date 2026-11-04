@@ -235,10 +235,12 @@ const thumbReqs=[];
 // is freed when its whole chunk arrived, or after WANT_TIMEOUT — a request
 // the server could not serve (deleted/moved item) must not retire a slot
 // permanently.
-const WANT_WORKERS=6, WANT_CHUNK=8, WANT_TIMEOUT=8000;
+const WANT_WORKERS=6, WANT_CHUNK=8, WANT_TIMEOUT=65000;
 // A requested thumbnail that never arrives is retried: drop it from
-// `pending` so the next draw() re-requests it.
-const PENDING_TIMEOUT=8000;
+// `pending` so the next draw() renews the request. Preview generation on
+// a slow mount legitimately takes tens of seconds — the server answers
+// within 60 s — so renew at 45 s, not sooner.
+const PENDING_TIMEOUT=45000;
 // A dispatched action the server never acknowledges is retried by the user
 // (the socket must be dead). Once the server acks the enqueue the op is in
 // its queue and is finished even across a restart — so a queued delete is

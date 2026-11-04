@@ -99,6 +99,40 @@ impl Drop for InflightGuard<'_> {
     }
 }
 
+/// Concurrency bound on inline produces (`get_or_produce`/`regenerate`).
+/// Each want spawns its own blocking task — without a cap, a slow mount
+/// ends up running dozens of full-res decodes at once, every read
+/// competing with every other until they all hit the produce deadline.
+/// The background pool has its own worker bound; this caps the client-
+/// driven path at the same `-j` budget, and waits queue behind the gate
+/// instead of hammering the mount.
+struct ProduceGate {
+    running: Mutex<usize>,
+    cv: Condvar,
+    max: usize,
+}
+
+struct GatePermit<'a>(&'a ProduceGate);
+
+impl ProduceGate {
+    fn acquire(&self) -> GatePermit<'_> {
+        let mut n = self.running.lock().unwrap();
+        while *n >= self.max {
+            n = self.cv.wait(n).unwrap();
+        }
+        *n += 1;
+        GatePermit(self)
+    }
+}
+
+impl Drop for GatePermit<'_> {
+    fn drop(&mut self) {
+        let mut n = self.0.running.lock().unwrap();
+        *n -= 1;
+        self.0.cv.notify_one();
+    }
+}
+
 pub struct PreviewStore {
     pool: AdaptivePool<Option<Preview>>,
     ram: Mutex<Ram>,
@@ -117,6 +151,8 @@ pub struct PreviewStore {
     gate: Arc<IoGate>,
     /// Deferred fullscreen-preview fill (see [`queue_screen`]).
     screen: Arc<ScreenFill>,
+    /// Bounds concurrent inline produces — see [`ProduceGate`].
+    produce_gate: ProduceGate,
 }
 
 /// Background queue for fullscreen-preview generation. Producing a 4K
@@ -190,6 +226,11 @@ impl PreviewStore {
             stopped: AtomicBool::new(false),
             gate,
             screen,
+            produce_gate: ProduceGate {
+                running: Mutex::new(0),
+                cv: Condvar::new(),
+                max: concurrency.max(1),
+            },
         };
         // Deferred fullscreen-preview fill: `f`-quality previews generate
         // lazily at tier-3 priority instead of inline on the thumbnail hot
@@ -380,6 +421,10 @@ impl PreviewStore {
         // A live client is waiting for this — mark it so background work
         // (preload, deletes, crops) holds off while it runs.
         let _client = self.gate.client_work();
+        // Then the produce gate: at most `-j` concurrent decodes on the
+        // client-driven path. Followers already waiting on this slot's
+        // Inflight just sleep a bit longer — the produce is shared.
+        let _permit = self.produce_gate.acquire();
         let hint = self.dims.read().unwrap().get(path).copied();
         let preview = produce_preview_bytes(path, hint).map(|(jpeg, w, h)| Preview {
             jpeg: Arc::new(jpeg),
