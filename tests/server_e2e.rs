@@ -217,6 +217,11 @@ async fn e2e_ws_auth_rejects_and_accepts_token() {
 
 /// Minimal HTTP/1.1 GET over a raw TcpStream (no reqwest dep).
 async fn reqwest_get(url: &str) -> String {
+    String::from_utf8_lossy(&reqwest_get_bytes(url).await).into_owned()
+}
+
+/// Byte-wise variant for binary endpoints (e.g. `/orig` file downloads).
+async fn reqwest_get_bytes(url: &str) -> Vec<u8> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let url = url.strip_prefix("http://").unwrap();
     let (host, path) = url.split_once('/').unwrap();
@@ -226,7 +231,49 @@ async fn reqwest_get(url: &str) -> String {
     )
     .await
     .unwrap();
-    let mut buf = String::new();
-    s.read_to_string(&mut buf).await.unwrap();
+    let mut buf = Vec::new();
+    s.read_to_end(&mut buf).await.unwrap();
     buf
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_orig_downloads_the_source_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let img = tmp.path().join("a.png");
+    write_image(&img, &solid_image(8, 8, [0, 0, 0, 255]));
+    let expected = std::fs::read(&img).unwrap();
+    let state = ServerState::new(
+        vec![img],
+        vec![tmp.path().to_path_buf()],
+        ServeMode::Album,
+        imagecropper::cli::MouseSelectMode::Sequence,
+        1,
+        Some("s3cret".into()),
+        4096,
+        None,
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = build_router(state);
+    tokio::spawn(async move { axum::serve(listener, router).await });
+
+    // Auth enforced like the WS endpoints.
+    let unauth = reqwest_get_bytes(&format!("http://{addr}/orig?id=0")).await;
+    assert!(unauth.starts_with(b"HTTP/1.1 401"), "{}", String::from_utf8_lossy(&unauth));
+
+    let resp = reqwest_get_bytes(&format!("http://{addr}/orig?id=0&token=s3cret")).await;
+    let split = resp
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .expect("header/body split");
+    let head = String::from_utf8_lossy(&resp[..split]);
+    let body = &resp[split + 4..];
+    assert!(head.contains("200"), "{head}");
+    assert!(head.contains("attachment"), "{head}");
+    assert!(head.contains("a.png"), "{head}");
+    assert_eq!(body, expected.as_slice(), "served bytes == source bytes");
+
+    // Tombstoned / unknown ids 404.
+    let missing = reqwest_get_bytes(&format!("http://{addr}/orig?id=99&token=s3cret")).await;
+    assert!(missing.starts_with(b"HTTP/1.1 404"));
 }

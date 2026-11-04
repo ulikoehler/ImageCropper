@@ -11,6 +11,7 @@ use regex::RegexSet;
 use walkdir::WalkDir;
 
 pub mod adaptive_pool;
+pub mod pack;
 pub mod previews;
 
 static VERBOSE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);

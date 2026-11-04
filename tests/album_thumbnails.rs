@@ -48,20 +48,19 @@ fn thumbnailer_generates_and_persists_previews() {
     assert!(thumb.size[0] <= THUMB_MAX_DIM as usize);
     assert_eq!(thumb.size[0], THUMB_MAX_DIM as usize);
 
-    // A preview file must have been persisted next to the source.
+    // The thumbnail must be persisted in the directory pack — one
+    // `thumbs.pack`, not per-image files.
     let dir = root.join(PREVIEWS_DIR);
     assert!(dir.is_dir());
-    let previews: Vec<_> = std::fs::read_dir(&dir)
-        .unwrap()
-        .flatten()
-        .map(|e| e.file_name().to_string_lossy().into_owned())
-        // Content-hash sidecars are metadata, not previews.
-        .filter(|n| n.ends_with(".jpg"))
-        .collect();
-    assert_eq!(previews.len(), 1);
-    assert!(previews[0].starts_with(&preview_file_prefix("photo.png")));
-    // …and its sha256 metadata exists next to it.
-    assert!(dir.join(format!("{}.sha256", previews[0])).is_file());
+    assert!(dir.join("thumbs.pack").is_file());
+    let persisted = imagecropper::fs_utils::previews::persisted_thumb_for_test(&image_path)
+        .expect("pack must hold the thumbnail");
+    assert_eq!(&persisted[0..2], &[0xFF, 0xD8]);
+    // …and its sha256 metadata is a pack record, queryable by source.
+    assert!(
+        imagecropper::fs_utils::previews::stored_content_hash(&image_path).is_some(),
+        "content hash must be recorded in the pack"
+    );
     assert_eq!(previews_dir_for(&image_path), dir);
 }
 
@@ -86,16 +85,13 @@ fn changed_source_produces_fresh_preview() {
         std::thread::sleep(Duration::from_millis(20));
     }
 
-    // Stale preview must be gone, a fresh one must exist.
+    // The stale flat file is swept on pack open, and the fresh thumbnail
+    // lands in the pack.
     assert!(!stale.exists());
-    let remaining: Vec<_> = std::fs::read_dir(&preview_dir)
-        .unwrap()
-        .flatten()
-        .map(|e| e.file_name().to_string_lossy().into_owned())
-        .filter(|n| n.ends_with(".jpg"))
-        .collect();
-    assert_eq!(remaining.len(), 1);
-    assert_ne!(remaining[0], stale.file_name().unwrap().to_string_lossy());
+    assert!(
+        imagecropper::fs_utils::previews::persisted_thumb_for_test(&image_path).is_some(),
+        "fresh preview must be in the pack"
+    );
 }
 
 #[test]
@@ -103,54 +99,56 @@ fn remove_previews_for_deletes_cached_files() {
     let tmp = tempdir().unwrap();
     let root = tmp.path();
     let source = root.join("gone.png");
-    std::fs::write(&source, b"x").unwrap();
-
-    let preview_dir = root.join(PREVIEWS_DIR);
-    std::fs::create_dir(&preview_dir).unwrap();
-    let p1 = preview_dir.join(preview_file_name("gone.png", 1, 1));
-    let p2 = preview_dir.join(preview_file_name("gone.png", 2, 2));
-    let other = preview_dir.join(preview_file_name("other.png", 1, 1));
-    for p in [&p1, &p2, &other] {
-        std::fs::write(p, b"x").unwrap();
-    }
+    let other = root.join("other.png");
+    write_image(&source, &solid_image(16, 16, [1, 1, 1, 255]));
+    write_image(&other, &solid_image(16, 16, [2, 2, 2, 255]));
+    imagecropper::fs_utils::previews::produce_preview_bytes(&source, None).unwrap();
+    imagecropper::fs_utils::previews::produce_preview_bytes(&other, None).unwrap();
+    assert!(imagecropper::fs_utils::previews::persisted_thumb_for_test(&source).is_some());
+    assert!(imagecropper::fs_utils::previews::persisted_thumb_for_test(&other).is_some());
 
     remove_previews_for(&source);
 
-    assert!(!p1.exists() && !p2.exists());
-    assert!(other.exists(), "unrelated previews must be kept");
+    assert!(
+        imagecropper::fs_utils::previews::persisted_thumb_for_test(&source).is_none(),
+        "tombstoned record must not resolve"
+    );
+    assert!(
+        imagecropper::fs_utils::previews::persisted_thumb_for_test(&other).is_some(),
+        "unrelated previews must be kept"
+    );
 }
 
 #[test]
 fn remove_previews_for_many_purges_only_listed_sources() {
     let tmp = tempdir().unwrap();
     let root = tmp.path();
-    let preview_dir = root.join(PREVIEWS_DIR);
-    std::fs::create_dir(&preview_dir).unwrap();
 
-    // Dotted source names exercise the signature-suffix parser.
+    // Dotted source names exercise the record key handling.
     let sources: Vec<_> = ["a.b.png", "b.png", "c.v2.png"]
         .iter()
-        .map(|name| {
-            let p = root.join(name);
-            std::fs::write(&p, b"x").unwrap();
-            p
-        })
-        .collect();
-    let previews: Vec<_> = sources
-        .iter()
         .enumerate()
-        .map(|(i, p)| {
-            let name = p.file_name().unwrap().to_string_lossy();
-            let preview = preview_dir.join(preview_file_name(&name, i as u64, i as u128));
-            std::fs::write(&preview, b"x").unwrap();
-            preview
+        .map(|(i, name)| {
+            let p = root.join(name);
+            write_image(&p, &solid_image(12, 12, [i as u8, 0, 0, 255]));
+            imagecropper::fs_utils::previews::produce_preview_bytes(&p, None).unwrap();
+            p
         })
         .collect();
 
     remove_previews_for_many([sources[0].as_path(), sources[1].as_path()]);
 
-    assert!(!previews[0].exists() && !previews[1].exists());
-    assert!(previews[2].exists(), "unlisted source keeps its preview");
+    for p in &sources[..2] {
+        assert!(
+            imagecropper::fs_utils::previews::persisted_thumb_for_test(p).is_none(),
+            "{} must be tombstoned",
+            p.display()
+        );
+    }
+    assert!(
+        imagecropper::fs_utils::previews::persisted_thumb_for_test(&sources[2]).is_some(),
+        "unlisted source keeps its preview"
+    );
 }
 
 #[test]

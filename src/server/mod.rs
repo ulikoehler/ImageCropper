@@ -909,7 +909,7 @@ pub fn spawn_scan_feeder(state: &Arc<ServerState>, stream: crate::cli::ScanStrea
 /// Token check at WS upgrade time (`?token=` query param). Returns `true`
 /// when no token is configured or the supplied token matches. Both sockets
 /// enforce it — `/bulk` must never be a backdoor around `/data`'s HELLO.
-fn ws_authed(state: &ServerState, query: &std::collections::HashMap<String, String>) -> bool {
+pub(crate) fn ws_authed(state: &ServerState, query: &std::collections::HashMap<String, String>) -> bool {
     state.token.is_none() || query.get("token").map(String::as_str) == state.token.as_deref()
 }
 
@@ -921,6 +921,7 @@ pub fn build_router(state: Arc<ServerState>) -> Router {
         .route("/favicon.ico", get(http::favicon))
         .route("/healthz", get(http::healthz))
         .route("/debugz", get(http::debugz))
+        .route("/orig", get(http::orig))
         .route("/data", get(ws_data::handler))
         .route("/bulk", get(ws_bulk::handler))
         .with_state(state)

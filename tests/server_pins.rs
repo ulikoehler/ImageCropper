@@ -109,7 +109,6 @@ fn server_pins_the_first_live_items() {
 /// "generate ALL, keep the first 2k in RAM" contract at small scale.
 #[test]
 fn unpinned_previews_produce_without_ram_retention() {
-    use imagecropper::fs_utils::previews::{preview_file_prefix, previews_dir_for};
     use std::time::Duration;
     with_temp_workdir(|root| {
         let mut paths = Vec::new();
@@ -153,16 +152,14 @@ fn unpinned_previews_produce_without_ram_retention() {
         assert!(matches!(got, Some(Some(_))), "pool produce did not finish");
         assert!(store.cached(&paths[3]).is_none());
 
-        // Over-cap work was still persisted: a later want is a disk hit,
+        // Over-cap work was still persisted: a later want is a pack hit,
         // not a re-encode.
         for p in &paths[2..] {
-            let dir = previews_dir_for(p);
-            let prefix = preview_file_prefix(p.file_name().unwrap().to_str().unwrap());
-            let on_disk = std::fs::read_dir(&dir).unwrap().any(|e| {
-                let n = e.unwrap().file_name().into_string().unwrap();
-                n.starts_with(&prefix) && n.ends_with(".jpg")
-            });
-            assert!(on_disk, "no persisted preview for {}", p.display());
+            assert!(
+                imagecropper::fs_utils::previews::persisted_thumb_for_test(p).is_some(),
+                "no persisted preview for {}",
+                p.display()
+            );
         }
     });
 }

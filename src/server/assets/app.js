@@ -829,6 +829,16 @@ addEventListener("keydown",e=>{
     }
     scheduleDraw();e.preventDefault();
   }
+  else if(e.key==="d"||e.key==="D"){
+    // Download the untouched original file of the focused tile.
+    const it=items[focus];
+    if(it&&!it.removed){
+      const a=document.createElement("a");
+      a.href=`/orig?id=${it.id}&token=${encodeURIComponent(token)}`;
+      a.download=it.name;document.body.appendChild(a);a.click();a.remove();
+    }
+    e.preventDefault();
+  }
   else if(e.key===" "){selected.has(focus)?selected.delete(focus):selected.add(focus);scheduleDraw();e.preventDefault()}
   else if(e.key==="a"&&e.ctrlKey){for(let i=0;i<items.length;i++)selected.add(i);scheduleDraw();e.preventDefault()}
 });

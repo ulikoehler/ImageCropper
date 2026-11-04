@@ -1,9 +1,11 @@
 //! Persistent thumbnail cache in `.imagecropper-previews`.
 //!
-//! Preview file names embed the source file's size and modification time, so
-//! a changed source automatically produces a fresh preview name and stale
-//! previews are cleaned up. Shared by the album UI (`Thumbnailer`) and the
-//! web server (`PreviewStore`).
+//! Previews live in an append-only `thumbs.pack` per directory (see
+//! [`crate::fs_utils::pack`]) — one file per folder instead of one JPEG +
+//! sidecar per image. Each record embeds the source file's name, size,
+//! mtime signature, sha256 content hash and the thumbnail dimension it was
+//! produced at, so changed sources automatically miss the cache.
+//! Shared by the album UI (`Thumbnailer`) and the web server (`PreviewStore`).
 
 use std::{
     collections::{HashMap, HashSet},
@@ -18,8 +20,10 @@ use crate::{
     image_utils::{decode_image_bytes, decode_image_bytes_tagged, resize_to_fit},
 };
 
-/// Maximum dimension of generated previews (pixels).
-pub const THUMB_MAX_DIM: u32 = 512;
+/// Maximum dimension of generated previews (pixels). Pack records carry
+/// the dimension they were produced at, so changing this never serves
+/// thumbnails encoded for another size.
+pub const THUMB_MAX_DIM: u32 = 256;
 
 /// Maximum dimension of the fullscreen preview tier (fit inside 1920x1080).
 pub const SCREEN_MAX_DIM: u32 = 1920;
@@ -312,6 +316,16 @@ where
         let _ = std::fs::remove_dir_all(screen_dir_for(source));
     }
     for (dir, names) in groups {
+        // Pack records: one tombstone per source name.
+        if let Some(pack) = crate::fs_utils::pack::pack_for(&dir) {
+            let mut pack = pack.lock().unwrap();
+            for name in &names {
+                pack.remove(name);
+            }
+        }
+        // Legacy flat previews from before the pack format (the pack's
+        // own open-sweep already removes them, but only for dirs that
+        // were opened — sweep here too for certainty).
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
         };
@@ -321,6 +335,9 @@ where
                 let _ = std::fs::remove_file(entry.path());
             }
         }
+        // Nothing left at all → the pack file itself goes too, leaving a
+        // completely clean `.imagecropper-previews` (or empty) dir.
+        crate::fs_utils::pack::remove_pack_if_empty(&dir);
     }
 }
 
@@ -355,20 +372,22 @@ fn preview_belongs_to(preview_name: &str, sources: &HashSet<String>) -> bool {
 pub fn produce_preview_image(path: &Path) -> Option<DynamicImage> {
     let (len, nanos) = source_signature(path)?;
     let source_name = path.file_name()?.to_string_lossy().into_owned();
-    let expected_name = preview_file_name(&source_name, len, nanos);
-    let expected = previews_dir_for(path).join(&expected_name);
+    let dir = previews_dir_for(path);
 
-    // Fast path: the deterministic path exists → read it straight away.
-    if let Ok(bytes) = std::fs::read(&expected) {
-        let (decoded, engine) = decode_image_bytes_tagged(&expected, &bytes);
-        if let Ok(img) = decoded {
-            if verbose() {
-                eprintln!("preview cache hit [{engine}]: {}", path.display());
+    // Fast path: the pack has a current-signature thumbnail for this file.
+    if let Some(pack) = crate::fs_utils::pack::pack_for(&dir) {
+        let mut pack = pack.lock().unwrap();
+        if let Some((jpeg, _)) = pack.lookup(&source_name, len, nanos, THUMB_MAX_DIM as u16) {
+            let (decoded, engine) = decode_image_bytes_tagged(path, &jpeg);
+            if let Ok(img) = decoded {
+                if verbose() {
+                    eprintln!("preview cache hit [{engine}]: {}", path.display());
+                }
+                return Some(img);
             }
-            return Some(img);
+            // Corrupt record — tombstone so it can never wedge us.
+            pack.remove(&source_name);
         }
-        // Corrupt preview — regenerate.
-        let _ = std::fs::remove_file(&expected);
     }
 
     // Slow path: decode the source, downscale, persist. Restart-marker
@@ -388,7 +407,7 @@ pub fn produce_preview_image(path: &Path) -> Option<DynamicImage> {
             (resize_to_fit(image, THUMB_MAX_DIM, THUMB_MAX_DIM), "cpu")
         }
     };
-    persist_preview(path, &expected_name, &thumb, &hash);
+    persist_preview(path, len, nanos, &source_name, &thumb, &hash);
     if verbose() {
         eprintln!("preview generated [{engine}]: {}", path.display());
     }
@@ -412,34 +431,30 @@ pub fn produce_preview_bytes(
     }
     let (len, nanos) = source_signature(path)?;
     let source_name = path.file_name()?.to_string_lossy().into_owned();
-    let expected_name = preview_file_name(&source_name, len, nanos);
-    let expected = previews_dir_for(path).join(&expected_name);
+    let dir = previews_dir_for(path);
 
-    if let Ok(bytes) = std::fs::read(&expected) {
-        if jpeg_plausible(&bytes) {
-            // The content-hash sidecar must exist — it is what proves "same
-            // bytes" when a signature check looks stale. Legacy caches
-            // predate it; backfill from the source instead of re-encoding.
-            if read_hash_sidecar(&expected).is_none() {
-                if let Some(hash) = source_content_hash(path) {
-                    write_hash_sidecar(&expected, &hash);
+    if let Some(pack) = crate::fs_utils::pack::pack_for(&dir) {
+        let mut pack = pack.lock().unwrap();
+        if let Some((jpeg, _hash)) =
+            pack.lookup(&source_name, len, nanos, THUMB_MAX_DIM as u16)
+        {
+            if jpeg_plausible(&jpeg) {
+                let dims = dims_hint
+                    .or_else(|| image::image_dimensions(path).ok())
+                    .unwrap_or((0, 0));
+                if verbose() {
+                    eprintln!("preview cache hit [pack]: {}", path.display());
                 }
+                return Some((jpeg, dims.0, dims.1));
             }
-            let dims = dims_hint
-                .or_else(|| image::image_dimensions(path).ok())
-                .unwrap_or((0, 0));
+            // Corrupt/truncated record (killed mid-write, disk damage) —
+            // serving it would wedge clients into decode-fail loops.
+            // Tombstone it and fall through to regeneration below.
             if verbose() {
-                eprintln!("preview cache hit [disk]: {}", path.display());
+                eprintln!("preview cache corrupt [pack]: {}", path.display());
             }
-            return Some((bytes, dims.0, dims.1));
+            pack.remove(&source_name);
         }
-        // Corrupt/truncated cache file (killed mid-write, disk damage) —
-        // serving it would wedge clients into decode-fail loops. Drop it
-        // and fall through to regeneration below.
-        if verbose() {
-            eprintln!("preview cache corrupt [disk]: {}", path.display());
-        }
-        let _ = std::fs::remove_file(&expected);
     }
 
     let bytes = std::fs::read(path).ok()?;
@@ -450,7 +465,7 @@ pub fn produce_preview_bytes(
         let (w, h) = (session.width, session.height);
         let (jpeg, _, _) =
             session.encode_resized(THUMB_MAX_DIM, THUMB_MAX_DIM, PREVIEW_JPEG_QUALITY.into())?;
-        persist_preview_bytes(path, &expected_name, &jpeg, &hash);
+        persist_preview_bytes(path, len, nanos, &source_name, &jpeg, &hash);
         // The fullscreen preview is generated by the store's deferred
         // screen-fill — never inline on the thumbnail hot path.
         if verbose() {
@@ -470,7 +485,7 @@ pub fn produce_preview_bytes(
             image::codecs::jpeg::JpegEncoder::new_with_quality(writer, PREVIEW_JPEG_QUALITY);
         thumb.to_rgb8().write_with_encoder(encoder).ok()?;
     }
-    persist_preview_bytes(path, &expected_name, &jpeg, &hash);
+    persist_preview_bytes(path, len, nanos, &source_name, &jpeg, &hash);
     if verbose() {
         eprintln!("preview generated [cpu]: {}", path.display());
     }
@@ -535,49 +550,26 @@ pub fn write_stored_hash_for(source: &Path, hash: &str) {
     let Some(name) = source.file_name().map(|n| n.to_string_lossy().into_owned()) else {
         return;
     };
-    let dir = previews_dir_for(source);
-    if std::fs::create_dir_all(&dir).is_ok() {
-        write_hash_sidecar(&dir.join(preview_file_name(&name, len, nanos)), hash);
+    if let Some(pack) = crate::fs_utils::pack::pack_for(&previews_dir_for(source)) {
+        pack.lock().unwrap().put_hash(&name, len, nanos, hash);
     }
-}
-
-/// Metadata sidecar next to a persisted preview: the sha256 of the source
-/// bytes the preview was produced from.
-fn preview_hash_path(preview: &Path) -> PathBuf {
-    let mut s = preview.as_os_str().to_owned();
-    s.push(".sha256");
-    PathBuf::from(s)
-}
-
-fn write_hash_sidecar(preview: &Path, hash: &str) {
-    let target = preview_hash_path(preview);
-    let tmp = preview
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join(format!(
-            ".tmp-{}-{}",
-            std::process::id(),
-            PERSIST_TMP_CTR.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        ));
-    if std::fs::write(&tmp, hash.as_bytes()).is_ok() && std::fs::rename(&tmp, &target).is_err() {
-        let _ = std::fs::remove_file(&tmp);
-    }
-}
-
-fn read_hash_sidecar(preview: &Path) -> Option<String> {
-    std::fs::read_to_string(preview_hash_path(preview))
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
 }
 
 /// The recorded content hash of `source` from any of its persisted
 /// previews (signature variants come and go; the newest one wins).
+/// Falls back to scanning legacy `.sha256` sidecars for caches written
+/// before the pack format existed.
 pub fn stored_content_hash(source: &Path) -> Option<String> {
     let name = source.file_name()?.to_string_lossy().into_owned();
+    let dir = previews_dir_for(source);
+    if let Some(pack) = crate::fs_utils::pack::pack_for(&dir) {
+        if let Some(hash) = pack.lock().unwrap().stored_hash(&name) {
+            return Some(hash);
+        }
+    }
     let prefix = preview_file_prefix(&name);
     let mut best: Option<(std::time::SystemTime, String)> = None;
-    for entry in std::fs::read_dir(previews_dir_for(source)).ok()?.flatten() {
+    for entry in std::fs::read_dir(&dir).ok()?.flatten() {
         let fname = entry.file_name().to_string_lossy().into_owned();
         if !fname.starts_with(&prefix) || !fname.ends_with(".sha256") {
             continue;
@@ -600,6 +592,32 @@ pub fn stored_content_hash(source: &Path) -> Option<String> {
     best.map(|(_, h)| h)
 }
 
+/// Test helper: the persisted thumbnail bytes for `source`'s current
+/// signature, if the directory pack holds them.
+#[doc(hidden)]
+pub fn persisted_thumb_for_test(source: &Path) -> Option<Vec<u8>> {
+    let (len, nanos) = source_signature(source)?;
+    let name = source.file_name()?.to_string_lossy().into_owned();
+    let pack = crate::fs_utils::pack::pack_for(&previews_dir_for(source))?;
+    let out = pack
+        .lock()
+        .unwrap()
+        .lookup(&name, len, nanos, THUMB_MAX_DIM as u16)
+        .map(|(jpeg, _)| jpeg);
+    out
+}
+
+/// Test helper: absolute offset of `source`'s jpeg inside `thumbs.pack` —
+/// tests overwrite bytes there to simulate corruption.
+#[doc(hidden)]
+pub fn persisted_thumb_offset_for_test(source: &Path) -> Option<u64> {
+    let (len, nanos) = source_signature(source)?;
+    let name = source.file_name()?.to_string_lossy().into_owned();
+    let pack = crate::fs_utils::pack::pack_for(&previews_dir_for(source))?;
+    let out = pack.lock().unwrap().jpeg_offset(&name, len, nanos);
+    out
+}
+
 /// Cheap structural check on cached preview bytes: SOI + EOI markers and a
 /// sane minimum length. Anything failing this is corrupt (truncated write,
 /// disk damage) and must be regenerated rather than served.
@@ -611,30 +629,34 @@ fn jpeg_plausible(bytes: &[u8]) -> bool {
         && bytes[bytes.len() - 1] == 0xD9
 }
 
-/// Delete the persisted thumbnail for `path` (the current-signature file
-/// only), forcing the next produce to regenerate. Called when a client
-/// reports the cached preview as undecodable — the file is presumed corrupt.
+/// Delete the persisted thumbnail for `path`, forcing the next produce to
+/// regenerate. Called when a client reports the cached preview as
+/// undecodable — the record is presumed corrupt, so the whole name (all
+/// signature variants plus the recorded hash) is tombstoned.
 pub fn invalidate_preview_bytes(path: &Path) {
-    let Some((len, nanos)) = source_signature(path) else {
-        return;
-    };
     let Some(name) = path.file_name().map(|n| n.to_string_lossy().into_owned()) else {
         return;
     };
-    let expected = previews_dir_for(path).join(preview_file_name(&name, len, nanos));
-    let _ = std::fs::remove_file(&expected);
-    let _ = std::fs::remove_file(preview_hash_path(&expected));
+    let dir = previews_dir_for(path);
+    if let Some(pack) = crate::fs_utils::pack::pack_for(&dir) {
+        pack.lock().unwrap().remove(&name);
+    }
+    // Legacy flat file from before the pack format.
+    if let Some((len, nanos)) = source_signature(path) {
+        let expected = dir.join(preview_file_name(&name, len, nanos));
+        let _ = std::fs::remove_file(&expected);
+        let _ = std::fs::remove_file(format!("{}.sha256", expected.display()));
+    }
 }
 
-/// Prune stale signature variants of `source` in `dir`, keeping
-/// `expected_name`. Runs on the write path only — cache hits never scan.
-fn prune_stale_previews(dir: &Path, source: &Path, expected_name: &str) {
-    // find_cached_preview deletes every prefix-matching file that isn't
-    // expected_name as it scans — exactly the pruning we need here.
-    let _ = find_cached_preview(dir, source, expected_name);
-}
-
-fn persist_preview(source: &Path, expected_name: &str, thumb: &DynamicImage, hash: &str) {
+fn persist_preview(
+    source: &Path,
+    len: u64,
+    nanos: u128,
+    source_name: &str,
+    thumb: &DynamicImage,
+    hash: &str,
+) {
     let mut jpeg = Vec::new();
     let ok = {
         let writer = std::io::BufWriter::new(std::io::Cursor::new(&mut jpeg));
@@ -643,44 +665,28 @@ fn persist_preview(source: &Path, expected_name: &str, thumb: &DynamicImage, has
         thumb.to_rgb8().write_with_encoder(encoder).is_ok()
     };
     if ok {
-        persist_preview_bytes(source, expected_name, &jpeg, hash);
+        persist_preview_bytes(source, len, nanos, source_name, &jpeg, hash);
     }
 }
 
-/// Counter making each persist's scratch path unique within the process —
-/// concurrent producers of the same preview (want + sweep + pin-fill all
-/// racing a miss) must never interleave into one shared tmp file, or the
-/// rename could publish a Frankenstein mix of two encodes.
-static PERSIST_TMP_CTR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-fn persist_preview_bytes(source: &Path, expected_name: &str, jpeg: &[u8], hash: &str) {
-    use std::io::Write;
+/// Append the thumbnail record to the directory's pack. A torn append can
+/// only corrupt the tail, which replay truncates — no tmp/rename dance
+/// needed per record, and concurrent producers serialize on the pack lock.
+fn persist_preview_bytes(
+    source: &Path,
+    len: u64,
+    nanos: u128,
+    source_name: &str,
+    jpeg: &[u8],
+    hash: &str,
+) {
     let parent = source.parent().unwrap_or_else(|| Path::new("."));
-    if let Ok(preview_dir) = prepare_dir(parent, PREVIEWS_DIR) {
-        prune_stale_previews(&preview_dir, source, expected_name);
-        write_hash_sidecar(&preview_dir.join(expected_name), hash);
-        // tmp + rename: a crash mid-write must never leave a truncated file
-        // that looks like a finished preview — readers and later runs would
-        // serve corrupt bytes forever. `.tmp-` prefix hides the scratch
-        // file from the source-prefix prune and marks it for cleanup.
-        let target = preview_dir.join(expected_name);
-        let tmp = preview_dir.join(format!(
-            ".tmp-{}-{}",
-            std::process::id(),
-            PERSIST_TMP_CTR.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        ));
-        let ok = std::fs::File::create(&tmp)
-            .and_then(|mut f| {
-                f.write_all(jpeg)?;
-                // fsync: surfaces close-time writeback failures (9p,
-                // virtiofs) that a plain write() would swallow — better
-                // no preview than a silently truncated one.
-                f.sync_all()
-            })
-            .and_then(|_| std::fs::rename(&tmp, &target))
-            .is_ok();
-        if !ok {
-            let _ = std::fs::remove_file(&tmp);
-        }
+    let Ok(preview_dir) = prepare_dir(parent, PREVIEWS_DIR) else {
+        return;
+    };
+    if let Some(pack) = crate::fs_utils::pack::pack_for(&preview_dir) {
+        pack.lock()
+            .unwrap()
+            .put(source_name, len, nanos, hash, THUMB_MAX_DIM as u16, jpeg);
     }
 }

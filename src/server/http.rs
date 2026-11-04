@@ -1,13 +1,13 @@
 //! Embedded client assets — HTTP only ever serves these.
 
 use axum::{
-    extract::State,
+    extract::{Query, State},
     http::{header, StatusCode},
     response::IntoResponse,
 };
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
-use super::ServerState;
+use super::{ws_authed, ServerState};
 
 const INDEX_HTML: &str = include_str!("assets/index.html");
 const APP_JS: &str = include_str!("assets/app.js");
@@ -97,4 +97,50 @@ pub async fn debugz(State(state): State<Arc<ServerState>>) -> impl IntoResponse 
 /// No favicon shipped — answer 204 instead of a 404 in the console.
 pub async fn favicon() -> impl IntoResponse {
     StatusCode::NO_CONTENT
+}
+
+/// `GET /orig?id=N&token=…` — download the untouched source file for a
+/// manifest item. Tombstoned/unknown ids 404; token enforcement matches
+/// the websocket endpoints.
+pub async fn orig(
+    State(state): State<Arc<ServerState>>,
+    Query(q): Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+    if !ws_authed(&state, &q) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    let Some(id) = q.get("id").and_then(|v| v.parse::<u32>().ok()) else {
+        return Err(StatusCode::BAD_REQUEST);
+    };
+    let (path, name) = {
+        let m = state.manifest.read().unwrap();
+        match m.items.get(id as usize) {
+            Some(it) if !it.removed => match m.path_of(id) {
+                Some(p) => (p, it.name.clone()),
+                None => return Err(StatusCode::NOT_FOUND),
+            },
+            _ => return Err(StatusCode::NOT_FOUND),
+        }
+    };
+    let bytes = tokio::fs::read(&path)
+        .await
+        .map_err(|_| StatusCode::NOT_FOUND)?;
+    // RFC 5987 filename* keeps non-ASCII names intact.
+    let enc: String = name
+        .bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'.' | b'-' | b'_' => (b as char).to_string(),
+            _ => format!("%{b:02X}"),
+        })
+        .collect();
+    Ok((
+        [
+            (header::CONTENT_TYPE, "application/octet-stream".to_string()),
+            (
+                header::CONTENT_DISPOSITION,
+                format!("attachment; filename*=UTF-8''{enc}"),
+            ),
+        ],
+        bytes,
+    ))
 }
