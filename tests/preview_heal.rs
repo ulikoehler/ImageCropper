@@ -138,6 +138,31 @@ fn stale_signature_ignored_when_content_is_unchanged() {
 }
 
 #[test]
+fn missing_hash_sidecar_records_one_and_allows_the_action() {
+    let tmp = tempdir().unwrap();
+    let src = tmp.path().join("m.png");
+    write_image(&src, &solid_image(80, 60, [4, 5, 6, 255]));
+    // No preview has ever been produced → no recorded hash.
+    assert!(imagecropper::fs_utils::previews::stored_content_hash(&src).is_none());
+
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    filetime_touch(&src);
+    let sig_now = imagecropper::fs_utils::previews::preview_sig_u64(&src).unwrap();
+    // A stale sig with no hash to compare against must not block the action
+    // (the tile would otherwise vanish then reappear when the op is refused).
+    imagecropper::server::actions::verify_sig(&src, sig_now.wrapping_sub(1))
+        .expect("no recorded hash → action allowed");
+
+    // …and the decision is now exact: the hash was recorded.
+    let recorded = imagecropper::fs_utils::previews::stored_content_hash(&src);
+    assert!(recorded.is_some(), "verification must record the hash");
+    assert_eq!(
+        recorded,
+        imagecropper::fs_utils::previews::source_content_hash(&src)
+    );
+}
+
+#[test]
 fn stale_signature_enforced_when_content_changed() {
     let tmp = tempdir().unwrap();
     let src = tmp.path().join("c.png");

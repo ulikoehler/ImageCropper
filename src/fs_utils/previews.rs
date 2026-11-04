@@ -530,6 +530,22 @@ pub fn source_content_hash_cached(path: &Path) -> Option<String> {
     Some(hash)
 }
 
+/// Record `hash` as the content hash for `source`'s current signature.
+/// Used when a verification found no recorded hash to compare against, so
+/// the next check is exact instead of guessing.
+pub fn write_stored_hash_for(source: &Path, hash: &str) {
+    let Some((len, nanos)) = source_signature(source) else {
+        return;
+    };
+    let Some(name) = source.file_name().map(|n| n.to_string_lossy().into_owned()) else {
+        return;
+    };
+    let dir = previews_dir_for(source);
+    if std::fs::create_dir_all(&dir).is_ok() {
+        write_hash_sidecar(&dir.join(preview_file_name(&name, len, nanos)), hash);
+    }
+}
+
 /// Metadata sidecar next to a persisted preview: the sha256 of the source
 /// bytes the preview was produced from.
 fn preview_hash_path(preview: &Path) -> PathBuf {

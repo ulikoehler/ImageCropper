@@ -37,9 +37,19 @@ fn stale_sig_rejects() {
     with_temp_workdir(|root| {
         let img = root.join("a.png");
         write_image(&img, &solid_image(10, 10, [1, 2, 3, 255]));
-        assert!(verify_sig(&img, 0xDEADBEEF).is_err());
+        // A recorded content hash is what makes a signature decision exact
+        // (producing the preview writes it). Without one the check cannot
+        // tell mtime churn from a real change and records the hash instead
+        // of blocking the action.
+        imagecropper::fs_utils::previews::produce_preview_bytes(&img, None).expect("preview");
+        let old_sig = preview_sig_u64(&img).unwrap();
+
+        // Real content change → rejected, file untouched.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        write_image(&img, &solid_image(20, 12, [9, 9, 9, 255]));
+        assert!(verify_sig(&img, old_sig).is_err());
         let mut saver = Saver::new(1);
-        let r = execute(&Action::Delete { id: 0, sig: 1 }, &img, &mut saver, None);
+        let r = execute(&Action::Delete { id: 0, sig: old_sig }, &img, &mut saver, None);
         assert!(r.is_err());
         assert!(img.exists(), "rejected action must not touch the file");
     });
