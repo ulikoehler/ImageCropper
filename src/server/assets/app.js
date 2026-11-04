@@ -607,6 +607,27 @@ function scheduleDraw(){
   requestAnimationFrame(()=>{drawQueued=false;draw()});
 }
 
+// Rotating arc for a tile whose preview is still being generated. Driven
+// by ensureSpin()'s rAF loop while any want is in flight — without it the
+// spinner would only move when something else triggers a redraw.
+function drawSpinner(cx,cy,r){
+  const ph=performance.now()/1000*Math.PI*2*0.7;   // ~0.7 s per turn
+  ctx.lineCap="round";
+  ctx.strokeStyle="rgba(255,255,255,.14)";ctx.lineWidth=3;
+  ctx.beginPath();ctx.arc(cx,cy,r,0,Math.PI*2);ctx.stroke();
+  ctx.strokeStyle="rgba(255,255,255,.85)";
+  ctx.beginPath();ctx.arc(cx,cy,r,ph,ph+Math.PI*0.9);ctx.stroke();
+  ctx.lineCap="butt";
+}
+// Frames while previews are outstanding. draw() re-arms this as long as
+// pending/wants remain, so it stops by itself when all thumbs arrived.
+let spinRAF=false;
+function ensureSpin(){
+  if(spinRAF)return;
+  spinRAF=true;
+  requestAnimationFrame(()=>{spinRAF=false;draw()});
+}
+
 function draw(){
   const W=canvas.width=innerWidth*devicePixelRatio|0,
         H=canvas.height=innerHeight*devicePixelRatio|0;
@@ -656,7 +677,20 @@ function draw(){
     if(y+t.h<0||y>H)continue;
     const bmp=thumbs.get(t.i);
     if(bmp)ctx.drawImage(bmp,t.x,y,t.w,t.h);
-    else{ctx.fillStyle="#1c1c1c";ctx.fillRect(t.x,y,t.w,t.h);}
+    else{
+      ctx.fillStyle="#1c1c1c";ctx.fillRect(t.x,y,t.w,t.h);
+      // No bitmap yet: a want is in flight → spinner (the server is
+      // generating/serving it); a failed decode shows a static dim mark.
+      if(pending.has(t.i))drawSpinner(t.x+t.w/2,y+t.h/2,Math.min(16,t.w/6,t.h/6));
+      else if(decRetry.has(t.i)){
+        ctx.strokeStyle="rgba(255,90,90,.6)";ctx.lineWidth=2;ctx.lineCap="round";
+        const cx=t.x+t.w/2,cy=y+t.h/2,r=Math.min(10,t.w/6,t.h/6);
+        ctx.beginPath();
+        ctx.moveTo(cx-r,cy-r);ctx.lineTo(cx+r,cy+r);
+        ctx.moveTo(cx+r,cy-r);ctx.lineTo(cx-r,cy+r);
+        ctx.stroke();ctx.lineCap="butt";
+      }
+    }
     if(selected.has(t.i)){ctx.strokeStyle="#4ea1ff";ctx.lineWidth=4;
       ctx.strokeRect(t.x+2,y+2,t.w-4,t.h-4);}
     if(t.i===focus){ctx.strokeStyle="#fff";ctx.lineWidth=2;
@@ -667,6 +701,8 @@ function draw(){
     ctx.fillStyle="rgba(78,161,255,0.22)";ctx.fillRect(r.x,y,r.w,r.h);
     ctx.strokeStyle="#4ea1ff";ctx.lineWidth=2;ctx.strokeRect(r.x,y,r.w,r.h);
   }
+  // Keep animating while the server still owes us previews.
+  if(pending.size||wantQ.length||decJobs.size)ensureSpin();
   // Replace the queue with the current wish-list; release the `pending`
   // marker of anything dropped so a later frame can request it again.
   const wanted=new Set(want.concat(ahead));
