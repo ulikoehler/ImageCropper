@@ -103,3 +103,66 @@ fn server_pins_the_first_live_items() {
         assert!(state.previews.is_pinned(&files[2]));
     });
 }
+
+/// Once every RAM slot is pinned, further previews are still produced and
+/// persisted to disk — they just aren't kept resident. This is the
+/// "generate ALL, keep the first 2k in RAM" contract at small scale.
+#[test]
+fn unpinned_previews_produce_without_ram_retention() {
+    use imagecropper::fs_utils::previews::{preview_file_prefix, previews_dir_for};
+    use std::time::Duration;
+    with_temp_workdir(|root| {
+        let mut paths = Vec::new();
+        for i in 0..4u32 {
+            let p = root.join(format!("b{i}.png"));
+            write_image(&p, &solid_image(16, 16, [0, 0, i as u8, 255]));
+            paths.push(p);
+        }
+        // RAM = the pinned set only (the server runs 0 unpinned + PIN_LIMIT).
+        let store = store(0, 2);
+        store.set_pins(vec![paths[0].clone(), paths[1].clone()]);
+        assert!(store.get_or_produce(&paths[0]).is_some());
+        assert!(store.get_or_produce(&paths[1]).is_some());
+
+        // RAM is now entirely pinned — a third preview still produces and
+        // persists, but is not kept resident.
+        assert!(
+            store.get_or_produce(&paths[2]).is_some(),
+            "produce must not stop at the RAM cap"
+        );
+        assert!(
+            store.cached(&paths[2]).is_none(),
+            "unpinned over-cap entry kept in RAM"
+        );
+
+        // The background pool path behaves the same: the job completes and
+        // the bytes are delivered, they just aren't retained.
+        store.request(paths[3].clone());
+        let mut got = None;
+        for _ in 0..200 {
+            for (p, prev) in store.poll() {
+                if p == paths[3] {
+                    got = Some(prev);
+                }
+            }
+            if got.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(matches!(got, Some(Some(_))), "pool produce did not finish");
+        assert!(store.cached(&paths[3]).is_none());
+
+        // Over-cap work was still persisted: a later want is a disk hit,
+        // not a re-encode.
+        for p in &paths[2..] {
+            let dir = previews_dir_for(p);
+            let prefix = preview_file_prefix(p.file_name().unwrap().to_str().unwrap());
+            let on_disk = std::fs::read_dir(&dir).unwrap().any(|e| {
+                let n = e.unwrap().file_name().into_string().unwrap();
+                n.starts_with(&prefix) && n.ends_with(".jpg")
+            });
+            assert!(on_disk, "no persisted preview for {}", p.display());
+        }
+    });
+}

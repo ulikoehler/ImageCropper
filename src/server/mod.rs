@@ -115,9 +115,13 @@ impl ServerState {
         // One gate for the whole server: preview production marks live
         // client requests on it, deletes/crops/preload yield to them.
         let io_gate = IoGate::new();
+        // RAM retention is exactly the pinned set: the first PIN_LIMIT
+        // (2000) live thumbnails. Unpinned budget is 0 — every found image
+        // is still produced + persisted to disk in the background, but
+        // only the pinned top stays resident.
         let previews = Arc::new(PreviewStore::with_gate(
             parallel,
-            2048,
+            0,
             Arc::clone(&io_gate),
         ));
         for item in &manifest.items {

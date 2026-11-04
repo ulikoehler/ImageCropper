@@ -24,7 +24,10 @@ use crate::fs_utils::{adaptive_pool::AdaptivePool, previews::produce_preview_byt
 use crate::server::io_gate::IoGate;
 
 /// How many of the first live album thumbnails stay pinned in RAM.
-pub const PIN_LIMIT: usize = 4096;
+/// The server's unpinned budget is 0, so this is also the total number
+/// of thumbnails held in RAM — every other image is still produced and
+/// persisted to disk in the background, just not kept resident.
+pub const PIN_LIMIT: usize = 2000;
 
 /// A produced preview: raw JPEG bytes + natural source dimensions.
 #[derive(Debug, Clone)]
@@ -216,7 +219,7 @@ impl PreviewStore {
         let worker_produce_gate = Arc::clone(&produce_gate);
         // The LRU is sized for pins + the unpinned budget; `Ram::insert`
         // decides what to evict, so pinned entries never fall out.
-        let capacity = ram_cache.max(1) + pin_limit;
+        let capacity = (ram_cache + pin_limit).max(1);
         let screen = Arc::new(ScreenFill {
             queue: Mutex::new(VecDeque::new()),
             pending: Mutex::new(HashSet::new()),

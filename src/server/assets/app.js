@@ -50,12 +50,23 @@ function connect(path){ return new Promise((res,rej)=>{
 // correlated by req_id.
 let bulkWs=null;
 const bulkReqs=new Map(); let bulkReqId=0x100;
+const BULK_TIMEOUT=120000, BULK_TRIES=3;
 function bulkRequest(type,payload){
   const reqId=bulkReqId++;
   return new Promise((res,rej)=>{
-    bulkReqs.set(reqId,{parts:[],head:null,res,rej});
-    // A lost response must not hang boot()/refreshManifest forever.
-    setTimeout(()=>{if(bulkReqs.delete(reqId))rej(new Error("bulk timeout"))},30000);
+    // A lost/slow response must not hang boot()/refreshManifest forever —
+    // but under load a reply can legitimately take a while, so the request
+    // is retried before it is allowed to fail.
+    const req={parts:[],head:null,res,rej,tries:0,to:0,
+      arm(){req.to=setTimeout(()=>{
+        if(++req.tries<BULK_TRIES){
+          // Drop any partial reply — a late first response must not mix
+          // chunks with the retried one.
+          req.parts=[];req.head=null;req.arm();
+          bulkWs.send(frame(type,reqId,payload))}
+        else if(bulkReqs.delete(reqId))rej(new Error("bulk timeout"));
+      },BULK_TIMEOUT)}};
+    bulkReqs.set(reqId,req);req.arm();
     bulkWs.send(frame(type,reqId,payload));
   });
 }
@@ -68,6 +79,7 @@ function onBulk(f){
   }
   req.parts.push(f.payload);
   if(f.flags&1){
+    clearTimeout(req.to);
     bulkReqs.delete(f.reqId);
     const all=new Uint8Array(req.parts.reduce((s,p)=>s+p.length,0));let o=0;
     for(const p of req.parts){all.set(p,o);o+=p.length}
@@ -799,11 +811,16 @@ addEventListener("keydown",e=>{
     scheduleDraw();
   }
   else if(e.key==="Home"||e.key==="End"){
-    // Jump to the first/last live image — selection stays untouched.
+    // Jump to the first/last live image — the selection is never reset:
+    // plain Home/End only moves focus (anchor stays put so a later
+    // Shift+Arrow still extends from where the user anchored), and
+    // Shift+Home/End extends the selection from the anchor to the edge.
     const t=items.length?
       (e.key==="Home"?firstLiveAtOrAfter(0):firstLiveAtOrAfter(items.length-1)):-1;
     if(t>=0){
-      focus=t;anchor=t;
+      if(e.shiftKey){const[a,b]=[Math.min(anchor,t),Math.max(anchor,t)];
+        for(let i=a;i<=b;i++)if(items[i]&&!items[i].removed)selected.add(i);}
+      focus=t;
       const r=tileRects().find(t2=>t2.i===t),H=canvas.height,m=8*devicePixelRatio;
       if(r){
         if(r.y<scrollY)scrollY=Math.max(0,r.y-m);          // above → top-align
