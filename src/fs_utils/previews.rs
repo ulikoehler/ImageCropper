@@ -498,6 +498,38 @@ pub fn source_content_hash(path: &Path) -> Option<String> {
     std::fs::read(path).ok().map(|b| sha256_hex(&b))
 }
 
+/// Short-lived content-hash cache. Mtime churn makes every signature check
+/// fall back to hashing; a bulk delete would otherwise read every source
+/// file in full, one after another, on a slow mount.
+static HASH_CACHE: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<PathBuf, (u64, String, std::time::Instant)>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// [`source_content_hash`] with a short TTL, keyed by (path, length): a
+/// length change always invalidates, a pure mtime change (the network-mount
+/// case) reuses the hash for up to 30 s.
+pub fn source_content_hash_cached(path: &Path) -> Option<String> {
+    let len = std::fs::metadata(path).ok()?.len();
+    {
+        let cache = HASH_CACHE.lock().unwrap();
+        if let Some((cached_len, hash, at)) = cache.get(path) {
+            if *cached_len == len && at.elapsed() < std::time::Duration::from_secs(30) {
+                return Some(hash.clone());
+            }
+        }
+    }
+    let hash = source_content_hash(path)?;
+    let mut cache = HASH_CACHE.lock().unwrap();
+    if cache.len() > 4096 {
+        cache.clear();
+    }
+    cache.insert(
+        path.to_path_buf(),
+        (len, hash.clone(), std::time::Instant::now()),
+    );
+    Some(hash)
+}
+
 /// Metadata sidecar next to a persisted preview: the sha256 of the source
 /// bytes the preview was produced from.
 fn preview_hash_path(preview: &Path) -> PathBuf {

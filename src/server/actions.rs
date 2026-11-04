@@ -129,9 +129,11 @@ pub fn verify_sig(path: &Path, expected: u64) -> Result<()> {
     if actual == expected {
         return Ok(());
     }
-    // Cheap sig differs — compare content before declaring a change.
+    // Cheap sig differs — compare content before declaring a change. The
+    // hash is cached briefly: a bulk delete would otherwise read every
+    // source file in full.
     if let Some(stored) = crate::fs_utils::previews::stored_content_hash(path) {
-        if crate::fs_utils::previews::source_content_hash(path).as_deref() == Some(&stored) {
+        if crate::fs_utils::previews::source_content_hash_cached(path).as_deref() == Some(&stored) {
             return Ok(());
         }
     }

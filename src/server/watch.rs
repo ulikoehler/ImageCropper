@@ -12,7 +12,9 @@ use notify::{RecursiveMode, Watcher};
 use super::ServerState;
 use crate::cli::{collect_sorted_files, ScanArgs};
 
-const DEBOUNCE: Duration = Duration::from_millis(250);
+/// Coalesce bursts into one rescan. Bulk deletes fire hundreds of events in
+/// seconds; a short window turns that into a rescan per delete batch.
+const DEBOUNCE: Duration = Duration::from_millis(1000);
 
 /// Spawn a watcher over the scan roots. The whole setup — watcher
 /// construction AND recursive watch registration — runs on the spawned
@@ -63,9 +65,11 @@ pub fn spawn(state: Arc<ServerState>, scan: ScanArgs) {
         while rx.recv().is_ok() {
             while rx.recv_timeout(DEBOUNCE).is_ok() {}
             if let Ok(files) = collect_sorted_files(&scan) {
-                state.rebuild_manifest(files, &scan.paths);
-                // Full resync patch — ids were reassigned wholesale.
-                state.broadcast_resync();
+                // Differential rebuild: surviving files keep their ids, so
+                // clients keep thumbnails/wants/selection. A full resync
+                // here renumbers everything and — during a delete storm —
+                // keeps wiping the thumbnails that just arrived.
+                state.rebuild_manifest_diff(files, &scan.paths);
             }
         }
     });

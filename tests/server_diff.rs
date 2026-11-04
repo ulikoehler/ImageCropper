@@ -24,6 +24,95 @@ fn recv_patch(
 }
 
 #[test]
+fn rescan_keeps_ids_stable_and_never_resyncs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    for name in ["a.png", "b.png", "c.png", "d.png"] {
+        write_image(root.join(name), &solid_image(12, 8, [7, 7, 7, 255]));
+    }
+    let state = ServerState::new(
+        vec![
+            root.join("a.png"),
+            root.join("b.png"),
+            root.join("c.png"),
+            root.join("d.png"),
+        ],
+        vec![root.to_path_buf()],
+        ServeMode::Album,
+        imagecropper::cli::MouseSelectMode::Sequence,
+        2,
+        None,
+        4096,
+        None,
+    );
+    let ids_before: Vec<u32> = ["a.png", "b.png", "c.png", "d.png"]
+        .iter()
+        .map(|n| state.position_of(&root.join(n)).expect("position"))
+        .collect();
+    let mut rx = state.events.subscribe();
+
+    // b.png vanishes from disk; a rescan (fs-watch) reports the rest.
+    std::fs::remove_file(root.join("b.png")).unwrap();
+    state.rebuild_manifest_diff(
+        vec![
+            root.join("a.png"),
+            root.join("c.png"),
+            root.join("d.png"),
+        ],
+        &[root.to_path_buf()],
+    );
+
+    // The surviving files kept their ids — clients keep their thumbnails,
+    // wants and selection. Only the vanished one is tombstoned.
+    for (i, name) in ["a.png", "c.png", "d.png"].iter().enumerate() {
+        let idx = [0usize, 2, 3][i];
+        assert_eq!(
+            state.position_of(&root.join(name)),
+            Some(ids_before[idx]),
+            "{name} must keep its id across a rescan"
+        );
+    }
+    assert_eq!(state.position_of(&root.join("b.png")), None);
+
+    let patch = recv_patch(&mut rx);
+    assert!(!patch.resync, "a rescan must never force a full resync");
+    assert!(patch.remove.contains(&ids_before[1]), "b must be tombstoned");
+}
+
+#[test]
+fn rescan_appends_new_files_without_touching_existing_ids() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write_image(root.join("a.png"), &solid_image(10, 10, [1, 1, 1, 255]));
+    write_image(root.join("b.png"), &solid_image(10, 10, [2, 2, 2, 255]));
+    let state = ServerState::new(
+        vec![root.join("a.png"), root.join("b.png")],
+        vec![root.to_path_buf()],
+        ServeMode::Album,
+        imagecropper::cli::MouseSelectMode::Sequence,
+        2,
+        None,
+        4096,
+        None,
+    );
+    let a_id = state.position_of(&root.join("a.png")).unwrap();
+
+    write_image(root.join("new.png"), &solid_image(10, 10, [3, 3, 3, 255]));
+    state.rebuild_manifest_diff(
+        vec![
+            root.join("a.png"),
+            root.join("b.png"),
+            root.join("new.png"),
+        ],
+        &[root.to_path_buf()],
+    );
+
+    assert_eq!(state.position_of(&root.join("a.png")), Some(a_id));
+    let new_id = state.position_of(&root.join("new.png")).expect("appended");
+    assert!(new_id > a_id, "new files append after existing ids");
+}
+
+#[test]
 fn upsert_and_remove_broadcast_to_all_subscribers() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();

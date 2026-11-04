@@ -15,6 +15,7 @@ pub mod watch;
 mod ws_bulk;
 mod ws_data;
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
@@ -602,6 +603,153 @@ impl ServerState {
                 std::thread::sleep(std::time::Duration::from_millis(20));
             }
         });
+    }
+
+    /// Rebuild from a fresh directory listing **without renumbering**:
+    /// surviving paths keep their ids, vanished paths are tombstoned, new
+    /// paths append. Broadcasts one differential patch.
+    ///
+    /// A rescan must never renumber: every id reassignment forces clients
+    /// to wipe and refetch every thumbnail, drop their want slots and
+    /// selection — during a delete storm that leaves the grid permanently
+    /// blank while resyncs keep clearing what just arrived.
+    pub fn rebuild_manifest_diff(&self, files: Vec<PathBuf>, _roots: &[PathBuf]) {
+        // Pending deletes must not resurface; departed paths must not come
+        // back (the listing may predate the rename).
+        let files: Vec<PathBuf> = files
+            .into_iter()
+            .filter(|p| !self.actions.is_pending(p) && !self.is_gone(p))
+            .collect();
+        // Phase 1 (no lock): sniff metadata for the listing. Reuse stored
+        // dims/sig when the cheap signature is unchanged — a rescan then
+        // stats instead of re-parsing headers on a slow mount.
+        let prior: HashMap<PathBuf, (u32, u32, u64, u64)> = {
+            let m = self.manifest.read().unwrap();
+            (0..m.items.len())
+                .filter_map(|i| {
+                    let it = &m.items[i];
+                    m.path_of(i as u32)
+                        .map(|p| (p, (it.w, it.h, it.bytes, it.sig)))
+                })
+                .collect()
+        };
+        let sniffed: Vec<(PathBuf, u32, u32, u64, u64)> = files
+            .iter()
+            .map(|path| {
+                let sig = crate::fs_utils::previews::preview_sig_u64(path).unwrap_or(0);
+                if let Some(&(w, h, bytes, old_sig)) = prior.get(path) {
+                    if sig == old_sig && sig != 0 {
+                        return (path.clone(), w, h, bytes, sig);
+                    }
+                }
+                let (w, h) = image::image_dimensions(path).unwrap_or((0, 0));
+                let bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+                (path.clone(), w, h, bytes, sig)
+            })
+            .collect();
+        for (p, w, h, _, _) in &sniffed {
+            self.previews.note_dims(p, (*w, *h));
+        }
+
+        let (json, added) = {
+            let mut m = self.manifest.write().unwrap();
+            let mut patch = ManifestPatch {
+                version: m.version + 1,
+                ..Default::default()
+            };
+            let mut present: std::collections::HashSet<PathBuf> =
+                std::collections::HashSet::with_capacity(sniffed.len());
+            let mut added = Vec::new();
+            let mut dir_index: HashMap<PathBuf, u32> = HashMap::new();
+            for (path, w, h, bytes, sig) in sniffed {
+                present.insert(path.clone());
+                if let Some(&id) = m.positions.get(&path) {
+                    // Surviving file: keep the id, refresh metadata.
+                    let item = &mut m.items[id as usize];
+                    if (item.w, item.h, item.bytes, item.sig) != (w, h, bytes, sig) {
+                        item.w = w;
+                        item.h = h;
+                        item.bytes = bytes;
+                        item.sig = sig;
+                        let snapshot = item.clone();
+                        patch.upsert.push(snapshot);
+                    }
+                    continue;
+                }
+                let parent = path
+                    .parent()
+                    .unwrap_or_else(|| Path::new("."))
+                    .to_path_buf();
+                let dir_idx = *dir_index.entry(parent.clone()).or_insert_with(|| {
+                    let parent_str = parent.to_string_lossy();
+                    match m
+                        .dirs
+                        .iter()
+                        .position(|d| d.as_str() == parent_str.as_ref())
+                    {
+                        Some(i) => i as u32,
+                        None => {
+                            m.dirs.push(parent.to_string_lossy().into_owned());
+                            patch.dirs_added.push(parent.to_string_lossy().into_owned());
+                            (m.dirs.len() - 1) as u32
+                        }
+                    }
+                });
+                let id = m.items.len() as u32;
+                let item = ManifestItem {
+                    id,
+                    name: path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default(),
+                    dir_index: dir_idx,
+                    w,
+                    h,
+                    bytes,
+                    sig,
+                    removed: false,
+                };
+                m.positions.insert(path.clone(), id);
+                m.items.push(item.clone());
+                patch.upsert.push(item);
+                added.push(path);
+            }
+            // Live items no longer in the listing are gone from disk —
+            // tombstone them in place (no compaction, no renumbering).
+            let vanished: Vec<(u32, PathBuf)> = m
+                .positions
+                .iter()
+                .filter(|(p, _)| !present.contains(*p))
+                .map(|(p, &id)| (id, p.clone()))
+                .collect();
+            for (id, path) in vanished {
+                m.positions.remove(&path);
+                if let Some(item) = m.items.get_mut(id as usize) {
+                    if !item.removed {
+                        item.removed = true;
+                        patch.remove.push(id);
+                    }
+                }
+            }
+            if patch.upsert.is_empty() && patch.remove.is_empty() {
+                return;
+            }
+            m.version = patch.version;
+            (
+                serde_json::to_string(&serde_json::json!({
+                    "ev": "manifest-patch",
+                    "patch": patch,
+                }))
+                .ok(),
+                added,
+            )
+        };
+
+        self.previews.request_all(added.iter());
+        if let Some(json) = json {
+            let _ = self.events.send(ServerEvent::Json(json));
+        }
+        self.pins_changed();
     }
 
     /// Rebuild the manifest (e.g. after fs changes) and bump the version.
