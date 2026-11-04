@@ -115,13 +115,22 @@ struct ProduceGate {
 struct GatePermit<'a>(&'a ProduceGate);
 
 impl ProduceGate {
-    fn acquire(&self) -> GatePermit<'_> {
+    /// `limit` below `max` leaves headroom for higher-priority producers:
+    /// background sweep/pin produces use a smaller cap so a client want
+    /// always has a lane even under a full prefetch flood.
+    fn acquire(&self, limit: usize) -> GatePermit<'_> {
         let mut n = self.running.lock().unwrap();
-        while *n >= self.max {
+        while *n >= limit {
             n = self.cv.wait(n).unwrap();
         }
         *n += 1;
         GatePermit(self)
+    }
+    fn acquire_client(&self) -> GatePermit<'_> {
+        self.acquire(self.max)
+    }
+    fn acquire_background(&self) -> GatePermit<'_> {
+        self.acquire((self.max / 2).max(1))
     }
 }
 
@@ -151,8 +160,9 @@ pub struct PreviewStore {
     gate: Arc<IoGate>,
     /// Deferred fullscreen-preview fill (see [`queue_screen`]).
     screen: Arc<ScreenFill>,
-    /// Bounds concurrent inline produces — see [`ProduceGate`].
-    produce_gate: ProduceGate,
+    /// Bounds concurrent produces — shared with the background pool,
+    /// which is capped at half the budget (see [`ProduceGate`]).
+    produce_gate: Arc<ProduceGate>,
 }
 
 /// Background queue for fullscreen-preview generation. Producing a 4K
@@ -195,6 +205,15 @@ impl PreviewStore {
         let dims = Arc::new(RwLock::new(HashMap::new()));
         let worker_dims = dims.clone();
         let worker_gate = Arc::clone(&gate);
+        // One gate shared by pool workers and inline wants: total produce
+        // concurrency never exceeds `-j`, and background work is capped at
+        // half of it so client wants always find a lane.
+        let produce_gate = Arc::new(ProduceGate {
+            running: Mutex::new(0),
+            cv: Condvar::new(),
+            max: concurrency.max(1),
+        });
+        let worker_produce_gate = Arc::clone(&produce_gate);
         // The LRU is sized for pins + the unpinned budget; `Ram::insert`
         // decides what to evict, so pinned entries never fall out.
         let capacity = ram_cache.max(1) + pin_limit;
@@ -203,17 +222,24 @@ impl PreviewStore {
             pending: Mutex::new(HashSet::new()),
             cv: Condvar::new(),
         });
+        let worker_screen = Arc::clone(&screen);
         let store = Self {
             pool: AdaptivePool::new(2, concurrency.max(1), move |path| {
                 // Speculative preload: yield to live client requests instead
                 // of competing with them for IO.
                 worker_gate.yield_to_clients();
+                let _permit = worker_produce_gate.acquire_background();
                 let hint = worker_dims.read().unwrap().get(path).copied();
-                produce_preview_bytes(path, hint).map(|(jpeg, w, h)| Preview {
-                    jpeg: Arc::new(jpeg),
-                    w,
-                    h,
-                })
+                let out =
+                    produce_preview_bytes(path, hint).map(|(jpeg, w, h)| Preview {
+                        jpeg: Arc::new(jpeg),
+                        w,
+                        h,
+                    });
+                if out.is_some() {
+                    worker_screen.push(path.to_path_buf());
+                }
+                out
             }),
             ram: Mutex::new(Ram {
                 cache: LruCache::new(NonZeroUsize::new(capacity).unwrap()),
@@ -226,11 +252,7 @@ impl PreviewStore {
             stopped: AtomicBool::new(false),
             gate,
             screen,
-            produce_gate: ProduceGate {
-                running: Mutex::new(0),
-                cv: Condvar::new(),
-                max: concurrency.max(1),
-            },
+            produce_gate,
         };
         // Deferred fullscreen-preview fill: `f`-quality previews generate
         // lazily at tier-3 priority instead of inline on the thumbnail hot
@@ -421,10 +443,11 @@ impl PreviewStore {
         // A live client is waiting for this — mark it so background work
         // (preload, deletes, crops) holds off while it runs.
         let _client = self.gate.client_work();
-        // Then the produce gate: at most `-j` concurrent decodes on the
-        // client-driven path. Followers already waiting on this slot's
-        // Inflight just sleep a bit longer — the produce is shared.
-        let _permit = self.produce_gate.acquire();
+        // Then the produce gate: at most `-j` concurrent decodes in total
+        // (background producers cap themselves at half). Followers already
+        // waiting on this slot's Inflight just sleep a bit longer — the
+        // produce is shared.
+        let _permit = self.produce_gate.acquire_client();
         let hint = self.dims.read().unwrap().get(path).copied();
         let preview = produce_preview_bytes(path, hint).map(|(jpeg, w, h)| Preview {
             jpeg: Arc::new(jpeg),
