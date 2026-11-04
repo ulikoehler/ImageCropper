@@ -12,7 +12,9 @@ use clap::{Args, Parser, Subcommand};
 use rand::seq::SliceRandom;
 
 use crate::fs_utils::{
-    collect_images_with_filter, exif_datetime_key, spawn_image_scan, FilterSyntax, PathFilter,
+    collect_images_limited,
+    exif_datetime_key, spawn_image_scan_limited, FilterSyntax,
+    PathFilter,
     ScanEvent,
 };
 use crate::image_utils::OutputFormat;
@@ -89,6 +91,11 @@ pub struct ScanArgs {
     /// Number of parallel image processing threads
     #[arg(short = 'j', long = "parallel", default_value_t = 16)]
     pub parallel: usize,
+
+    /// Stop scanning after this many images were found (0 = no limit).
+    /// The walk itself stops — the rest of the tree is never traversed.
+    #[arg(short = 'n', long = "max-files", value_name = "N")]
+    pub max_files: Option<usize>,
 
     /// Skip destructive operations and just print what would happen
     #[arg(short = 'd', long, default_value_t = false)]
@@ -256,7 +263,7 @@ pub struct ScanStream {
 pub fn spawn_scan_stream(scan: &ScanArgs) -> Result<ScanStream> {
     let filter = PathFilter::compile(scan.filter_syntax, &scan.whitelist, &scan.blacklist)?;
     Ok(ScanStream {
-        rx: spawn_image_scan(scan.paths.clone(), scan.recursive, filter),
+        rx: spawn_image_scan_limited(scan.paths.clone(), scan.recursive, filter, scan.max_files),
         order: scan.order,
         inverse: scan.inverse,
     })
@@ -266,7 +273,8 @@ pub fn spawn_scan_stream(scan: &ScanArgs) -> Result<ScanStream> {
 /// every subcommand.
 pub fn collect_sorted_files(scan: &ScanArgs) -> Result<Vec<PathBuf>> {
     let file_filter = PathFilter::compile(scan.filter_syntax, &scan.whitelist, &scan.blacklist)?;
-    let mut files = collect_images_with_filter(&scan.paths, scan.recursive, file_filter.as_ref())?;
+    let mut files =
+        collect_images_limited(&scan.paths, scan.recursive, file_filter.as_ref(), scan.max_files)?;
     if files.is_empty() {
         return Err(anyhow!(
             "No supported image files found in the provided paths. Supported formats are: {}",

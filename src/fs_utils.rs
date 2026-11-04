@@ -169,7 +169,26 @@ pub fn walk_images(
     filter: Option<&PathFilter>,
     emit: &mut dyn FnMut(ScanEvent),
 ) {
+    walk_images_limited(paths, recursive, filter, None, emit)
+}
+
+/// [`walk_images`] with an optional cap on discovered files: the walk stops
+/// as soon as `max` images were emitted (0 or `None` = unlimited). Stopping
+/// the walk itself — not just the events — is the point: it keeps a huge or
+/// slow tree from being traversed when only the first N images are wanted.
+pub fn walk_images_limited(
+    paths: &[PathBuf],
+    recursive: bool,
+    filter: Option<&PathFilter>,
+    max: Option<usize>,
+    emit: &mut dyn FnMut(ScanEvent),
+) {
+    let limit = max.filter(|n| *n > 0).unwrap_or(usize::MAX);
+    let mut emitted = 0usize;
     for path in paths {
+        if emitted >= limit {
+            return;
+        }
         if !path.exists() {
             emit(ScanEvent::Error(format!(
                 "{} does not exist",
@@ -185,6 +204,7 @@ pub fn walk_images(
                     path: path.to_path_buf(),
                     bytes,
                 });
+                emitted += 1;
             }
         } else if path.is_dir() {
             if recursive {
@@ -207,6 +227,10 @@ pub fn walk_images(
                             path: entry.path().to_path_buf(),
                             bytes,
                         });
+                        emitted += 1;
+                        if emitted >= limit {
+                            return;
+                        }
                     }
                 }
             } else {
@@ -224,6 +248,10 @@ pub fn walk_images(
                             {
                                 let bytes = p.metadata().map(|m| m.len()).unwrap_or(0);
                                 emit(ScanEvent::Found { path: p, bytes });
+                                emitted += 1;
+                                if emitted >= limit {
+                                    return;
+                                }
                             }
                         }
                     }
@@ -241,9 +269,19 @@ pub fn spawn_image_scan(
     recursive: bool,
     filter: Option<PathFilter>,
 ) -> std::sync::mpsc::Receiver<ScanEvent> {
+    spawn_image_scan_limited(paths, recursive, filter, None)
+}
+
+/// [`spawn_image_scan`] that stops walking once `max` images were found.
+pub fn spawn_image_scan_limited(
+    paths: Vec<PathBuf>,
+    recursive: bool,
+    filter: Option<PathFilter>,
+    max: Option<usize>,
+) -> std::sync::mpsc::Receiver<ScanEvent> {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        walk_images(&paths, recursive, filter.as_ref(), &mut |ev| {
+        walk_images_limited(&paths, recursive, filter.as_ref(), max, &mut |ev| {
             let _ = tx.send(ev);
         });
     });
@@ -259,9 +297,19 @@ pub fn collect_images_with_filter(
     recursive: bool,
     filter: Option<&PathFilter>,
 ) -> Result<Vec<PathBuf>> {
+    collect_images_limited(paths, recursive, filter, None)
+}
+
+/// [`collect_images_with_filter`] capped at `max` discovered files.
+pub fn collect_images_limited(
+    paths: &[PathBuf],
+    recursive: bool,
+    filter: Option<&PathFilter>,
+    max: Option<usize>,
+) -> Result<Vec<PathBuf>> {
     let mut files = Vec::new();
     let mut error = None;
-    walk_images(paths, recursive, filter, &mut |ev| match ev {
+    walk_images_limited(paths, recursive, filter, max, &mut |ev| match ev {
         ScanEvent::Found { path, .. } => files.push(path),
         ScanEvent::Error(e) => {
             if error.is_none() {
