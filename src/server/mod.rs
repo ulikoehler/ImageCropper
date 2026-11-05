@@ -617,13 +617,49 @@ impl ServerState {
     /// to wipe and refetch every thumbnail, drop their want slots and
     /// selection — during a delete storm that leaves the grid permanently
     /// blank while resyncs keep clearing what just arrived.
-    pub fn rebuild_manifest_diff(&self, files: Vec<PathBuf>, _roots: &[PathBuf]) {
+    pub fn rebuild_manifest_diff(&self, files: Vec<PathBuf>, roots: &[PathBuf], reorder: bool) {
         // Pending deletes must not resurface; departed paths must not come
         // back (the listing may predate the rename).
         let files: Vec<PathBuf> = files
             .into_iter()
             .filter(|p| !self.actions.is_pending(p) && !self.is_gone(p))
             .collect();
+        // When `reorder` is set the listing is in the user's `-o` order
+        // (filename/EXIF/size/…). The diff path can only tombstone and
+        // append — if applying it would leave surviving items out of the
+        // requested order (a new file sorting mid-list, or a reorder),
+        // fall back to a full rebuild + resync. Clients keep thumbs and
+        // selection across resyncs via content keys, and order changes are
+        // rare — deletes/shrinks keep the same relative order and still
+        // take the cheap diff path.
+        if reorder {
+            let current: Vec<PathBuf> = {
+                let m = self.manifest.read().unwrap();
+                (0..m.items.len())
+                    .filter_map(|i| m.path_of(i as u32))
+                    .collect()
+            };
+            let file_set: std::collections::HashSet<&PathBuf> = files.iter().collect();
+            let cur_set: std::collections::HashSet<&PathBuf> = current.iter().collect();
+            // The diff path would produce exactly: survivors in current
+            // order, then new files appended in listing order.
+            let mut expected: Vec<PathBuf> = current
+                .iter()
+                .filter(|p| file_set.contains(*p))
+                .cloned()
+                .collect();
+            expected.extend(
+                files
+                    .iter()
+                    .filter(|p| !cur_set.contains(*p))
+                    .cloned(),
+            );
+            if expected != files {
+                self.rebuild_manifest(files, roots);
+                self.broadcast_resync();
+                return;
+            }
+        }
         // Phase 1 (no lock): sniff metadata for the listing. Reuse stored
         // dims/sig when the cheap signature is unchanged — a rescan then
         // stats instead of re-parsing headers on a slow mount.

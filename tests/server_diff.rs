@@ -60,6 +60,7 @@ fn rescan_keeps_ids_stable_and_never_resyncs() {
             root.join("d.png"),
         ],
         &[root.to_path_buf()],
+        true,
     );
 
     // The surviving files kept their ids — clients keep their thumbnails,
@@ -105,6 +106,7 @@ fn rescan_appends_new_files_without_touching_existing_ids() {
             root.join("new.png"),
         ],
         &[root.to_path_buf()],
+        true,
     );
 
     assert_eq!(state.position_of(&root.join("a.png")), Some(a_id));
@@ -364,4 +366,76 @@ fn a_completed_delete_stays_gone_through_stale_rescans() {
         "a re-created file is new content, not the deleted one"
     );
     assert!(state.position_of(&path_a).is_some());
+}
+
+#[test]
+fn rescan_mid_insert_resyncs_into_sorted_order() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    for name in ["a.png", "z.png"] {
+        write_image(root.join(name), &solid_image(10, 10, [1, 1, 1, 255]));
+    }
+    let state = ServerState::new(
+        vec![root.join("a.png"), root.join("z.png")],
+        vec![root.to_path_buf()],
+        ServeMode::Album,
+        imagecropper::cli::MouseSelectMode::Sequence,
+        2,
+        None,
+        4096,
+        None,
+    );
+    let mut rx = state.events.subscribe();
+
+    // A rescan reports a new file that sorts BETWEEN existing items —
+    // appending it at the end would violate the requested order, so the
+    // rebuild falls back to a full resync in sorted order.
+    write_image(root.join("m.png"), &solid_image(10, 10, [2, 2, 2, 255]));
+    state.rebuild_manifest_diff(
+        vec![
+            root.join("a.png"),
+            root.join("m.png"),
+            root.join("z.png"),
+        ],
+        &[root.to_path_buf()],
+        true,
+    );
+
+    let patch = recv_patch(&mut rx);
+    assert!(patch.resync, "a mid-list insert must resync");
+    let m = state.manifest.read().unwrap();
+    let names: Vec<_> = m.items.iter().map(|i| i.name.as_str()).collect();
+    assert_eq!(names, ["a.png", "m.png", "z.png"]);
+}
+
+#[test]
+fn rescan_without_reorder_never_resyncs_on_appends() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write_image(root.join("b.png"), &solid_image(10, 10, [1, 1, 1, 255]));
+    let state = ServerState::new(
+        vec![root.join("b.png")],
+        vec![root.to_path_buf()],
+        ServeMode::Album,
+        imagecropper::cli::MouseSelectMode::Sequence,
+        2,
+        None,
+        4096,
+        None,
+    );
+    let mut rx = state.events.subscribe();
+
+    // reorder=false (randomize mode): even a file that would sort before
+    // existing items just appends — no resync, no id churn.
+    write_image(root.join("a.png"), &solid_image(10, 10, [2, 2, 2, 255]));
+    state.rebuild_manifest_diff(
+        vec![root.join("a.png"), root.join("b.png")],
+        &[root.to_path_buf()],
+        false,
+    );
+    let patch = recv_patch(&mut rx);
+    assert!(!patch.resync);
+    let m = state.manifest.read().unwrap();
+    let names: Vec<_> = m.items.iter().map(|i| i.name.as_str()).collect();
+    assert_eq!(names, ["b.png", "a.png"]);
 }

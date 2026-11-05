@@ -68,8 +68,13 @@ pub fn spawn(state: Arc<ServerState>, scan: ScanArgs) {
                 // Differential rebuild: surviving files keep their ids, so
                 // clients keep thumbnails/wants/selection. A full resync
                 // here renumbers everything and — during a delete storm —
-                // keeps wiping the thumbnails that just arrived.
-                state.rebuild_manifest_diff(files, &scan.paths);
+                // keeps wiping the thumbnails that just arrived. It only
+                // happens when the sorted order itself changed (e.g. a new
+                // file inserting mid-list), never for plain deletes.
+                // Randomize is exempt — a shuffled listing must not force
+                // a reshuffle on every rescan.
+                let reorder = scan.order != crate::cli::SortOrder::Randomize;
+                state.rebuild_manifest_diff(files, &scan.paths, reorder);
             }
         }
     });
