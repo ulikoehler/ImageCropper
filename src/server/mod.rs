@@ -322,6 +322,13 @@ impl ServerState {
             let mut dir_index = std::collections::HashMap::<PathBuf, u32>::new();
             let mut added = Vec::new();
             for (path, w, h, bytes, sig) in sniffed {
+                // Re-check under the manifest lock: the filter above ran
+                // before a (slow-mount) sniff — a delete/move may have
+                // landed in between, and a tombstoned path must never
+                // come back as a fresh append or live upsert.
+                if self.actions.is_pending(&path) || self.is_gone(&path) {
+                    continue;
+                }
                 if let Some(&id) = m.positions.get(&path) {
                     // In-place upsert: keep the id so client tiles stay put.
                     let item = &mut m.items[id as usize];
@@ -604,7 +611,9 @@ impl ServerState {
     /// walk finishes. A resync only goes out when the order actually
     /// differs; `Randomize` is exempt (a shuffle per batch is meaningless).
     pub fn resort_partial(&self, order: crate::cli::SortOrder, inverse: bool) {
-        if order == crate::cli::SortOrder::Randomize {
+        if order == crate::cli::SortOrder::Randomize || self.actions.pending() > 0 {
+            // See rebuild_manifest_diff: a resync during a delete/move
+            // renumbers slots the client tombstoned → tiles "reappear".
             return;
         }
         let current: Vec<PathBuf> = {
@@ -625,6 +634,14 @@ impl ServerState {
     /// (ids are reassigned) and broadcast a `resync` patch so clients
     /// replace their lists in place — no reconnect or manifest re-pull.
     pub fn finish_scan(&self, order: crate::cli::SortOrder, inverse: bool) {
+        // Rebuilding renumbers positional ids; the resync patch keeps
+        // client and server in agreement. While a delete/move is pending
+        // that refill of tombstoned slots looks like tiles "reappearing",
+        // and a client action carrying a pre-rebuild id could hit the
+        // wrong file — defer ordering; the next rescan applies it.
+        if self.actions.pending() > 0 {
+            return;
+        }
         let mut files: Vec<PathBuf> = {
             let m = self.manifest.read().unwrap();
             (0..m.items.len())
@@ -767,7 +784,12 @@ impl ServerState {
         // selection across resyncs via content keys, and order changes are
         // rare — deletes/shrinks keep the same relative order and still
         // take the cheap diff path.
-        if reorder {
+        // Never renumber mid-delete/move: a resync shifts positional ids,
+        // so slots the client already tombstoned get refilled by
+        // different images — the visible "reappearing" tiles. While
+        // destructive work is pending the cheap diff path keeps ids
+        // stable; the next rescan re-establishes order.
+        if reorder && self.actions.pending() == 0 {
             let current: Vec<PathBuf> = {
                 let m = self.manifest.read().unwrap();
                 (0..m.items.len())
@@ -837,6 +859,12 @@ impl ServerState {
             let mut added = Vec::new();
             let mut dir_index: HashMap<PathBuf, u32> = HashMap::new();
             for (path, w, h, bytes, sig) in sniffed {
+                // Re-check under the lock: a delete/move may have landed
+                // between the filter above and this insert (the sniff is
+                // the slow part on remote mounts).
+                if self.actions.is_pending(&path) || self.is_gone(&path) {
+                    continue;
+                }
                 present.insert(path.clone());
                 if let Some(&id) = m.positions.get(&path) {
                     // Surviving file: keep the id, refresh metadata.
@@ -964,6 +992,12 @@ impl ServerState {
             let bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
             (w, h, bytes, sig)
         };
+        // Re-filter right before the swap: a delete/move may have landed
+        // while `files` was being sniffed — the tombstone must win.
+        let files: Vec<PathBuf> = files
+            .into_iter()
+            .filter(|p| !self.actions.is_pending(p) && !self.is_gone(p))
+            .collect();
         let fresh =
             Manifest::build_with(&files, roots, self.mode, self.mouse_select, version, sniff);
         *self.manifest.write().unwrap() = fresh;

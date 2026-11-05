@@ -1,5 +1,5 @@
 //! `files.pack` — binary snapshot of the last scan's file list, stored in
-//! `.imagecropper-thumbnails/` next to each scan root. On the next run the
+//! `.imagecropper-previews/` next to each scan root. On the next run the
 //! entries seed the manifest instantly (no walk, no header sniffing), and
 //! directories whose mtime is unchanged are skipped by the walker entirely
 //! — so a re-scan only stats dir/file mtimes instead of enumerating and
@@ -12,7 +12,6 @@ use std::{
 };
 
 const MAGIC: u32 = 0x4C_46_43_49; // "ICFL"
-const PACK_DIR: &str = ".imagecropper-thumbnails";
 const PACK_FILE: &str = "files.pack";
 
 #[derive(Debug, Clone)]
@@ -31,7 +30,7 @@ pub struct DirRec {
 }
 
 pub fn pack_path(root: &Path) -> PathBuf {
-    root.join(PACK_DIR).join(PACK_FILE)
+    root.join(super::PREVIEWS_DIR).join(PACK_FILE)
 }
 
 fn dir_mtime(p: &Path) -> u128 {
