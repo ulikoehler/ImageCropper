@@ -91,19 +91,23 @@ function onBulk(f){
 // Key them by content (dir+name+sig) so unchanged images survive a
 // resync instead of being refetched.
 function snapshotThumbs(){
-  const m=new Map();
+  const m=new Map(), loose=new Map();
   if(manifest&&manifest.dirs)for(let i=0;i<items.length;i++){
     const it=items[i],b=thumbs.get(i);
-    if(it&&b)m.set(`${manifest.dirs[it.dir_index]}|${it.name}|${it.sig}`,b);
+    if(it&&b){m.set(`${manifest.dirs[it.dir_index]}|${it.name}|${it.sig}`,b);
+      loose.set(`${manifest.dirs[it.dir_index]}|${it.name}`,b);}
   }
-  return m;
+  return {m,loose};
 }
 function restoreThumbs(snap){
   for(let i=0;i<items.length;i++){
     const it=items[i];
     if(!it||it.removed)continue;
-    const b=snap.get(`${manifest.dirs[it.dir_index]}|${it.name}|${it.sig}`);
-    if(b)thumbs.set(i,b);
+    const dk=`${manifest.dirs[it.dir_index]}|${it.name}`;
+    const b=snap.m.get(`${dk}|${it.sig}`)||snap.loose.get(dk);
+    if(b){thumbs.set(i,b);
+      // Loose (sig-changed) hit: keep the pixels, refresh the bytes.
+      if(!snap.m.has(`${dk}|${it.sig}`))pending.set(i,Date.now());}
   }
 }
 
@@ -125,7 +129,8 @@ function restoreSelection(snap){
   for(let i=0;i<items.length;i++){
     const it=items[i];
     if(!it||it.removed)continue;
-    if(snap.has(itemKey(i)))selected.add(i);
+    const it2=items[i],dk=`${manifest.dirs[it2.dir_index]}|${it2.name}`;
+    if(snap.has(itemKey(i))||snap.has(dk))selected.add(i);
   }
 }
 // Focus/anchor follow their content across renumbering; fall back to the
@@ -133,7 +138,9 @@ function restoreSelection(snap){
 function restoreIndex(key,fallback){
   if(key)for(let i=0;i<items.length;i++){
     const it=items[i];
-    if(it&&!it.removed&&itemKey(i)===key)return i;
+    if(!it||it.removed)continue;
+    const dk=`${manifest.dirs[it.dir_index]}|${it.name}`;
+    if(itemKey(i)===key||dk===key)return i;
   }
   const f=Math.min(Math.max(fallback,0),Math.max(items.length-1,0));
   for(let i=f;i<items.length;i++)if(items[i]&&!items[i].removed)return i;

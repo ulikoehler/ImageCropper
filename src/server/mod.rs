@@ -274,7 +274,7 @@ impl ServerState {
     /// upsert differentially instead of re-pulling the manifest.
     /// Returns how many items were inserted or updated.
     /// `bytes` = walker-supplied size when known (`None` → sniffed here).
-    pub fn upsert_files(&self, files: Vec<(PathBuf, Option<u64>)>) -> usize {
+    pub fn upsert_files(&self, files: Vec<(PathBuf, Option<(u32, u32, u64, u64)>)>) -> usize {
         // Phase 1 (no lock): sniff per-file metadata — this is the I/O part
         // and must not block manifest readers.
         let sniffed: Vec<(PathBuf, u32, u32, u64, u64)> = files
@@ -284,11 +284,26 @@ impl ServerState {
             // enumerated the directory before the rename) — must not come
             // back either.
             .filter(|(p, _)| !self.actions.is_pending(p) && !self.is_gone(p))
-            .map(|(p, known_bytes)| {
-                let (w, h) = image::image_dimensions(&p).unwrap_or((0, 0));
-                let bytes = known_bytes
-                    .unwrap_or_else(|| std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0));
+            .map(|(p, known)| {
+                // `known` may carry full cached metadata (files.pack seed):
+                // (w, h, bytes, sig) — only a stat is needed to reuse it.
+                if let Some((w, h, bytes, sig)) = known {
+                    return (p, w, h, bytes, sig);
+                }
+                // Mtime-only recheck: an unchanged signature reuses stored
+                // dims instead of re-sniffing the image header.
                 let sig = crate::fs_utils::previews::preview_sig_u64(&p).unwrap_or(0);
+                if sig != 0 {
+                    let m = self.manifest.read().unwrap();
+                    if let Some(id) = m.positions.get(&p) {
+                        let it = &m.items[*id as usize];
+                        if it.sig == sig {
+                            return (p, it.w, it.h, it.bytes, sig);
+                        }
+                    }
+                }
+                let (w, h) = image::image_dimensions(&p).unwrap_or((0, 0));
+                let bytes = std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
                 (p, w, h, bytes, sig)
             })
             .collect();
@@ -983,14 +998,20 @@ pub fn spawn_scan_feeder(state: &Arc<ServerState>, stream: crate::cli::ScanStrea
         // RAII: the flag clears itself if this thread exits by any path —
         // a stuck hold would tax every action job for the rest of the run.
         let mut hold = Some(state.io_gate.scan_hold());
-        let mut batch: Vec<(PathBuf, Option<u64>)> = Vec::new();
+        let mut batch: Vec<(PathBuf, Option<(u32, u32, u64, u64)>)> = Vec::new();
         let mut found = 0usize;
         let t0 = std::time::Instant::now();
         let mut last_report = t0;
         loop {
             let timed_out = match stream.rx.recv_timeout(FLUSH) {
                 Ok(ScanEvent::Found { path, bytes }) => {
-                    batch.push((path, Some(bytes)));
+                    let _ = bytes;
+                    batch.push((path, None));
+                    found += 1;
+                    false
+                }
+                Ok(ScanEvent::Cached { path, w, h, bytes, sig }) => {
+                    batch.push((path, Some((w, h, bytes, sig))));
                     found += 1;
                     false
                 }
@@ -1052,6 +1073,28 @@ pub fn spawn_scan_feeder(state: &Arc<ServerState>, stream: crate::cli::ScanStrea
             );
         }
         state.finish_scan(stream.order, stream.inverse);
+        // Persist the scan result so the next run seeds instantly.
+        {
+            let m = state.manifest.read().unwrap();
+            let mut per_root: std::collections::HashMap<PathBuf, Vec<(PathBuf, String, u64, u128, u32, u32)>> =
+                std::collections::HashMap::new();
+            for (i, it) in m.items.iter().enumerate() {
+                if it.removed {
+                    continue;
+                }
+                let Some(p) = m.path_of(i as u32) else { continue };
+                let Some((len, nanos)) = crate::fs_utils::previews::source_signature(&p) else { continue };
+                let Some(parent) = p.parent() else { continue };
+                let root = state.roots.iter().find(|r| p.starts_with(r));
+                let Some(root) = root else { continue };
+                per_root.entry(root.clone()).or_default().push(
+                    (parent.to_path_buf(), it.name.clone(), len, nanos, it.w, it.h));
+            }
+            drop(m);
+            for (root, files) in per_root {
+                crate::fs_utils::files_pack::save(&root, &files);
+            }
+        }
         if crate::fs_utils::verbose() {
             eprintln!("scan: {} items indexed", state.item_count());
         }

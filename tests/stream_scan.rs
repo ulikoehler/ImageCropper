@@ -16,6 +16,7 @@ fn drain(rx: std::sync::mpsc::Receiver<ScanEvent>) -> (Vec<(PathBuf, u64)>, Vec<
     for ev in rx {
         match ev {
             ScanEvent::Found { path, bytes } => found.push((path, bytes)),
+            ScanEvent::Cached { path, bytes, .. } => found.push((path, bytes)),
             ScanEvent::Error(e) => errors.push(e),
         }
     }

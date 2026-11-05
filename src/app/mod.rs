@@ -166,7 +166,8 @@ impl ImageCropperApp {
         if let Some(rx) = &self.scan_rx {
             loop {
                 match rx.try_recv() {
-                    Ok(crate::fs_utils::ScanEvent::Found { path: p, .. }) => {
+                    Ok(crate::fs_utils::ScanEvent::Found { path: p, .. })
+                    | Ok(crate::fs_utils::ScanEvent::Cached { path: p, .. }) => {
                         if self.files_seen.insert(p.clone()) {
                             self.files.push(p);
                         }

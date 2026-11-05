@@ -280,8 +280,34 @@ pub struct ScanStream {
 /// [`ScanEvent::Error`]s.
 pub fn spawn_scan_stream(scan: &ScanArgs) -> Result<ScanStream> {
     let filter = PathFilter::compile(scan.filter_syntax, &scan.whitelist, &scan.blacklist)?;
+    // Seed from the last scan's files.pack: unchanged dirs emit their
+    // recorded entries instantly and are skipped by the walker.
+    let mut seeds = Vec::new();
+    let mut skip = std::collections::HashSet::new();
+    for root in &scan.paths {
+        if let Some((dirs, s)) = crate::fs_utils::files_pack::load(root) {
+            skip.extend(s);
+            for (dir, rec) in dirs {
+                for f in rec.files {
+                    seeds.push(crate::fs_utils::ScanEvent::Cached {
+                        path: dir.join(&f.name),
+                        w: f.w,
+                        h: f.h,
+                        bytes: f.len,
+                        sig: f.len ^ f.mtime as u64 ^ (f.mtime >> 64) as u64,
+                    });
+                }
+            }
+        }
+    }
     Ok(ScanStream {
-        rx: spawn_image_scan_limited(scan.paths.clone(), scan.recursive, filter, scan.max_files),
+        rx: crate::fs_utils::spawn_image_scan_seeded(
+            scan.paths.clone(),
+            scan.recursive,
+            filter,
+            scan.max_files,
+            Some((seeds, skip)),
+        ),
         order: scan.order,
         inverse: scan.inverse,
         resort: scan.resort,

@@ -244,7 +244,8 @@ impl AlbumApp {
         if let Some(rx) = &self.scan_rx {
             loop {
                 match rx.try_recv() {
-                    Ok(ScanEvent::Found { path, bytes }) => {
+                    Ok(ScanEvent::Found { path, bytes })
+                    | Ok(ScanEvent::Cached { path, bytes, .. }) => {
                         if !self.positions.contains_key(&path) {
                             self.positions.insert(path.clone(), self.entries.len());
                             self.entries.push(Entry::new(path, bytes));

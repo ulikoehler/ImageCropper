@@ -255,7 +255,7 @@ fn pregenerate_stream(stream: ScanStream, parallel: usize) {
         }
         if scanning {
             match stream.rx.recv_timeout(Duration::from_millis(20)) {
-                Ok(ScanEvent::Found { path, .. }) => {
+                Ok(ScanEvent::Found { path, .. }) | Ok(ScanEvent::Cached { path, .. }) => {
                     pool.request(path);
                     queued += 1;
                 }
@@ -297,7 +297,7 @@ fn headless_crop(args: &CropArgs, stream: ScanStream) -> Result<()> {
             break;
         }
         match ev {
-            ScanEvent::Found { path: f, .. } => {
+            ScanEvent::Found { path: f, .. } | ScanEvent::Cached { path: f, .. } => {
                 let Ok(bytes) = std::fs::read(&f) else {
                     continue;
                 };

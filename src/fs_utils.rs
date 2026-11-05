@@ -11,6 +11,7 @@ use regex::RegexSet;
 use walkdir::WalkDir;
 
 pub mod adaptive_pool;
+pub mod files_pack;
 pub mod pack;
 pub mod previews;
 
@@ -157,6 +158,15 @@ pub enum ScanEvent {
     /// An image file matched — emitted the moment it is discovered, with
     /// its byte size (one metadata call inside the walker thread).
     Found { path: PathBuf, bytes: u64 },
+    /// A cached entry from `files.pack` (dir mtime unchanged): the consumer
+    /// gets the recorded dims + signature, no re-sniff needed.
+    Cached {
+        path: PathBuf,
+        w: u32,
+        h: u32,
+        bytes: u64,
+        sig: u64,
+    },
     /// Non-fatal problem (missing root, unreadable dir); the scan continues.
     Error(String),
 }
@@ -184,8 +194,30 @@ pub fn walk_images_limited(
     max: Option<usize>,
     emit: &mut dyn FnMut(ScanEvent),
 ) {
+    walk_images_seeded(paths, recursive, filter, max, None, emit)
+}
+
+/// [`walk_images_limited`] with a `files.pack` seed: `seeds` are emitted
+/// first (they count toward the limit), and dirs in `skip` are pruned —
+/// their contents arrive via the seeds instead of a re-walk.
+pub fn walk_images_seeded(
+    paths: &[PathBuf],
+    recursive: bool,
+    filter: Option<&PathFilter>,
+    max: Option<usize>,
+    plan: Option<(Vec<ScanEvent>, std::collections::HashSet<PathBuf>)>,
+    emit: &mut dyn FnMut(ScanEvent),
+) {
     let limit = max.filter(|n| *n > 0).unwrap_or(usize::MAX);
     let mut emitted = 0usize;
+    let (seeds, skip) = plan.unwrap_or_default();
+    for ev in seeds {
+        if emitted >= limit {
+            return;
+        }
+        emit(ev);
+        emitted += 1;
+    }
     for path in paths {
         if emitted >= limit {
             return;
@@ -213,9 +245,10 @@ pub fn walk_images_limited(
                     .follow_links(false)
                     .into_iter()
                     .filter_entry(|e| {
-                        e.depth() == 0
+                        (e.depth() == 0
                             || !e.file_type().is_dir()
-                            || !is_reserved_dir_name(e.file_name())
+                            || !is_reserved_dir_name(e.file_name()))
+                            && !(e.file_type().is_dir() && skip.contains(e.path()))
                     })
                     .filter_map(|e| e.ok())
                 {
@@ -234,6 +267,9 @@ pub fn walk_images_limited(
                         }
                     }
                 }
+            } else if skip.contains(path) {
+                // Non-recursive root whose dir mtime is unchanged — its
+                // contents already arrived via the seed events.
             } else {
                 match fs::read_dir(path) {
                     Err(e) => emit(ScanEvent::Error(format!(
@@ -280,9 +316,20 @@ pub fn spawn_image_scan_limited(
     filter: Option<PathFilter>,
     max: Option<usize>,
 ) -> std::sync::mpsc::Receiver<ScanEvent> {
+    spawn_image_scan_seeded(paths, recursive, filter, max, None)
+}
+
+/// [`spawn_image_scan_limited`] with a `files.pack` seed plan.
+pub fn spawn_image_scan_seeded(
+    paths: Vec<PathBuf>,
+    recursive: bool,
+    filter: Option<PathFilter>,
+    max: Option<usize>,
+    plan: Option<(Vec<ScanEvent>, std::collections::HashSet<PathBuf>)>,
+) -> std::sync::mpsc::Receiver<ScanEvent> {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        walk_images_limited(&paths, recursive, filter.as_ref(), max, &mut |ev| {
+        walk_images_seeded(&paths, recursive, filter.as_ref(), max, plan, &mut |ev| {
             let _ = tx.send(ev);
         });
     });
@@ -311,7 +358,7 @@ pub fn collect_images_limited(
     let mut files = Vec::new();
     let mut error = None;
     walk_images_limited(paths, recursive, filter, max, &mut |ev| match ev {
-        ScanEvent::Found { path, .. } => files.push(path),
+        ScanEvent::Found { path, .. } | ScanEvent::Cached { path, .. } => files.push(path),
         ScanEvent::Error(e) => {
             if error.is_none() {
                 error = Some(e);
