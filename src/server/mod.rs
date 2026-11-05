@@ -23,6 +23,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use axum::{routing::get, Router};
+use rand::seq::SliceRandom;
 use tokio::sync::broadcast;
 
 pub use actions::{Action, ActionDone, ActionEnvelope, ActionKind, ActionQueue, RotateOp};
@@ -67,6 +68,12 @@ pub struct ServerState {
     /// Counters behind `/debugz` — the web client only sees its own state;
     /// this answers "is the server still scanning/pushing/producing?".
     pub dbg: DbgStats,
+    /// Sort keys memoized by (path, sig): continuous re-sorting during a
+    /// scan must not re-stat/re-parse every item on each pass — the
+    /// signature already covers (len, mtime), so a hit is always exact.
+    /// The u128 packs the order key (size → len, mtime → nanos, EXIF →
+    /// packed datetime); `None` = no key (files without EXIF sort last).
+    key_cache: std::sync::Mutex<HashMap<PathBuf, (u64, Option<u128>)>>,
 }
 
 /// Lightweight instrumentation for `/debugz`. Everything is cheap (atomics
@@ -150,6 +157,7 @@ impl ServerState {
             gone: std::sync::Mutex::new(std::collections::HashMap::new()),
             io_gate,
             pins_dirty: std::sync::atomic::AtomicBool::new(true),
+            key_cache: std::sync::Mutex::new(HashMap::new()),
             dbg: DbgStats::default(),
         })
     }
@@ -486,6 +494,118 @@ impl ServerState {
         }
     }
 
+    /// Sort `files` by the `-o` order, using the signature-keyed sort-key
+    /// cache so repeated passes don't re-stat or re-parse every file.
+    /// Equivalent to [`crate::cli::sort_files`] plus memoization.
+    pub fn sort_with_order(
+        &self,
+        files: &mut Vec<PathBuf>,
+        order: crate::cli::SortOrder,
+        inverse: bool,
+    ) {
+        use crate::cli::SortOrder as S;
+        match order {
+            S::Filename => files.sort(),
+            S::Randomize => files.shuffle(&mut rand::rng()),
+            S::Modified
+            | S::Size
+            | S::SizeAsc
+            | S::SizeDesc
+            | S::Exif
+            | S::ExifAsc
+            | S::ExifDesc => {
+                let descending = matches!(order, S::SizeDesc | S::ExifDesc);
+                let mut keyed: Vec<(Option<u128>, PathBuf)> = files
+                    .drain(..)
+                    .map(|path| {
+                        let sig =
+                            crate::fs_utils::previews::preview_sig_u64(&path).unwrap_or(0);
+                        let cached = self
+                            .key_cache
+                            .lock()
+                            .unwrap()
+                            .get(&path)
+                            .filter(|(s, _)| *s == sig)
+                            .map(|(_, k)| *k);
+                        let key = cached.unwrap_or_else(|| {
+                            let k = match order {
+                                S::Modified => std::fs::metadata(&path)
+                                    .ok()
+                                    .and_then(|m| m.modified().ok())
+                                    .and_then(|t| {
+                                        t.duration_since(std::time::UNIX_EPOCH).ok()
+                                    })
+                                    .map(|d| d.as_nanos()),
+                                S::Size | S::SizeAsc | S::SizeDesc => {
+                                    Some(std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0)
+                                        as u128)
+                                }
+                                _ => crate::fs_utils::exif_datetime_key(&path).map(
+                                    |(y, mo, d, h, mi, s)| {
+                                        // Monotone pack: each field < 100,
+                                        // so decimal concat sorts right.
+                                        ((((y as u128 * 100 + mo as u128) * 100 + d as u128)
+                                            * 100
+                                            + h as u128)
+                                            * 100
+                                            + mi as u128)
+                                            * 100
+                                            + s as u128
+                                    },
+                                ),
+                            };
+                            self.key_cache
+                                .lock()
+                                .unwrap()
+                                .insert(path.clone(), (sig, k));
+                            k
+                        });
+                        (key, path)
+                    })
+                    .collect();
+                keyed.sort_by(|(a, _), (b, _)| match (a, b) {
+                    (Some(x), Some(y)) => {
+                        if descending {
+                            y.cmp(x)
+                        } else {
+                            x.cmp(y)
+                        }
+                    }
+                    (Some(_), None) => std::cmp::Ordering::Less,
+                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (None, None) => std::cmp::Ordering::Equal,
+                });
+                files.extend(keyed.into_iter().map(|(_, p)| p));
+            }
+        }
+        if inverse && order != S::Randomize {
+            files.reverse();
+        }
+    }
+
+    /// Re-apply the `-o` order to the CURRENT manifest and resync when it
+    /// changed — the streaming scan's continuous sorting: without it the
+    /// grid stays in filesystem order until the (possibly minutes-long)
+    /// walk finishes. A resync only goes out when the order actually
+    /// differs; `Randomize` is exempt (a shuffle per batch is meaningless).
+    pub fn resort_partial(&self, order: crate::cli::SortOrder, inverse: bool) {
+        if order == crate::cli::SortOrder::Randomize {
+            return;
+        }
+        let current: Vec<PathBuf> = {
+            let m = self.manifest.read().unwrap();
+            (0..m.items.len())
+                .filter_map(|i| m.path_of(i as u32))
+                .collect()
+        };
+        let mut files = current.clone();
+        self.sort_with_order(&mut files, order, inverse);
+        if files != current {
+            self.rebuild_manifest(files, &self.roots);
+            self.broadcast_resync();
+        }
+    }
+
     /// Scan finished: apply the final `-o` ordering, rebuild the manifest
     /// (ids are reassigned) and broadcast a `resync` patch so clients
     /// replace their lists in place — no reconnect or manifest re-pull.
@@ -496,7 +616,7 @@ impl ServerState {
                 .filter_map(|i| m.path_of(i as u32))
                 .collect()
         };
-        crate::cli::sort_files(&mut files, order, inverse);
+        self.sort_with_order(&mut files, order, inverse);
         self.rebuild_manifest(files, &self.roots);
         self.broadcast_resync();
     }
@@ -900,6 +1020,12 @@ pub fn spawn_scan_feeder(state: &Arc<ServerState>, stream: crate::cli::ScanStrea
             }
             if batch.len() >= BATCH || (timed_out && !batch.is_empty()) {
                 state.upsert_files(std::mem::take(&mut batch));
+                // --resort=realtime: the `-o` order applies after EVERY
+                // batch, not just at scan end — a resync goes out only
+                // when the order actually changed.
+                if stream.resort == crate::cli::ResortMode::Realtime {
+                    state.resort_partial(stream.order, stream.inverse);
+                }
                 state
                     .dbg
                     .scan_found
@@ -915,6 +1041,9 @@ pub fn spawn_scan_feeder(state: &Arc<ServerState>, stream: crate::cli::ScanStrea
         drop(hold);
         if !batch.is_empty() {
             state.upsert_files(batch);
+            if stream.resort == crate::cli::ResortMode::Realtime {
+                state.resort_partial(stream.order, stream.inverse);
+            }
         }
         if crate::fs_utils::verbose() {
             eprintln!(

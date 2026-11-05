@@ -10,7 +10,7 @@ use std::time::Duration;
 use notify::{RecursiveMode, Watcher};
 
 use super::ServerState;
-use crate::cli::{collect_sorted_files, ScanArgs};
+use crate::cli::ScanArgs;
 
 /// Coalesce bursts into one rescan. Bulk deletes fire hundreds of events in
 /// seconds; a short window turns that into a rescan per delete batch.
@@ -64,7 +64,11 @@ pub fn spawn(state: Arc<ServerState>, scan: ScanArgs) {
         // is owned by this thread — it stays alive for the process lifetime.
         while rx.recv().is_ok() {
             while rx.recv_timeout(DEBOUNCE).is_ok() {}
-            if let Ok(files) = collect_sorted_files(&scan) {
+            if let Ok(mut files) = crate::cli::collect_files(&scan) {
+                // The listing arrives unsorted; apply the `-o` order
+                // through the shared signature-keyed cache (rescans must
+                // not re-stat/re-parse every file on a slow mount).
+                state.sort_with_order(&mut files, scan.order, scan.inverse);
                 // Differential rebuild: surviving files keep their ids, so
                 // clients keep thumbnails/wants/selection. A full resync
                 // here renumbers everything and — during a delete storm —

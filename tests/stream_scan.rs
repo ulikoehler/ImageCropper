@@ -34,6 +34,7 @@ fn scan_args(root: &std::path::Path) -> ScanArgs {
         verbose: false,
         inverse: false,
         order: SortOrder::Filename,
+        resort: imagecropper::cli::ResortMode::OnScanFinish,
         no_gpu: false,
         max_files: None,
     }

@@ -113,11 +113,27 @@ pub struct ScanArgs {
     #[arg(short, long, value_enum, default_value_t = SortOrder::Filename)]
     pub order: SortOrder,
 
+    /// When the -o order is applied during a --serve scan: realtime
+    /// re-sorts after every batch; on-scan-finish sorts once at the end.
+    #[arg(long, value_enum, default_value_t = ResortMode::OnScanFinish)]
+    pub resort: ResortMode,
+
     /// Disable GPU image processing (JPEG decode/resize/encode) and use
     /// CPU paths only — for machines without a usable GPU or driver.
     /// Same effect as IC_NO_GPUJPEG=1. Does not affect UI rendering.
     #[arg(long = "no-gpu", default_value_t = false)]
     pub no_gpu: bool,
+}
+
+/// When the `-o` ordering is (re)applied during a streaming scan.
+#[derive(clap::ValueEnum, Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ResortMode {
+    /// Sort once, when the scan completes (classic behavior).
+    #[default]
+    OnScanFinish,
+    /// Re-sort after every discovered batch — new files slot into their
+    /// sorted position immediately instead of piling at the end.
+    Realtime,
 }
 
 /// WebSocket auth mode for `--serve`.
@@ -255,6 +271,8 @@ pub struct ScanStream {
     pub rx: Receiver<ScanEvent>,
     pub order: SortOrder,
     pub inverse: bool,
+    /// Whether `--serve` re-sorts after every batch or only at scan end.
+    pub resort: ResortMode,
 }
 
 /// Spawn a streaming scan for `scan`'s paths/filters. Errors in the
@@ -266,7 +284,23 @@ pub fn spawn_scan_stream(scan: &ScanArgs) -> Result<ScanStream> {
         rx: spawn_image_scan_limited(scan.paths.clone(), scan.recursive, filter, scan.max_files),
         order: scan.order,
         inverse: scan.inverse,
+        resort: scan.resort,
     })
+}
+
+/// Collect the input images WITHOUT sorting — callers that sort through
+/// `ServerState::sort_with_order` get the shared EXIF-key cache.
+pub fn collect_files(scan: &ScanArgs) -> Result<Vec<PathBuf>> {
+    let file_filter = PathFilter::compile(scan.filter_syntax, &scan.whitelist, &scan.blacklist)?;
+    let files =
+        collect_images_limited(&scan.paths, scan.recursive, file_filter.as_ref(), scan.max_files)?;
+    if files.is_empty() {
+        return Err(anyhow!(
+            "No supported image files found in the provided paths. Supported formats are: {}",
+            crate::fs_utils::SUPPORTED_EXTENSIONS.join(", ")
+        ));
+    }
+    Ok(files)
 }
 
 /// Collect the input images, apply filters and sort them the same way for
@@ -316,7 +350,7 @@ pub fn sort_files(files: &mut Vec<PathBuf>, order: SortOrder, inverse: bool) {
 }
 
 /// Compare two optional EXIF keys; files without EXIF data always sort last.
-fn exif_cmp(
+pub(crate) fn exif_cmp(
     a: &Option<(u32, u32, u32, u32, u32, u32)>,
     b: &Option<(u32, u32, u32, u32, u32, u32)>,
     descending: bool,
