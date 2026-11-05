@@ -132,27 +132,23 @@ pub fn verify_sig(path: &Path, expected: u64) -> Result<()> {
     // Cheap sig differs — compare content before declaring a change. The
     // hash is cached briefly: a bulk delete would otherwise read every
     // source file in full.
-    match crate::fs_utils::previews::stored_content_hash(path) {
-        Some(stored) => {
-            if crate::fs_utils::previews::source_content_hash_cached(path).as_deref()
-                == Some(&stored)
-            {
-                return Ok(());
-            }
+    let computed = crate::fs_utils::previews::source_content_hash_cached(path);
+    match (crate::fs_utils::previews::stored_content_hash(path), computed) {
+        // Recorded hash AND current hash disagree → proven change.
+        (Some(stored), Some(now)) if now != stored => Err(anyhow!(STALE_SIG_MSG)),
+        // Same content → the mtime churn was cosmetic.
+        (Some(_), Some(_)) => Ok(()),
+        // No recorded hash — record it so the next decision is exact.
+        (None, Some(now)) => {
+            crate::fs_utils::previews::write_stored_hash_for(path, &now);
+            Ok(())
         }
-        // No recorded hash (preview not produced yet, or a legacy cache):
-        // we cannot tell mtime churn from a real change. Record the current
-        // content so the next decision is exact, and let the action proceed
-        // — refusing here strands the tile as "still there" after the user
-        // already saw it disappear.
-        None => {
-            if let Some(hash) = crate::fs_utils::previews::source_content_hash_cached(path) {
-                crate::fs_utils::previews::write_stored_hash_for(path, &hash);
-                return Ok(());
-            }
-        }
+        // Cannot decide (unreadable file on a flaky mount, or no hash at
+        // all): refusing strands the tile as "still there" after the user
+        // already saw it disappear — and a genuinely failed read errors
+        // properly at the rename itself. Allow.
+        _ => Ok(()),
     }
-    Err(anyhow!(STALE_SIG_MSG))
 }
 
 /// Execute one action. `path` is the manifest-resolved source path.

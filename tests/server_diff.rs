@@ -439,3 +439,91 @@ fn rescan_without_reorder_never_resyncs_on_appends() {
     let names: Vec<_> = m.items.iter().map(|i| i.name.as_str()).collect();
     assert_eq!(names, ["b.png", "a.png"]);
 }
+
+/// Regression: a file moved away mid-scan must not reappear. Reproduces the
+/// ws_data sequence (dispatch + eager tombstone), then a watcher-style
+/// rescan whose listing still contains the file (slow-mount staleness),
+/// then completion — at no point may an upsert/resync revive the item.
+#[test]
+fn moved_file_never_resurfaces_through_rescan() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let dest = tmp.path().join("dest");
+    std::fs::create_dir_all(&dest).unwrap();
+    for name in ["a.png", "b.png", "c.png"] {
+        write_image(root.join(name), &solid_image(10, 10, [1, 1, 1, 255]));
+    }
+    let state = ServerState::new(
+        vec![
+            root.join("a.png"),
+            root.join("b.png"),
+            root.join("c.png"),
+        ],
+        vec![root.to_path_buf()],
+        ServeMode::Album,
+        imagecropper::cli::MouseSelectMode::Sequence,
+        2,
+        None,
+        4096,
+        Some(dest.clone()),
+    );
+    let mut rx = state.events.subscribe();
+    let b = root.join("b.png");
+    let sig = imagecropper::fs_utils::previews::preview_sig_u64(&b).unwrap();
+
+    // The ws_data CL_ACTION sequence: queue, then eager tombstone.
+    state.actions.dispatch(
+        1,
+        imagecropper::server::Action::Move { id: 1, sig },
+        b.clone(),
+    );
+    state.remove_path(&b);
+    assert_eq!(state.position_of(&b), None);
+
+    // A rescan whose listing still contains b (enumerated before the
+    // rename landed on this slow mount) must not re-add it.
+    state.rebuild_manifest_diff(
+        vec![root.join("a.png"), b.clone(), root.join("c.png")],
+        &[root.to_path_buf()],
+        true,
+    );
+    assert_eq!(state.position_of(&b), None, "pending move re-added by rescan");
+
+    // Now the op finishes; drain completions the way the pump does.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut done_any = false;
+    while !done_any && std::time::Instant::now() < deadline {
+        for done in state.actions.poll() {
+            done_any = true;
+            if done.ok {
+                state.remove_path(&done.src);
+            } else {
+                state.restore_path(&done.src);
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(done_any, "move never completed");
+    assert!(!b.exists(), "file must have moved");
+    assert_eq!(state.position_of(&b), None);
+
+    // Another rescan (fresh listing, b really gone) also keeps it out.
+    state.rebuild_manifest_diff(
+        vec![root.join("a.png"), root.join("c.png")],
+        &[root.to_path_buf()],
+        true,
+    );
+
+    // Inspect every broadcast patch: b must never appear as a live upsert.
+    while let Ok(imagecropper::server::ServerEvent::Json(json)) = rx.try_recv() {
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        if v["ev"] != "manifest-patch" {
+            continue;
+        }
+        for it in v["patch"]["upsert"].as_array().cloned().unwrap_or_default() {
+            if it["name"] == "b.png" {
+                assert_eq!(it["removed"], true, "b.png resurrected: {json}");
+            }
+        }
+    }
+}
