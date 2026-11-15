@@ -426,7 +426,11 @@ pub fn parse_jpg(j: &mut Jpg<'_>) -> bool {
                 for i in 0..ns as usize {
                     let cs = s[1 + i * 2] as i32;
                     let mut ci = None;
-                    for (k, cc) in j.comps.iter().enumerate() {
+                    // Only real frame components: unused slots past
+                    // n_comp are Comp::default() with id==0, which would
+                    // otherwise steal component ID 0 (seen in the wild).
+                    for (k, cc) in j.comps.iter().take(j.n_comp as usize).enumerate()
+                    {
                         if cc.id == cs {
                             ci = Some(k);
                         }
@@ -676,7 +680,11 @@ pub fn pack_comps(j: &Jpg<'_>) -> FrameGpu {
         total_blocks: 0,
         plane_words: 0,
     };
-    let (mut coef_of, mut plane_of) = (0u32, 0u32);
+    // u64 accumulators: bw*bh*64 overflows i32 for max-size JPEGs.
+    // Published totals saturate at i32::MAX — any image that large
+    // fails the GPU buffer pre-flight anyway, so the saturated value
+    // only needs to stay "huge", not exact.
+    let (mut coef_of, mut plane_of, mut blocks) = (0u64, 0u64, 0u64);
     for i in 0..4 {
         let c = &j.comps[i];
         let cc = &mut f.comps[i];
@@ -689,17 +697,18 @@ pub fn pack_comps(j: &Jpg<'_>) -> FrameGpu {
         cc[6] = c.tq;
         cc[7] = c.td; // dctab[t] -> tabs[t]
         cc[8] = 4 + c.ta; // actab[t] -> tabs[4+t]
-        cc[9] = coef_of as i32;
-        cc[10] = plane_of as i32;
+        cc[9] = coef_of.min(i32::MAX as u64) as i32;
+        cc[10] = plane_of.min(i32::MAX as u64) as i32;
         cc[11] = c.wib;
         cc[12] = c.hib;
         if i < j.n_comp as usize {
-            coef_of += (c.bw * c.bh) as u32 * 32; // 64 coefs / 2 per word
-            plane_of += (c.bw * 8 * c.bh * 8) as u32; // plane bytes
+            coef_of += c.bw as u64 * c.bh as u64 * 32; // 64 coefs / 2 per word
+            plane_of += c.bw as u64 * c.bh as u64 * 64; // plane bytes
         }
-        f.total_blocks += c.bw * c.bh;
+        blocks += c.bw as u64 * c.bh as u64;
     }
-    f.plane_words = (plane_of / 4) as i32;
+    f.total_blocks = blocks.min(i32::MAX as u64) as i32;
+    f.plane_words = (plane_of / 4).min(i32::MAX as u64) as i32;
     f
 }
 

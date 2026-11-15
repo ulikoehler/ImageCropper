@@ -19,9 +19,12 @@ const SUBMIT_MCUS: u32 = 32768;
 
 pub struct GpuCtx {
     /// Largest bindable storage-buffer range on this device
-    /// (`max_storage_buffer_binding_size`). Callers must check every
-    /// bound buffer against this — oversized work falls back to CPU.
+    /// (`max_storage_buffer_binding_size`).
     pub max_bind: u64,
+    /// Largest creatable buffer (`max_buffer_size`) — the WebGPU
+    /// default of 256 MiB is far below what native adapters allow,
+    /// so init requests the adapter's real limit.
+    pub max_buf: u64,
     device: wgpu::Device,
     queue: wgpu::Queue,
     d_bgl: wgpu::BindGroupLayout,
@@ -149,6 +152,12 @@ impl GpuCtx {
         let mut limits = wgpu::Limits::default();
         limits.max_immediate_size = 128;
         limits.max_storage_buffer_binding_size = adapter.limits().max_storage_buffer_binding_size;
+        // `Limits::default()` keeps the WebGPU 256 MiB `max_buffer_size`;
+        // native adapters allow far more, and our decode coefficient
+        // buffers for multi-10-MP JPEGs exceed 256 MiB. Request the
+        // adapter's real limit so those decode on GPU instead of
+        // falling back to CPU.
+        limits.max_buffer_size = adapter.limits().max_buffer_size;
         let (device, queue) = block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("gpujpeg"),
             required_features: wgpu::Features::IMMEDIATES,
@@ -216,6 +225,7 @@ impl GpuCtx {
         };
         let ctx = GpuCtx {
             max_bind: u64::from(device.limits().max_storage_buffer_binding_size),
+            max_buf: device.limits().max_buffer_size,
             p_entropy: mk(shaders::ENTROPY, &d_layout, "main"),
             p_recon: mk(shaders::RECON, &d_layout, "main"),
             p_upsample: mk(shaders::UPSAMPLE, &d_layout, "main"),
@@ -229,6 +239,15 @@ impl GpuCtx {
             e_bgl,
         };
         Some(ctx)
+    }
+
+    /// Largest buffer we may create AND bind whole: every GPU buffer
+    /// in this module is bound as a whole storage buffer, so the
+    /// ceiling is min(`max_buffer_size`, `max_storage_buffer_binding_size`).
+    /// Callers pre-flight sizes against this and fall back to CPU
+    /// instead of letting `create_buffer` fail validation.
+    pub fn bound_limit(&self) -> u64 {
+        self.max_buf.min(self.max_bind)
     }
 
     /// Wait until `idx`'s submission completes — other in-flight jobs'
@@ -269,7 +288,9 @@ impl GpuCtx {
     /// Handles baseline (SOF0/1) and progressive (SOF2, multi-scan) files.
     /// DRI=0 scans are parallelized by host "survey" passes that
     /// synthesize virtual restart intervals (see jpeg::survey_scan).
-    pub fn decode_into(&self, j: &mut Jpg<'_>, fg: &FrameGpu) -> wgpu::Buffer {
+    /// Returns None when a required buffer exceeds the device limits —
+    /// the caller then falls back to CPU decode.
+    pub fn decode_into(&self, j: &mut Jpg<'_>, fg: &FrameGpu) -> Option<wgpu::Buffer> {
         let dev = &self.device;
         let q = &self.queue;
         let n_scans = j.scans.len() as u32;
@@ -361,6 +382,34 @@ impl GpuCtx {
             }
             total_slots += n_iv * n_gen;
         }
+
+        // Pre-flight: every buffer below is bound whole, so each must
+        // fit min(max_buffer_size, max_storage_buffer_binding_size) —
+        // create_buffer fails validation (panic) past that. Oversized
+        // images return None → caller falls back to CPU decode.
+        let (ow, oh) = j.out_dims();
+        let need = [
+            j.data.len().div_ceil(4) as u64 * 4, // scan data
+            ck_all.len() as u64 * 4,            // interval chunks
+            u64::from(total_slots) * 48,        // state slots (12 words)
+            (n_scans as u64 + 1) * super::jpeg::TAB_WORDS as u64 * 4,
+            n_scans as u64 * super::jpeg::FLUT_WORDS as u64 * 4,
+            fg.total_blocks as u64 * 128, // coefficients (32 words/block)
+            fg.plane_words as u64 * 4,    // sample planes
+            u64::from(ow) * u64::from(oh) * 4, // RGBA output
+        ]
+        .into_iter()
+        .max()
+        .unwrap_or(0);
+        if need > self.bound_limit() {
+            j.scans = scans;
+            eprintln!(
+                "gpujpeg: decode buffer {need} B exceeds {} B limit — CPU fallback",
+                self.bound_limit()
+            );
+            return None;
+        }
+
         let iv_buf = buf(
             dev,
             (ck_all.len() * 4) as u64,
@@ -443,7 +492,6 @@ impl GpuCtx {
             (fg.plane_words as u64) * 4,
             wgpu::BufferUsages::STORAGE,
         );
-        let (ow, oh) = j.out_dims();
         let out_buf = buf(
             dev,
             (ow as u64) * (oh as u64) * 4,
@@ -646,11 +694,12 @@ impl GpuCtx {
         // host readbacks (read_buf) observe the finished decode.
         q.submit([enc.finish()]);
         j.scans = scans;
-        out_buf
+        Some(out_buf)
     }
 
     /// Resize a GPU-resident RGBA word buffer and read back packed
     /// n_comp-byte pixels. Only the small result leaves the device.
+    /// Returns None when a resample buffer exceeds the device limits.
     pub fn resize_pack(
         &self,
         px: &wgpu::Buffer,
@@ -664,6 +713,14 @@ impl GpuCtx {
         let dev = &self.device;
         let out_bytes = u64::from(out_w) * u64::from(out_h) * u64::from(n_comp);
         let pack_size = (out_bytes + 3) & !3;
+        // Resample temps are bound whole: out_w×in_h then out_w×out_h
+        // RGBA words. Oversized requests → None (CPU fallback).
+        let need = (u64::from(out_w) * u64::from(in_h) * 4)
+            .max(u64::from(out_w) * u64::from(out_h) * 4)
+            .max(pack_size);
+        if need > self.bound_limit() {
+            return None;
+        }
         let pack_buf = buf(
             dev,
             pack_size,
@@ -870,7 +927,8 @@ impl GpuCtx {
     /// GPU-resident variant of [`resize_pack`]: records the resample in
     /// its own submission and returns the RGBA-word buffer immediately —
     /// it may still be filling; queue ordering makes any later GPU
-    /// submission (or [`read_buf`]) see it complete.
+    /// submission (or [`read_buf`]) see it complete. Returns None when
+    /// a resample buffer exceeds the device limits.
     pub fn resize_to_buffer(
         &self,
         px: &wgpu::Buffer,
@@ -879,11 +937,16 @@ impl GpuCtx {
         out_w: u32,
         out_h: u32,
         filter: i32,
-    ) -> wgpu::Buffer {
+    ) -> Option<wgpu::Buffer> {
+        let need = (u64::from(out_w) * u64::from(in_h) * 4)
+            .max(u64::from(out_w) * u64::from(out_h) * 4);
+        if need > self.bound_limit() {
+            return None;
+        }
         let mut enc = self.device.create_command_encoder(&Default::default());
         let out = self.record_resize(&mut enc, px, in_w, in_h, out_w, out_h, filter);
         self.queue.submit([enc.finish()]);
-        out
+        Some(out)
     }
 
     /// Record the baseline-encode dispatch into `enc` (no submit): one

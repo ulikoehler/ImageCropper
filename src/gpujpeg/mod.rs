@@ -100,6 +100,14 @@ pub fn available() -> bool {
     !disabled() && !stopped() && gpu::ctx().is_some()
 }
 
+/// Device buffer limits for diagnostics: (max_buffer_size,
+/// max_storage_buffer_binding_size, effective per-buffer ceiling).
+/// None when no GPU context exists.
+#[doc(hidden)]
+pub fn buffer_limits() -> Option<(u64, u64, u64)> {
+    gpu::ctx().map(|c| (c.max_buf, c.max_bind, c.bound_limit()))
+}
+
 /// Returns (width, height, max restart interval across scans) if bytes
 /// parse as a JPEG we can handle (baseline or progressive), else None.
 /// Pure CPU — never touches the GPU.
@@ -139,19 +147,20 @@ fn open_locked(bytes: &[u8]) -> Option<(GpuJpeg, &'static gpu::GpuCtx)> {
     let ctx = gpu::ctx()?;
     canon(&mut j);
     let fg = pack_comps(&j);
-    // Every storage buffer bound during decode must fit the device's
-    // binding-size limit (as small as 128 MB on some adapters). The
-    // big ones: coefficient array (128 B/block), RGBA output (4 B/px)
-    // and the compressed scan data. Oversized images → CPU fallback.
+    // Cheap early-out: the big decode buffers — coefficient array
+    // (128 B/block), RGBA output (4 B/px), compressed scan data —
+    // must fit the device limits. decode_into re-checks every buffer
+    // (chunk/state/table/LUT buffers too) before creating anything.
+    // Oversized images → CPU fallback.
     let need = (fg.total_blocks as u64 * 128)
         .max(u64::from(w) * u64::from(h) * 4)
         .max(j.data.len() as u64);
-    if need > ctx.max_bind {
+    if need > ctx.bound_limit() {
         return None;
     }
     // DRI=0 scans get host "survey" passes that synthesize virtual
     // restart intervals — serial scans decode in parallel anyway.
-    let px = ctx.decode_into(&mut j, &fg);
+    let px = ctx.decode_into(&mut j, &fg)?;
     Some((
         GpuJpeg {
             px: Some(px),
@@ -250,7 +259,7 @@ impl GpuJpeg {
             ow,
             oh,
             FILTER_LANCZOS,
-        );
+        )?;
         Some((buf, ow, oh))
     }
 
@@ -267,7 +276,7 @@ impl GpuJpeg {
     pub fn encode_jpeg_start(&self, quality: i32) -> Option<EncodeJob> {
         let _active = GpuActive::enter()?;
         let ctx = gpu::ctx()?;
-        if !enc_fits(ctx, self.width, self.height) {
+        if !enc_fits(ctx, self.height, self.width, self.height) {
             return None;
         }
         let p = ctx.encode_chain(
@@ -301,7 +310,7 @@ impl GpuJpeg {
         let _active = GpuActive::enter()?;
         let (ow, oh) = fit_dims(self.width, self.height, max_w, max_h);
         let ctx = gpu::ctx()?;
-        if !enc_fits(ctx, ow, oh) {
+        if !enc_fits(ctx, self.height, ow, oh) {
             return None;
         }
         let p = ctx.encode_chain(
@@ -356,13 +365,21 @@ impl EncodeJob {
     }
 }
 
-/// Both storage buffers the encode binds — source RGBA (4 B/px) and
-/// the segment output (sizes + 1 KiB per MCU) — must fit the device
-/// binding limit. Returns false → caller falls back to CPU encoding.
-fn enc_fits(ctx: &gpu::GpuCtx, w: u32, h: u32) -> bool {
-    let total = u64::from((w.div_ceil(16) * h.div_ceil(16)).max(1));
-    (u64::from(w) * u64::from(h) * 4).max(total * 4 + total * 4 * u64::from(jenc::SEG_WORDS))
-        <= ctx.max_bind
+/// Every buffer the encode chain allocates must fit the device
+/// limits: resized RGBA (4 B/px of the OUTPUT), the horizontal-pass
+/// temp (out_w × in_h RGBA words), the per-MCU segment output
+/// (4 B sizes + SEG_WORDS u32s per MCU) and its staging copy. The
+/// source RGBA already exists (decode output or a checked upload).
+/// Returns false → caller falls back to CPU encoding.
+fn enc_fits(ctx: &gpu::GpuCtx, src_h: u32, dst_w: u32, dst_h: u32) -> bool {
+    let mcu = (u64::from(dst_w.div_ceil(16)) * u64::from(dst_h.div_ceil(16))).max(1);
+    [
+        u64::from(dst_w) * u64::from(dst_h) * 4,
+        u64::from(dst_w) * u64::from(src_h) * 4,
+        mcu * 4 + mcu * 4 * u64::from(jenc::SEG_WORDS),
+    ]
+    .into_iter()
+    .all(|n| n <= ctx.bound_limit())
 }
 
 /// One-shot JPEG encode of CPU-side RGBA bytes (packed R,G,B,A per
@@ -373,7 +390,7 @@ pub fn encode_rgba(rgba: &[u8], w: u32, h: u32, quality: i32) -> Option<Vec<u8>>
         return None;
     }
     let ctx = gpu::ctx()?;
-    if !enc_fits(ctx, w, h) {
+    if !enc_fits(ctx, h, w, h) {
         return None;
     }
     let src = ctx.upload_rgba(rgba, w, h);

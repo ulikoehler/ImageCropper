@@ -234,6 +234,104 @@ fn exif_orientation_applied_on_gpu() {
     }
 }
 
+/// Rewrite component identifiers throughout a baseline JPEG: SOF spec
+/// bytes and every SOS component selector. `f` maps old id -> new id
+/// (None keeps the byte). Walks markers only up to the first SOS —
+/// enough for the single-scan files the encoder emits.
+fn patch_comp_ids(jpg: &[u8], f: impl Fn(u8) -> Option<u8>) -> (Vec<u8>, usize) {
+    let mut out = jpg.to_vec();
+    let mut patched = 0usize;
+    let mut p = 2usize;
+    while p + 4 <= out.len() && out[p] == 0xFF {
+        let m = out[p + 1];
+        if m == 0x00 || m == 0x01 || (0xD0..=0xD9).contains(&m) {
+            p += 2;
+            continue;
+        }
+        let len = u16::from_be_bytes([out[p + 2], out[p + 3]]) as usize;
+        if p + 2 + len > out.len() {
+            break;
+        }
+        match m {
+            // SOFn (not DHT/JPG/DAC): comp specs at +10, 3 bytes each
+            0xC0..=0xCF if m != 0xC4 && m != 0xC8 && m != 0xCC => {
+                let n = out[p + 9] as usize;
+                for k in 0..n.min(4) {
+                    let o = p + 10 + k * 3;
+                    if o < out.len() {
+                        if let Some(v) = f(out[o]) {
+                            out[o] = v;
+                            patched += 1;
+                        }
+                    }
+                }
+            }
+            0xDA => {
+                let ns = out[p + 4] as usize;
+                for k in 0..ns.min(4) {
+                    let o = p + 5 + k * 2;
+                    if o < out.len() {
+                        if let Some(v) = f(out[o]) {
+                            out[o] = v;
+                            patched += 1;
+                        }
+                    }
+                }
+                break; // entropy data follows — stop marker walk
+            }
+            _ => {}
+        }
+        p += 2 + len;
+    }
+    (out, patched)
+}
+
+/// Regression: component IDs are arbitrary — real-world files (seen in
+/// Lightroom exports) number them 0,1,2. The frame's unused comp slots
+/// are Comp::default() with id==0, so the SOS->component lookup must
+/// only search real components; otherwise id 0 binds to the phantom
+/// 4th slot, its coefficients are never decoded (flat luma) and the
+/// interleaved bitstream desyncs.
+#[test]
+fn component_id_zero_decodes() {
+    if !gpujpeg::available() {
+        eprintln!("gpujpeg not compiled in — skipping");
+        return;
+    }
+    let img = image::DynamicImage::ImageRgb8(image::RgbImage::from_fn(96, 80, |x, y| {
+        image::Rgb([(x * 3) as u8, (y * 5) as u8, ((x + y) % 251) as u8])
+    }));
+    let mut jpg = Vec::new();
+    img.write_to(&mut std::io::Cursor::new(&mut jpg), image::ImageFormat::Jpeg)
+        .expect("encode jpeg");
+
+    // ids 1,2,3 -> 0,1,2 (subtract one; keeps them unique and in order)
+    let (jpg, patched) = patch_comp_ids(&jpg, |id| id.checked_sub(1));
+    assert!(patched >= 6, "expected SOF+SOS id rewrites, got {patched}");
+
+    // zune must still decode it — ids are arbitrary per spec
+    let mut dec = zune_jpeg::JpegDecoder::new(std::io::Cursor::new(&jpg));
+    dec.set_options(zune_jpeg::zune_core::options::DecoderOptions::default().set_strict_mode(false));
+    let zrgb = dec.decode().expect("zune decode of id-0 jpeg");
+
+    let (rgba, w, h) = gpujpeg::decode_rgba(&jpg).expect("gpu decode id-0 jpeg");
+    assert_eq!((w, h), (96, 80));
+    let mut worst = 0i32;
+    let mut sum = 0i64;
+    for i in 0..zrgb.len() / 3 {
+        for c in 0..3 {
+            let d = (zrgb[i * 3 + c] as i32 - rgba[i * 4 + c] as i32).abs();
+            worst = worst.max(d);
+            sum += d as i64;
+        }
+    }
+    assert!(
+        worst <= 4 && sum * 10 < zrgb.len() as i64,
+        "gpu vs zune: worst {worst} mean {:.3}",
+        sum as f64 / zrgb.len() as f64
+    );
+}
+
 #[test]
 fn non_jpeg_falls_back() {
     assert_eq!(gpujpeg::decode_rgba(b"not a jpeg at all"), None);
@@ -424,4 +522,56 @@ fn concurrent_inflight_images() {
     for h in handles {
         h.join().unwrap();
     }
+}
+
+/// Rewrite the SOF width/height — fake huge dims without a huge image.
+fn patch_sof_dims(jpg: &[u8], w: u16, h: u16) -> Vec<u8> {
+    let mut out = jpg.to_vec();
+    let mut p = 2usize;
+    while p + 10 <= out.len() && out[p] == 0xFF {
+        let m = out[p + 1];
+        if m == 0x00 || m == 0x01 || (0xD0..=0xD9).contains(&m) {
+            p += 2;
+            continue;
+        }
+        if m == 0xDA {
+            break;
+        }
+        let len = u16::from_be_bytes([out[p + 2], out[p + 3]]) as usize;
+        if p + 2 + len > out.len() {
+            break;
+        }
+        if (0xC0..=0xCF).contains(&m) && m != 0xC4 && m != 0xC8 && m != 0xCC {
+            out[p + 5..p + 7].copy_from_slice(&h.to_be_bytes());
+            out[p + 7..p + 9].copy_from_slice(&w.to_be_bytes());
+            return out;
+        }
+        p += 2 + len;
+    }
+    panic!("no SOF marker found");
+}
+
+/// A JPEG whose GPU buffers would exceed the device limits must be
+/// refused (None → CPU fallback), never panic inside create_buffer.
+#[test]
+fn oversized_jpeg_falls_back() {
+    if !gpujpeg::available() {
+        eprintln!("gpujpeg not compiled in — skipping");
+        return;
+    }
+    let img = image::DynamicImage::ImageRgb8(image::RgbImage::from_fn(16, 16, |x, y| {
+        image::Rgb([(x * 16) as u8, (y * 16) as u8, 128])
+    }));
+    let mut jpg = Vec::new();
+    img.write_to(&mut std::io::Cursor::new(&mut jpg), image::ImageFormat::Jpeg)
+        .expect("encode jpeg");
+
+    // 65535×65535 needs tens of GB of coefficient/RGBA buffers — far
+    // past any adapter's max_buffer_size / binding limits.
+    let jpg = patch_sof_dims(&jpg, u16::MAX, u16::MAX);
+    let (w, h, _) = gpujpeg::probe(&jpg).expect("probe still parses");
+    assert_eq!((w, h), (u16::MAX as u32, u16::MAX as u32));
+
+    assert!(gpujpeg::open(&jpg).is_none(), "oversized decode must fall back");
+    assert!(gpujpeg::decode_rgba(&jpg).is_none());
 }

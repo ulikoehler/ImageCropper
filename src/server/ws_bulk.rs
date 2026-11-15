@@ -152,9 +152,12 @@ fn produce_full(path: &std::path::Path, fmt: u8, quality: u8) -> Option<(Vec<u8>
         _ => {
             let bytes = std::fs::read(path).ok()?;
             // Restart-marker JPEGs: GPU decode + resize in one session —
-            // the full-res image never reaches the host.
-            let (img, engine) = match crate::gpujpeg::open(&bytes) {
-                Some(session) => (session.resize_image(FULL_MAX_DIM, FULL_MAX_DIM)?, "gpu"),
+            // the full-res image never reaches the host. A session whose
+            // resample buffers exceed the device limits falls back to CPU.
+            let (img, engine) = match crate::gpujpeg::open(&bytes)
+                .and_then(|s| s.resize_image(FULL_MAX_DIM, FULL_MAX_DIM))
+            {
+                Some(img) => (img, "gpu"),
                 None => {
                     let img = decode_image_bytes(path, &bytes).ok()?;
                     (resize_to_fit(img, FULL_MAX_DIM, FULL_MAX_DIM), "cpu")
