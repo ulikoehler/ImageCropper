@@ -391,14 +391,41 @@ pub fn move_with_unique_name(source: &Path, target_dir: &Path) -> Result<PathBuf
         .file_name()
         .ok_or_else(|| anyhow!("{} has no file name", source.display()))?;
     let destination = unique_destination(target_dir, file_name);
-    fs::rename(source, &destination).with_context(|| {
-        format!(
+    match fs::rename(source, &destination) {
+        Ok(()) => Ok(destination),
+        Err(e) if e.kind() == std::io::ErrorKind::CrossesDevices => {
+            // rename(2) can't span filesystems (e.g. the /nastmp CIFS
+            // mount → local disk): copy the bytes, keep the mtime like
+            // mv does, then remove the source.
+            let mtime = fs::metadata(source).and_then(|m| m.modified()).ok();
+            if let Err(e) = fs::copy(source, &destination) {
+                let _ = fs::remove_file(&destination); // no truncated leftovers
+                return Err(anyhow!(e).context(format!(
+                    "Unable to copy {} to {}",
+                    source.display(),
+                    destination.display()
+                )));
+            }
+            if let Some(t) = mtime {
+                if let Ok(f) = fs::File::options().write(true).open(&destination) {
+                    let _ = f.set_modified(t);
+                }
+            }
+            fs::remove_file(source).with_context(|| {
+                format!(
+                    "Copied {} to {} but unable to remove the source",
+                    source.display(),
+                    destination.display()
+                )
+            })?;
+            Ok(destination)
+        }
+        Err(e) => Err(anyhow!(e).context(format!(
             "Unable to move {} to {}",
             source.display(),
             destination.display()
-        )
-    })?;
-    Ok(destination)
+        ))),
+    }
 }
 
 pub fn unique_destination(dir: &Path, file_name: &OsStr) -> PathBuf {

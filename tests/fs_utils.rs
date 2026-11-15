@@ -127,6 +127,49 @@ fn move_with_unique_name_avoids_overwrites() {
 }
 
 #[test]
+fn move_with_unique_name_crosses_filesystems() {
+    // rename(2) fails with EXDEV across mounts — the move must fall
+    // back to copy+remove. /dev/shm (tmpfs) and the target tmpdir
+    // (repo filesystem) are on different devices on typical dev
+    // machines; skip when they aren't.
+    use std::os::unix::fs::MetadataExt;
+    let src_root = Path::new("/dev/shm");
+    let dst_root = Path::new(env!("CARGO_TARGET_TMPDIR"));
+    if fs::metadata(src_root).unwrap().dev() == fs::metadata(dst_root).unwrap().dev() {
+        eprintln!("skipping: source and target share a filesystem");
+        return;
+    }
+    let tag = format!("ic-mv-xdev-{}", std::process::id());
+    let src_dir = src_root.join(&tag);
+    let dst_dir = dst_root.join(&tag);
+    fs::create_dir_all(&src_dir).unwrap();
+    fs::create_dir_all(&dst_dir).unwrap();
+
+    let source = src_dir.join("photo.jpg");
+    fs::write(&source, b"payload").unwrap();
+    let mtime = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000);
+    fs::File::options()
+        .write(true)
+        .open(&source)
+        .unwrap()
+        .set_modified(mtime)
+        .unwrap();
+
+    let moved = move_with_unique_name(&source, &dst_dir).unwrap();
+    assert!(!source.exists());
+    assert_eq!(moved, dst_dir.join("photo.jpg"));
+    assert_eq!(fs::read(&moved).unwrap(), b"payload");
+    assert_eq!(
+        fs::metadata(&moved).unwrap().modified().unwrap(),
+        mtime,
+        "cross-device move must preserve mtime"
+    );
+
+    let _ = fs::remove_dir_all(&src_dir);
+    let _ = fs::remove_dir_all(&dst_dir);
+}
+
+#[test]
 fn split_name_handles_extensions_and_plain_names() {
     let (stem, ext) = split_name(OsStr::new("photo.avif"));
     assert_eq!(stem, "photo");
