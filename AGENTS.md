@@ -17,6 +17,13 @@ systemd-run --user --scope --quiet -p MemoryMax=6G --unit ic-build --collect \
 - If the scope gets `oom-kill`ed during `Compiling`, lower jobs further.
 - `dav1d` builds against the system `libdav1d-dev` (installed); the
   `SYSTEM_DEPS_DAV1D_BUILD_INTERNAL=always` fallback is no longer needed.
+- AVIF decode (dav1d, the only C dep) is behind the default `avif-decode`
+  feature; AVIF *encode* (ravif/rav1e) is always on. For a fully static
+  binary (e.g. old-glibc hosts like the Synology NAS at 10.9.2.200, glibc
+  2.36):
+  `cargo rustc --release --no-default-features --bin imagecropper -- -C target-feature=+crt-static`
+  Static glibc can't `dlopen`, so wgpu/Vulkan paths are dead — CPU
+  fallbacks only. Note `/tmp` on that NAS is `noexec`; run from `$HOME`.
 - GPU JPEG decode: `src/gpujpeg/` — pure-Rust wgpu/WGSL port of the
   former C++/Vulkan decoder, bit-exact vs libjpeg-turbo. Baseline and
   progressive (SOF2) both decode on GPU; DRI=0 scans get virtual

@@ -7,6 +7,14 @@ repository = "https://github.com/ulikoehler/ImageCropper"
 description = "Batch interactive image cropper with multicrop support"
 license = "Apache-2.0"
 
+[features]
+default = ["avif-decode"]
+# AVIF decoding via dav1d (C library, needs libdav1d.so at runtime).
+# AVIF *encoding* is always enabled (pure-Rust ravif/rav1e via image/avif).
+# Build without it for static or libdav1d-free targets:
+#   cargo build --release --no-default-features
+avif-decode = ["image/avif-native"]
+
 [dependencies]
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
@@ -34,7 +42,7 @@ webbrowser = "1"
 sha2 = "0.10"
 
 [target.'cfg(not(target_os = "windows"))'.dependencies]
-image = { version = "0.25", default-features = false, features = ["jpeg", "png", "bmp", "gif", "ico", "tiff", "webp", "avif", "avif-native"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "bmp", "gif", "ico", "tiff", "webp", "avif"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "bmp", "gif", "ico", "tiff", "webp", "avif"] }

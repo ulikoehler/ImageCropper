@@ -18,6 +18,9 @@ and ensure `~/.cargo/bin` is in your `PATH`. Then, you can just run
 imagecropper crop <DIRECTORY>
 ```
 
+For headless servers and Synology NAS (static build, no GPU/AVIF-decode),
+see [docs/synology.md](docs/synology.md).
+
 ### Simple cropping
 
 ```sh
