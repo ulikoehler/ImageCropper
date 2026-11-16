@@ -105,6 +105,9 @@ const FAIL_TTL: Duration = Duration::from_secs(300);
 fn fail_reusable(entry: &FailEntry, cur_sig: Option<u64>) -> bool {
     match entry.fail.kind {
         "decode" | "encode" => entry.sig != 0 && Some(entry.sig) == cur_sig,
+        // A gone file is dropped from the manifest on first sight; if it
+        // is re-created the produce must run again, so never reuse.
+        "gone" => false,
         _ => entry.at.elapsed() < FAIL_TTL,
     }
 }
@@ -130,6 +133,7 @@ fn fail_hit(
                 .or_else(|| crate::fs_utils::previews::preview_sig_u64(path));
             fail_reusable(&e, cur)
         }
+        "gone" => false,
         _ => e.at.elapsed() < FAIL_TTL,
     };
     reusable.then_some(e.fail)

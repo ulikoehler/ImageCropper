@@ -774,6 +774,11 @@ impl ServerState {
                 for (path, preview) in state.previews.poll() {
                     if let Err(f) = &preview {
                         state.dbg.note_preview_err(f.kind);
+                        // Deleted outside ImageCropper — background
+                        // produces (preload/pins) discover it too.
+                        if f.kind == "gone" {
+                            state.remove_path(&path);
+                        }
                     }
                     if let Some(id) = state.position_of(&path) {
                         let dims = preview

@@ -164,3 +164,46 @@ fn unpinned_previews_produce_without_ram_retention() {
         }
     });
 }
+
+/// A file deleted outside ImageCropper is discovered by the pin-driven
+/// background produce: the ENOENT classifies as `gone` and the item is
+/// tombstoned from the manifest — no client request or watcher needed.
+#[test]
+fn externally_deleted_file_is_removed_from_manifest() {
+    use std::time::{Duration, Instant};
+    with_temp_workdir(|root| {
+        let mut files = Vec::new();
+        for i in 0..3u32 {
+            let p = root.join(format!("g{i}.png"));
+            write_image(&p, &solid_image(8, 8, [i as u8, 4, 4, 255]));
+            files.push(p);
+        }
+        // Gone before the server starts: the manifest still lists it
+        // (build keeps every listed path), and the constructor's
+        // request_all queues its produce — the first attempt hits
+        // ENOENT. No watcher runs in tests, so only the produce path
+        // can notice.
+        std::fs::remove_file(&files[1]).unwrap();
+        let state = std::sync::Arc::new(ServerState::new(
+            files.clone(),
+            vec![root.to_path_buf()],
+            ServeMode::Album,
+            imagecropper::cli::MouseSelectMode::Sequence,
+            1,
+            None,
+            4096,
+            None,
+            false,
+        ));
+        state.spawn_pumps();
+
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while state.position_of(&files[1]).is_some() {
+            assert!(Instant::now() < deadline, "gone file was not removed");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        // Siblings are untouched.
+        assert!(state.position_of(&files[0]).is_some());
+        assert!(state.position_of(&files[2]).is_some());
+    });
+}

@@ -93,6 +93,20 @@ impl PreviewFail {
     pub fn io(sig: u64, err: &std::io::Error) -> Self {
         Self::new("io", sig, err.to_string())
     }
+    /// Failure touching the *source* file — `NotFound` means it was
+    /// deleted outside ImageCropper (manual delete, another client, a
+    /// dropped mount), so it becomes kind `"gone"` and the server drops
+    /// the item from the listing instead of reporting a retryable
+    /// preview error. Cache-file reads must keep [`Self::io`]: a missing
+    /// cache entry is a miss, not a deleted source.
+    pub fn source_io(sig: u64, err: &std::io::Error) -> Self {
+        let kind = if err.kind() == std::io::ErrorKind::NotFound {
+            "gone"
+        } else {
+            "io"
+        };
+        Self::new(kind, sig, err.to_string())
+    }
     /// Source bytes could not be decoded as an image.
     pub fn decode(sig: u64, err: impl std::fmt::Display) -> Self {
         Self::new("decode", sig, err.to_string())
@@ -182,7 +196,7 @@ pub fn produce_screen_jpeg(
         Some(s) if s != 0 => s,
         _ => {
             let (len, nanos) = source_signature_ex(source)
-                .map_err(|e| PreviewFail::io(0, &e))?;
+                .map_err(|e| PreviewFail::source_io(0, &e))?;
             sig_u64(len, nanos)
         }
     };
@@ -543,7 +557,8 @@ pub fn produce_preview_image(
         }
     }
 
-    let (len, nanos) = source_signature_ex(path).map_err(|e| PreviewFail::io(0, &e))?;
+    let (len, nanos) = source_signature_ex(path)
+        .map_err(|e| PreviewFail::source_io(0, &e))?;
     let sig64 = sig_u64(len, nanos);
 
     // Fast path: the pack has a current-signature thumbnail for this file.
@@ -571,7 +586,7 @@ pub fn produce_preview_image(
     // through to the CPU decode. The fullscreen preview is NOT generated
     // here — it is produced lazily on hold-`f`/screen-fill, never inline
     // on the thumbnail hot path.
-    let bytes = std::fs::read(path).map_err(|e| PreviewFail::io(sig64, &e))?;
+    let bytes = std::fs::read(path).map_err(|e| PreviewFail::source_io(sig64, &e))?;
     let hash = sha256_hex(&bytes);
     let thumb = match crate::gpujpeg::open(&bytes)
         .and_then(|s| s.resize_image(THUMB_MAX_DIM, THUMB_MAX_DIM))
@@ -639,7 +654,8 @@ pub fn produce_preview_bytes(
         }
     }
 
-    let (len, nanos) = source_signature_ex(path).map_err(|e| PreviewFail::io(0, &e))?;
+    let (len, nanos) = source_signature_ex(path)
+        .map_err(|e| PreviewFail::source_io(0, &e))?;
     let sig64 = sig_u64(len, nanos);
 
     if let Some(pack) = crate::fs_utils::pack::pack_for(&dir) {
@@ -666,7 +682,7 @@ pub fn produce_preview_bytes(
         }
     }
 
-    let bytes = std::fs::read(path).map_err(|e| PreviewFail::io(sig64, &e))?;
+    let bytes = std::fs::read(path).map_err(|e| PreviewFail::source_io(sig64, &e))?;
     // The source is already in memory — the content hash is nearly free and
     // becomes the preview's authoritative metadata.
     let hash = sha256_hex(&bytes);

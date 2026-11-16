@@ -91,9 +91,10 @@ async fn handle(socket: WebSocket, state: Arc<ServerState>) {
                         // A full-resolution read is a live client request:
                         // background work (deletes, preload) yields to it.
                         let gate = state.io_gate.clone();
+                        let produce_path = path.clone();
                         let produced = tokio::task::spawn_blocking(move || {
                             let _client = gate.client_work();
-                            produce_full(&path, want_fmt, q)
+                            produce_full(&produce_path, want_fmt, q)
                         })
                         .await
                         .ok();
@@ -125,6 +126,12 @@ async fn handle(socket: WebSocket, state: Arc<ServerState>) {
                             // then an empty terminating chunk so the
                             // request resolves instead of timing out.
                             Some(Err(fail)) => {
+                                // Source deleted outside ImageCropper —
+                                // drop it from the listing like an action
+                                // delete would.
+                                if fail.kind == "gone" {
+                                    state.remove_path(&path);
+                                }
                                 let mut head = full_head_payload(sig, 0, 0, want_fmt, 0);
                                 head.extend_from_slice(fail.msg.as_bytes());
                                 let _ = out_tx
@@ -179,13 +186,13 @@ fn produce_full(
         FMT_SCREEN => crate::fs_utils::previews::produce_screen_jpeg(path, None),
         FMT_ORIGINAL => {
             let bytes = std::fs::read(path)
-                .map_err(|e| PreviewFail::io(0, &e))?;
+                .map_err(|e| PreviewFail::source_io(0, &e))?;
             let (w, h) = image::image_dimensions(path).unwrap_or((0, 0));
             Ok((bytes, w, h))
         }
         _ => {
             let bytes = std::fs::read(path)
-                .map_err(|e| PreviewFail::io(0, &e))?;
+                .map_err(|e| PreviewFail::source_io(0, &e))?;
             // Restart-marker JPEGs: GPU decode + resize in one session —
             // the full-res image never reaches the host. A session whose
             // resample buffers exceed the device limits falls back to CPU.

@@ -247,9 +247,16 @@ fn produce_failure_is_cached_and_reported() {
         "known-bad path must not be queued"
     );
 
-    // A missing file reports `io`, also cached.
-    let gone = tmp.path().join("gone.jpg");
+    // A missing file reports `gone` — the server drops it from the
+    // listing. It is never fail-cached: each attempt re-stats, and a
+    // re-created file must produce immediately.
+    let gone = tmp.path().join("gone.png");
     let err3 = store.get_or_produce(&gone).unwrap_err();
-    assert_eq!(err3.kind, "io");
-    assert_eq!(store.get_or_produce(&gone).unwrap_err().kind, "io");
+    assert_eq!(err3.kind, "gone");
+    assert_eq!(store.get_or_produce(&gone).unwrap_err().kind, "gone");
+
+    // Re-create the file — the next produce must succeed, not serve a
+    // stale "gone" from the failure cache.
+    write_image(&gone, &solid_image(64, 64, [1, 2, 3, 255]));
+    assert!(store.get_or_produce(&gone).is_ok());
 }

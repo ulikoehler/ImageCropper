@@ -255,6 +255,7 @@ async fn handle(socket: WebSocket, state: Arc<ServerState>) {
                 // per group instead of one per thumb cuts message dispatch
                 // and lets the client decode them in parallel off one Blob.
                 let mut batch: Vec<(u32, u64, Vec<u8>)> = Vec::new();
+                let mut gone_paths: Vec<std::path::PathBuf> = Vec::new();
                 while let Some(done) = handles.next().await {
                     let Ok((id, path, sig, produced)) = done else {
                         continue;
@@ -268,6 +269,11 @@ async fn handle(socket: WebSocket, state: Arc<ServerState>) {
                                 std::sync::atomic::Ordering::Relaxed,
                             );
                             state.dbg.note_preview_err(f.kind);
+                            // Deleted outside ImageCropper — drop it from
+                            // the listing once the queue lock is released.
+                            if f.kind == "gone" {
+                                gone_paths.push(path);
+                            }
                         }
                         Some(Ok(p)) => {
                             // Re-verify the id still names the produced file —
@@ -321,6 +327,9 @@ async fn handle(socket: WebSocket, state: Arc<ServerState>) {
                     let _ = out_tx
                         .send(Frame::new(EV_THUMB_BATCH, 0, thumb_batch_payload(&batch)))
                         .await;
+                }
+                for path in gone_paths {
+                    state.remove_path(&path);
                 }
             }
         })
@@ -392,11 +401,12 @@ async fn handle(socket: WebSocket, state: Arc<ServerState>) {
                         let out_tx = out_tx.clone();
                         let ev_tx = ev_tx.clone();
                         let state = state.clone();
+                        let produce_path = path.clone();
                         tokio::spawn(async move {
                             let res = tokio::time::timeout(
                                 PRODUCE_TIMEOUT,
                                 tokio::task::spawn_blocking(move || {
-                                    previews.get_or_produce(&path)
+                                    previews.get_or_produce(&produce_path)
                                 }),
                             )
                             .await;
@@ -431,6 +441,12 @@ async fn handle(socket: WebSocket, state: Arc<ServerState>) {
                                         std::sync::atomic::Ordering::Relaxed,
                                     );
                                     state.dbg.note_preview_err(f.kind);
+                                    // Deleted outside ImageCropper — drop
+                                    // it from the listing like an action
+                                    // delete would.
+                                    if f.kind == "gone" {
+                                        state.remove_path(&path);
+                                    }
                                     // A wanted thumbnail that failed must
                                     // reach the client — silence leaves the
                                     // tile spinning forever. `sig` goes out
@@ -495,11 +511,12 @@ async fn handle(socket: WebSocket, state: Arc<ServerState>) {
                             let ev_tx = ev_tx.clone();
                             let state = state.clone();
                             let req_id = frame.req_id;
+                            let produce_path = path.clone();
                             tokio::spawn(async move {
                                 let produced = tokio::time::timeout(
                                     PRODUCE_TIMEOUT,
                                     tokio::task::spawn_blocking(move || {
-                                        previews.regenerate(&path)
+                                        previews.regenerate(&produce_path)
                                     }),
                                 )
                                 .await;
@@ -518,6 +535,9 @@ async fn handle(socket: WebSocket, state: Arc<ServerState>) {
                                     // visibly instead of spinning.
                                     Ok(Ok(Err(f))) => {
                                         state.dbg.note_preview_err(f.kind);
+                                        if f.kind == "gone" {
+                                            state.remove_path(&path);
+                                        }
                                         if let Ok(json) = serde_json::to_string(
                                             &serde_json::json!({
                                                 "ev": "thumb-error",
