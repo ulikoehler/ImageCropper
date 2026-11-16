@@ -220,3 +220,36 @@ fn concurrent_produce_of_same_path_all_succeed() {
     });
     assert_eq!(store.inflight_len(), 0, "no leaked in-flight slots");
 }
+
+/// A file that cannot be decoded fails once with a classified error,
+/// then every subsequent produce answers from the failure cache — the
+/// client gets the same `Err` without another read+decode, and the
+/// background queue refuses to burn a worker on it.
+#[test]
+fn produce_failure_is_cached_and_reported() {
+    let tmp = tempdir().unwrap();
+    let bad = tmp.path().join("bad.jpg");
+    std::fs::write(&bad, b"this is not a jpeg").unwrap();
+    let store = imagecropper::server::PreviewStore::new(2, 4);
+
+    let err = store.get_or_produce(&bad).unwrap_err();
+    assert_eq!(err.kind, "decode");
+    assert!(!err.msg.is_empty());
+
+    // Same file state → cached failure, still classified.
+    let err2 = store.get_or_produce(&bad).unwrap_err();
+    assert_eq!(err2.kind, "decode");
+
+    // The background queue refuses known-bad paths outright.
+    store.request(bad.clone());
+    assert!(
+        store.pending.lock().unwrap().is_empty(),
+        "known-bad path must not be queued"
+    );
+
+    // A missing file reports `io`, also cached.
+    let gone = tmp.path().join("gone.jpg");
+    let err3 = store.get_or_produce(&gone).unwrap_err();
+    assert_eq!(err3.kind, "io");
+    assert_eq!(store.get_or_produce(&gone).unwrap_err().kind, "io");
+}

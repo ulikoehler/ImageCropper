@@ -100,6 +100,9 @@ pub struct DbgStats {
     pub stale_skip: std::sync::atomic::AtomicU64,
     /// CL_CREDIT bytes granted by clients.
     pub credit_recv: std::sync::atomic::AtomicU64,
+    /// Preview produce failures by kind (`io`, `decode`, `encode`, …) —
+    /// the breakdown behind `produce_none`.
+    pub preview_errs: std::sync::Mutex<std::collections::HashMap<String, u64>>,
     /// Scan feeder progress (mirrors the stderr counters).
     pub scan_found: std::sync::atomic::AtomicU64,
     pub scan_done: std::sync::atomic::AtomicBool,
@@ -107,6 +110,18 @@ pub struct DbgStats {
     pub queues: std::sync::Mutex<std::collections::HashMap<u64, serde_json::Value>>,
     /// Connection id allocator (debug output only).
     pub next_conn: std::sync::atomic::AtomicU64,
+}
+
+impl DbgStats {
+    /// Count one preview produce failure by kind.
+    pub fn note_preview_err(&self, kind: &str) {
+        *self
+            .preview_errs
+            .lock()
+            .unwrap()
+            .entry(kind.to_string())
+            .or_insert(0) += 1;
+    }
 }
 
 impl ServerState {
@@ -757,9 +772,13 @@ impl ServerState {
                 }
                 // Preview completions → per-path ready events.
                 for (path, preview) in state.previews.poll() {
+                    if let Err(f) = &preview {
+                        state.dbg.note_preview_err(f.kind);
+                    }
                     if let Some(id) = state.position_of(&path) {
                         let dims = preview
                             .as_ref()
+                            .ok()
                             .map(|p| format!(",\"w\":{},\"h\":{}", p.w, p.h))
                             .unwrap_or_default();
                         let _ = state.events.send(ServerEvent::Json(format!(

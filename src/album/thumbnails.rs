@@ -52,11 +52,15 @@ impl Thumbnailer {
         Self {
             pool: AdaptivePool::new(2, concurrency.max(1), move |path| {
                 let sig = thumb_sigs.lock().unwrap().get(path).copied();
-                produce_preview_image(path, sig).map(|i| to_color_image(&i))
+                produce_preview_image(path, sig)
+                    .ok()
+                    .map(|i| to_color_image(&i))
             }),
             screen_pool: AdaptivePool::new(2, 4, move |path| {
                 let sig = screen_sigs.lock().unwrap().get(path).copied();
-                produce_screen_image(path, sig).map(|i| to_color_image(&i))
+                produce_screen_image(path, sig)
+                    .ok()
+                    .map(|i| to_color_image(&i))
             }),
             pending: HashSet::new(),
             pending_screen: HashSet::new(),

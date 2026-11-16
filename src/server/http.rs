@@ -77,6 +77,7 @@ pub async fn debugz(State(state): State<Arc<ServerState>>) -> impl IntoResponse 
             "rewant_regen": d.rewant_regen.load(Relaxed),
             "produce_none": d.produce_none.load(Relaxed),
             "produce_timeout": d.produce_timeout.load(Relaxed),
+            "preview_errs": d.preview_errs.lock().unwrap().clone(),
             "stale_skip": d.stale_skip.load(Relaxed),
             "credit_recv": d.credit_recv.load(Relaxed),
         },

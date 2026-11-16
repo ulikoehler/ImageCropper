@@ -12,6 +12,7 @@ use axum::{
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
 
+use crate::fs_utils::previews::PreviewFail;
 use crate::image_utils::{decode_image_bytes, resize_to_fit};
 
 use super::{proto::*, ServerState};
@@ -95,17 +96,45 @@ async fn handle(socket: WebSocket, state: Arc<ServerState>) {
                             produce_full(&path, want_fmt, q)
                         })
                         .await
-                        .ok()
-                        .flatten();
-                        if let Some(((bytes, w, h), sig)) = produced.zip(item.map(|i| i.sig)) {
-                            let _ = out_tx
-                                .send(Frame::new(
-                                    BK_FULL_HEAD,
-                                    req_id,
-                                    full_head_payload(sig, w, h, want_fmt, bytes.len() as u64),
-                                ))
-                                .await;
-                            send_chunked(&out_tx, req_id, BK_FULL_CHUNK, bytes).await;
+                        .ok();
+                        // `item` supplies the manifest sig for the reply
+                        // head; gone mid-flight → drop silently as before.
+                        let Some(sig) = item.map(|i| i.sig) else {
+                            return;
+                        };
+                        match produced {
+                            Some(Ok((bytes, w, h))) => {
+                                let _ = out_tx
+                                    .send(Frame::new(
+                                        BK_FULL_HEAD,
+                                        req_id,
+                                        full_head_payload(
+                                            sig,
+                                            w,
+                                            h,
+                                            want_fmt,
+                                            bytes.len() as u64,
+                                        ),
+                                    ))
+                                    .await;
+                                send_chunked(&out_tx, req_id, BK_FULL_CHUNK, bytes).await;
+                            }
+                            // Produce failed — answer with a HEAD whose
+                            // w/h are 0 and the reason appended after the
+                            // fixed fields (older clients ignore the tail),
+                            // then an empty terminating chunk so the
+                            // request resolves instead of timing out.
+                            Some(Err(fail)) => {
+                                let mut head = full_head_payload(sig, 0, 0, want_fmt, 0);
+                                head.extend_from_slice(fail.msg.as_bytes());
+                                let _ = out_tx
+                                    .send(Frame::new(BK_FULL_HEAD, req_id, head))
+                                    .await;
+                                send_chunked(&out_tx, req_id, BK_FULL_CHUNK, Vec::new()).await;
+                            }
+                            // Join error (worker panic) — same silence as
+                            // before; the client's bulk timeout covers it.
+                            None => {}
                         }
                     });
                 }
@@ -140,17 +169,23 @@ async fn send_chunked(out_tx: &mpsc::Sender<Frame>, req_id: u32, msg_type: u8, p
 
 /// Produce a full-image payload: original bytes, or a JPEG re-encode of the
 /// resized (≤FULL_MAX_DIM) decode. Returns (bytes, w, h) of the *decoded*
-/// image for layout purposes.
-fn produce_full(path: &std::path::Path, fmt: u8, quality: u8) -> Option<(Vec<u8>, u32, u32)> {
+/// image for layout purposes, or the reason production failed.
+fn produce_full(
+    path: &std::path::Path,
+    fmt: u8,
+    quality: u8,
+) -> Result<(Vec<u8>, u32, u32), PreviewFail> {
     match fmt {
         FMT_SCREEN => crate::fs_utils::previews::produce_screen_jpeg(path, None),
         FMT_ORIGINAL => {
-            let bytes = std::fs::read(path).ok()?;
+            let bytes = std::fs::read(path)
+                .map_err(|e| PreviewFail::io(0, &e))?;
             let (w, h) = image::image_dimensions(path).unwrap_or((0, 0));
-            Some((bytes, w, h))
+            Ok((bytes, w, h))
         }
         _ => {
-            let bytes = std::fs::read(path).ok()?;
+            let bytes = std::fs::read(path)
+                .map_err(|e| PreviewFail::io(0, &e))?;
             // Restart-marker JPEGs: GPU decode + resize in one session —
             // the full-res image never reaches the host. A session whose
             // resample buffers exceed the device limits falls back to CPU.
@@ -159,7 +194,8 @@ fn produce_full(path: &std::path::Path, fmt: u8, quality: u8) -> Option<(Vec<u8>
             {
                 Some(img) => (img, "gpu"),
                 None => {
-                    let img = decode_image_bytes(path, &bytes).ok()?;
+                    let img = decode_image_bytes(path, &bytes)
+                        .map_err(|e| PreviewFail::decode(0, e))?;
                     (resize_to_fit(img, FULL_MAX_DIM, FULL_MAX_DIM), "cpu")
                 }
             };
@@ -172,8 +208,10 @@ fn produce_full(path: &std::path::Path, fmt: u8, quality: u8) -> Option<(Vec<u8>
                 std::io::BufWriter::new(std::io::Cursor::new(&mut out)),
                 if quality == 0 { 80 } else { quality },
             );
-            img.to_rgb8().write_with_encoder(encoder).ok()?;
-            Some((out, w, h))
+            img.to_rgb8()
+                .write_with_encoder(encoder)
+                .map_err(|_| PreviewFail::encode(0))?;
+            Ok((out, w, h))
         }
     }
 }

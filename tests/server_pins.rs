@@ -33,7 +33,7 @@ fn pinned_previews_are_never_evicted() {
 
         // Fill the RAM cache: the pinned two first, then pressure.
         for p in &paths {
-            assert!(store.get_or_produce(p).is_some());
+            assert!(store.get_or_produce(p).is_ok());
         }
 
         assert!(
@@ -58,7 +58,7 @@ fn unpinned_previews_still_rotate() {
         }
         let store = store(2, 0);
         for p in &paths {
-            assert!(store.get_or_produce(p).is_some());
+            assert!(store.get_or_produce(p).is_ok());
         }
         let cached: Vec<_> = paths.iter().filter(|p| store.cached(p).is_some()).collect();
         assert_eq!(cached.len(), 2, "capacity is respected");
@@ -121,13 +121,13 @@ fn unpinned_previews_produce_without_ram_retention() {
         // RAM = the pinned set only (the server runs 0 unpinned + PIN_LIMIT).
         let store = store(0, 2);
         store.set_pins(vec![paths[0].clone(), paths[1].clone()]);
-        assert!(store.get_or_produce(&paths[0]).is_some());
-        assert!(store.get_or_produce(&paths[1]).is_some());
+        assert!(store.get_or_produce(&paths[0]).is_ok());
+        assert!(store.get_or_produce(&paths[1]).is_ok());
 
         // RAM is now entirely pinned — a third preview still produces and
         // persists, but is not kept resident.
         assert!(
-            store.get_or_produce(&paths[2]).is_some(),
+            store.get_or_produce(&paths[2]).is_ok(),
             "produce must not stop at the RAM cap"
         );
         assert!(
@@ -150,7 +150,7 @@ fn unpinned_previews_produce_without_ram_retention() {
             }
             std::thread::sleep(Duration::from_millis(10));
         }
-        assert!(matches!(got, Some(Some(_))), "pool produce did not finish");
+        assert!(matches!(got, Some(Ok(_))), "pool produce did not finish");
         assert!(store.cached(&paths[3]).is_none());
 
         // Over-cap work was still persisted: a later want is a pack hit,

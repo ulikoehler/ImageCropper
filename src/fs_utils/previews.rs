@@ -10,7 +10,7 @@
 use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
-    time::UNIX_EPOCH,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use image::DynamicImage;
@@ -35,14 +35,26 @@ pub const PREVIEW_JPEG_QUALITY: u8 = 80;
 
 /// Signature used to detect that a source file changed: (size, mtime nanos).
 pub fn source_signature(path: &Path) -> Option<(u64, u128)> {
-    let meta = std::fs::metadata(path).ok()?;
+    source_signature_ex(path).ok()
+}
+
+/// [`source_signature`] with the io error preserved — preview production
+/// reports the reason to clients instead of collapsing it to `None`.
+pub fn source_signature_ex(path: &Path) -> std::io::Result<(u64, u128)> {
+    let meta = std::fs::metadata(path)?;
     let nanos = meta
         .modified()
         .ok()
         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    Some((meta.len(), nanos))
+    Ok((meta.len(), nanos))
+}
+
+/// Fold (len, mtime-nanos) into the u64 signature shared by the manifest,
+/// `files.pack`/`thumbs.pack` lookups and [`preview_sig_u64`].
+pub fn sig_u64(len: u64, nanos: u128) -> u64 {
+    len ^ nanos as u64 ^ (nanos >> 64) as u64
 }
 
 /// Compact u64 signature for protocol use (manifest, action preconditions).
@@ -50,7 +62,49 @@ pub fn source_signature(path: &Path) -> Option<(u64, u128)> {
 /// detecting changes to a given file.
 pub fn preview_sig_u64(path: &Path) -> Option<u64> {
     let (len, nanos) = source_signature(path)?;
-    Some(len ^ nanos as u64 ^ (nanos >> 64) as u64)
+    Some(sig_u64(len, nanos))
+}
+
+/// Why preview production failed. Carried to clients so a corrupt or
+/// unreadable source shows an error tile instead of an endless spinner,
+/// and counted per `kind` in `/debugz`.
+#[derive(Debug, Clone)]
+pub struct PreviewFail {
+    /// Stable category for counters/protocol: `"io"`, `"decode"`,
+    /// `"encode"`, `"cancelled"`, `"internal"`.
+    pub kind: &'static str,
+    /// Folded signature of the source state that failed (0 = the file
+    /// could not even be stat'ed, so no signature is known).
+    pub sig: u64,
+    /// Short human-readable reason, safe to show in the UI.
+    pub msg: String,
+}
+
+impl PreviewFail {
+    fn new(kind: &'static str, sig: u64, msg: impl Into<String>) -> Self {
+        Self {
+            kind,
+            sig,
+            msg: msg.into(),
+        }
+    }
+    /// Filesystem failure (stat/read) — `sig` is the resolved signature
+    /// when known, 0 otherwise.
+    pub fn io(sig: u64, err: &std::io::Error) -> Self {
+        Self::new("io", sig, err.to_string())
+    }
+    /// Source bytes could not be decoded as an image.
+    pub fn decode(sig: u64, err: impl std::fmt::Display) -> Self {
+        Self::new("decode", sig, err.to_string())
+    }
+    /// JPEG re-encode of the thumbnail failed.
+    pub fn encode(sig: u64) -> Self {
+        Self::new("encode", sig, "jpeg encode failed")
+    }
+    /// Ctrl-C shutdown — production was asked to stop, not an error.
+    pub fn cancelled() -> Self {
+        Self::new("cancelled", 0, "interrupted")
+    }
 }
 
 /// Deterministic preview file name for a source file: embeds the signature so
@@ -115,40 +169,143 @@ pub fn screen_preview_path(source: &Path) -> Option<PathBuf> {
 /// Read the cached fullscreen preview, generating + persisting it if
 /// missing. `sig_hint` carries a scan-time signature so the `stat` can
 /// be skipped entirely on slow mounts. Returns (jpeg bytes, w, h).
-pub fn produce_screen_jpeg(source: &Path, sig_hint: Option<u64>) -> Option<(Vec<u8>, u32, u32)> {
+pub fn produce_screen_jpeg(
+    source: &Path,
+    sig_hint: Option<u64>,
+) -> Result<(Vec<u8>, u32, u32), PreviewFail> {
     // Ctrl-C: no new production — this runs on detached blocking tasks that
     // outlive the pools' cancel.
     if sigint_received() {
-        return None;
+        return Err(PreviewFail::cancelled());
     }
-    let sig = sig_hint.or_else(|| preview_sig_u64(source))?;
+    let sig = match sig_hint {
+        Some(s) if s != 0 => s,
+        _ => {
+            let (len, nanos) = source_signature_ex(source)
+                .map_err(|e| PreviewFail::io(0, &e))?;
+            sig_u64(len, nanos)
+        }
+    };
     let path = screen_path_with_sig(source, sig);
     if !path.exists() {
         ensure_screen_preview(source, Some(sig));
     }
-    let jpeg = std::fs::read(&path).ok()?;
+    let jpeg = std::fs::read(&path).map_err(|e| PreviewFail::io(sig, &e))?;
     // Dimensions from the bytes in hand — never re-open the file.
     let (w, h) = image::ImageReader::new(std::io::Cursor::new(&jpeg))
         .with_guessed_format()
-        .ok()?
+        .map_err(|e| PreviewFail::decode(sig, e))?
         .into_dimensions()
         .unwrap_or((0, 0));
-    Some((jpeg, w, h))
+    Ok((jpeg, w, h))
 }
 
 /// Like [`produce_screen_jpeg`] but returns the decoded preview image —
 /// the form the native hold-`f` fullscreen view needs.
-pub fn produce_screen_image(source: &Path, sig_hint: Option<u64>) -> Option<DynamicImage> {
+pub fn produce_screen_image(
+    source: &Path,
+    sig_hint: Option<u64>,
+) -> Result<DynamicImage, PreviewFail> {
     let (jpeg, _, _) = produce_screen_jpeg(source, sig_hint)?;
-    decode_image_bytes(source, &jpeg).ok()
+    decode_image_bytes(source, &jpeg)
+        .map_err(|e| PreviewFail::decode(sig_hint.unwrap_or(0), e))
+}
+
+/// Cap for the global fullscreen-preview cache (`~/.cache/imagecropper/f`).
+/// These files are pure regenerable cache — the safe thing to delete when
+/// the disk fills — so the store is bounded LRU-by-mtime instead of
+/// growing forever.
+const SCREEN_CACHE_MAX_BYTES: u64 = 4 << 30; // 4 GiB
+/// How often the opportunistic GC may run per process.
+const SCREEN_GC_INTERVAL: Duration = Duration::from_secs(3600);
+/// Per-path backoff after a failed ensure — without it a persistently
+/// full disk burns a full decode+resize on every request for the same
+/// file.
+const SCREEN_FAIL_BACKOFF: Duration = Duration::from_secs(60);
+
+/// Paths whose last fullscreen-preview persist failed, with when.
+static SCREEN_FAIL: std::sync::LazyLock<
+    std::sync::Mutex<HashMap<PathBuf, Instant>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+/// Delete oldest fullscreen previews until the global cache fits
+/// [`SCREEN_CACHE_MAX_BYTES`]. Returns bytes freed. Every file under
+/// `f/` is a regenerable JPEG — nothing here is user data.
+fn screen_cache_gc() -> u64 {
+    screen_cache_gc_at(&cache_root().join("f"))
+}
+
+/// [`screen_cache_gc`] against an explicit cache root — split out so
+/// tests don't have to mutate `XDG_CACHE_HOME` process-wide.
+fn screen_cache_gc_at(root: &Path) -> u64 {
+    let Ok(dirs) = std::fs::read_dir(root) else {
+        return 0;
+    };
+    let mut files: Vec<(PathBuf, u64, SystemTime)> = Vec::new();
+    let mut total = 0u64;
+    for d in dirs.flatten() {
+        let Ok(entries) = std::fs::read_dir(d.path()) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            let Ok(meta) = e.metadata() else { continue };
+            if !meta.is_file() {
+                continue;
+            }
+            total += meta.len();
+            files.push((e.path(), meta.len(), meta.modified().unwrap_or(UNIX_EPOCH)));
+        }
+    }
+    if total <= SCREEN_CACHE_MAX_BYTES {
+        return 0;
+    }
+    files.sort_by_key(|(_, _, t)| *t);
+    let mut freed = 0u64;
+    for (path, len, _) in files {
+        if total <= SCREEN_CACHE_MAX_BYTES {
+            break;
+        }
+        if std::fs::remove_file(&path).is_ok() {
+            total -= len;
+            freed += len;
+        }
+    }
+    // Drop per-source dirs left empty by the sweep.
+    if let Ok(dirs) = std::fs::read_dir(root) {
+        for d in dirs.flatten() {
+            let _ = std::fs::remove_dir(d.path());
+        }
+    }
+    freed
+}
+
+/// Opportunistic GC — at most once per [`SCREEN_GC_INTERVAL`] per process.
+fn maybe_screen_gc() {
+    static LAST: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
+    {
+        let mut last = LAST.lock().unwrap();
+        if last.is_some_and(|t| t.elapsed() < SCREEN_GC_INTERVAL) {
+            return;
+        }
+        *last = Some(Instant::now());
+    }
+    let freed = screen_cache_gc();
+    if freed > 0 && verbose() {
+        eprintln!(
+            "screen cache gc: freed {:.1} GiB",
+            freed as f64 / (1u64 << 30) as f64
+        );
+    }
 }
 
 /// Prune stale signature variants in the per-source cache dir and
-/// write `jpeg` to `expected`.
-fn persist_screen_bytes(source: &Path, expected: &Path, jpeg: &[u8], engine: &str) {
+/// write `jpeg` to `expected`. On ENOSPC the screen cache is GC'd and the
+/// write retried once — it is regenerable data, the only safe cleanup.
+/// Returns whether the preview is persisted afterwards.
+fn persist_screen_bytes(source: &Path, expected: &Path, jpeg: &[u8], engine: &str) -> bool {
     let dir = screen_dir_for(source);
     if std::fs::create_dir_all(&dir).is_err() {
-        return;
+        return false;
     }
     // Prune stale variants (older signatures of the same source).
     let expected_name = expected.file_name().unwrap_or_default();
@@ -159,23 +316,31 @@ fn persist_screen_bytes(source: &Path, expected: &Path, jpeg: &[u8], engine: &st
             }
         }
     }
-    if std::fs::write(expected, jpeg).is_ok() && verbose() {
+    let ok = match std::fs::write(expected, jpeg) {
+        Ok(()) => true,
+        Err(e) if crate::fs_utils::is_no_space(&e) => {
+            screen_cache_gc();
+            std::fs::write(expected, jpeg).is_ok()
+        }
+        Err(_) => false,
+    };
+    if ok && verbose() {
         eprintln!("screen preview generated [{engine}]: {}", source.display());
     }
+    ok
 }
 
 /// JPEG-encode the resized `screen` image on CPU and persist it.
-fn persist_screen_jpeg(source: &Path, expected: &Path, screen: &DynamicImage, engine: &str) {
+/// Returns whether the preview is persisted afterwards.
+fn persist_screen_jpeg(source: &Path, expected: &Path, screen: &DynamicImage, engine: &str) -> bool {
     let mut jpeg = Vec::new();
-    {
+    let ok = {
         let writer = std::io::BufWriter::new(std::io::Cursor::new(&mut jpeg));
         let encoder =
             image::codecs::jpeg::JpegEncoder::new_with_quality(writer, PREVIEW_JPEG_QUALITY);
-        if screen.to_rgb8().write_with_encoder(encoder).is_err() {
-            return;
-        }
-    }
-    persist_screen_bytes(source, expected, &jpeg, engine);
+        screen.to_rgb8().write_with_encoder(encoder).is_ok()
+    };
+    ok && persist_screen_bytes(source, expected, &jpeg, engine)
 }
 
 /// Ensure a fullscreen-size preview exists in the global cache. `sig`
@@ -183,16 +348,39 @@ fn persist_screen_jpeg(source: &Path, expected: &Path, screen: &DynamicImage, en
 /// stat on slow mounts; a stale hint just misses `expected.exists()`
 /// and regenerates under the hinted name — the read below is current
 /// content either way, and stale variants are pruned on write.
+///
+/// Failures (full disk, unreadable source, undecodable file) back off
+/// per path for [`SCREEN_FAIL_BACKOFF`] so a persistently broken file
+/// doesn't burn a decode+resize on every request.
 pub(crate) fn ensure_screen_preview(source: &Path, sig: Option<u64>) {
+    {
+        let fails = SCREEN_FAIL.lock().unwrap();
+        if fails.get(source).is_some_and(|t| t.elapsed() < SCREEN_FAIL_BACKOFF) {
+            return;
+        }
+    }
+    maybe_screen_gc();
+    let ok = ensure_screen_preview_inner(source, sig);
+    let mut fails = SCREEN_FAIL.lock().unwrap();
+    if ok {
+        fails.remove(source);
+    } else {
+        fails.insert(source.to_path_buf(), Instant::now());
+    }
+}
+
+/// The ensure body — returns true when the preview exists afterwards
+/// (already cached or freshly persisted).
+fn ensure_screen_preview_inner(source: &Path, sig: Option<u64>) -> bool {
     let Some(sig) = sig.or_else(|| preview_sig_u64(source)) else {
-        return;
+        return false;
     };
     let expected = screen_path_with_sig(source, sig);
     if expected.exists() {
-        return;
+        return true;
     }
     let Some(bytes) = std::fs::read(source).ok() else {
-        return;
+        return false;
     };
     // GPU session path: decode+resize on the GPU — the full-res image
     // never materializes on the host.
@@ -200,15 +388,14 @@ pub(crate) fn ensure_screen_preview(source: &Path, sig: Option<u64>) {
         if let Some((jpeg, _, _)) =
             session.encode_resized(SCREEN_MAX_DIM, SCREEN_MAX_DIM, PREVIEW_JPEG_QUALITY.into())
         {
-            persist_screen_bytes(source, &expected, &jpeg, "gpu");
-            return;
+            return persist_screen_bytes(source, &expected, &jpeg, "gpu");
         }
     }
     let Some(img) = decode_image_bytes(source, &bytes).ok() else {
-        return;
+        return false;
     };
     let screen = resize_to_fit(img, SCREEN_MAX_DIM, SCREEN_MAX_DIM);
-    persist_screen_jpeg(source, &expected, &screen, "cpu");
+    persist_screen_jpeg(source, &expected, &screen, "cpu")
 }
 
 /// Remove stale previews of `source` inside `dir`, keeping `expected_name`.
@@ -326,8 +513,14 @@ fn preview_belongs_to(preview_name: &str, sources: &HashSet<String>) -> bool {
 /// Cache-hit I/O on slow/remote filesystems is kept minimal: at most one
 /// `stat` (signature) plus one `read` of the pack record — no directory
 /// scan, no touching the source.
-pub fn produce_preview_image(path: &Path, sig_hint: Option<u64>) -> Option<DynamicImage> {
-    let source_name = path.file_name()?.to_string_lossy().into_owned();
+pub fn produce_preview_image(
+    path: &Path,
+    sig_hint: Option<u64>,
+) -> Result<DynamicImage, PreviewFail> {
+    let source_name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .ok_or_else(|| PreviewFail::new("io", 0, "invalid path"))?;
     let dir = previews_dir_for(path);
 
     // Fast path: caller knows the scan-time signature — resolve the live
@@ -343,14 +536,15 @@ pub fn produce_preview_image(path: &Path, sig_hint: Option<u64>) -> Option<Dynam
                     if verbose() {
                         eprintln!("preview cache hit [{engine}]: {}", path.display());
                     }
-                    return Some(img);
+                    return Ok(img);
                 }
                 pack.remove(&source_name);
             }
         }
     }
 
-    let (len, nanos) = source_signature(path)?;
+    let (len, nanos) = source_signature_ex(path).map_err(|e| PreviewFail::io(0, &e))?;
+    let sig64 = sig_u64(len, nanos);
 
     // Fast path: the pack has a current-signature thumbnail for this file.
     if let Some(pack) = crate::fs_utils::pack::pack_for(&dir) {
@@ -363,7 +557,7 @@ pub fn produce_preview_image(path: &Path, sig_hint: Option<u64>) -> Option<Dynam
                 if verbose() {
                     eprintln!("preview cache hit [{engine}]: {}", path.display());
                 }
-                return Some(img);
+                return Ok(img);
             }
             // Corrupt record — tombstone so it can never wedge us.
             pack.remove(&source_name);
@@ -377,14 +571,15 @@ pub fn produce_preview_image(path: &Path, sig_hint: Option<u64>) -> Option<Dynam
     // through to the CPU decode. The fullscreen preview is NOT generated
     // here — it is produced lazily on hold-`f`/screen-fill, never inline
     // on the thumbnail hot path.
-    let bytes = std::fs::read(path).ok()?;
+    let bytes = std::fs::read(path).map_err(|e| PreviewFail::io(sig64, &e))?;
     let hash = sha256_hex(&bytes);
     let thumb = match crate::gpujpeg::open(&bytes)
         .and_then(|s| s.resize_image(THUMB_MAX_DIM, THUMB_MAX_DIM))
     {
         Some(img) => (img, "gpu"),
         None => {
-            let image = decode_image_bytes(path, &bytes).ok()?;
+            let image =
+                decode_image_bytes(path, &bytes).map_err(|e| PreviewFail::decode(sig64, e))?;
             drop(bytes);
             (resize_to_fit(image, THUMB_MAX_DIM, THUMB_MAX_DIM), "cpu")
         }
@@ -394,7 +589,7 @@ pub fn produce_preview_image(path: &Path, sig_hint: Option<u64>) -> Option<Dynam
     if verbose() {
         eprintln!("preview generated [{engine}]: {}", path.display());
     }
-    Some(thumb)
+    Ok(thumb)
 }
 
 /// Like [`produce_preview_image`] but returns the persisted JPEG bytes plus
@@ -412,11 +607,14 @@ pub fn produce_preview_bytes(
     path: &Path,
     dims_hint: Option<(u32, u32)>,
     sig_hint: Option<u64>,
-) -> Option<(Vec<u8>, u32, u32)> {
+) -> Result<(Vec<u8>, u32, u32), PreviewFail> {
     if sigint_received() {
-        return None;
+        return Err(PreviewFail::cancelled());
     }
-    let source_name = path.file_name()?.to_string_lossy().into_owned();
+    let source_name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .ok_or_else(|| PreviewFail::new("io", 0, "invalid path"))?;
     let dir = previews_dir_for(path);
 
     // Fast path: caller knows the scan-time signature — a pack hit needs
@@ -434,14 +632,15 @@ pub fn produce_preview_bytes(
                     if verbose() {
                         eprintln!("preview cache hit [pack-sig]: {}", path.display());
                     }
-                    return Some((jpeg, dims.0, dims.1));
+                    return Ok((jpeg, dims.0, dims.1));
                 }
                 pack.remove(&source_name);
             }
         }
     }
 
-    let (len, nanos) = source_signature(path)?;
+    let (len, nanos) = source_signature_ex(path).map_err(|e| PreviewFail::io(0, &e))?;
+    let sig64 = sig_u64(len, nanos);
 
     if let Some(pack) = crate::fs_utils::pack::pack_for(&dir) {
         let mut pack = pack.lock().unwrap();
@@ -455,7 +654,7 @@ pub fn produce_preview_bytes(
                 if verbose() {
                     eprintln!("preview cache hit [pack]: {}", path.display());
                 }
-                return Some((jpeg, dims.0, dims.1));
+                return Ok((jpeg, dims.0, dims.1));
             }
             // Corrupt/truncated record (killed mid-write, disk damage) —
             // serving it would wedge clients into decode-fail loops.
@@ -467,7 +666,7 @@ pub fn produce_preview_bytes(
         }
     }
 
-    let bytes = std::fs::read(path).ok()?;
+    let bytes = std::fs::read(path).map_err(|e| PreviewFail::io(sig64, &e))?;
     // The source is already in memory — the content hash is nearly free and
     // becomes the preview's authoritative metadata.
     let hash = sha256_hex(&bytes);
@@ -483,11 +682,11 @@ pub fn produce_preview_bytes(
             if verbose() {
                 eprintln!("preview generated [gpu]: {}", path.display());
             }
-            return Some((jpeg, w, h));
+            return Ok((jpeg, w, h));
         }
     }
 
-    let image = decode_image_bytes(path, &bytes).ok()?;
+    let image = decode_image_bytes(path, &bytes).map_err(|e| PreviewFail::decode(sig64, e))?;
     drop(bytes);
     let (w, h) = (image.width(), image.height());
     let thumb = resize_to_fit(image, THUMB_MAX_DIM, THUMB_MAX_DIM);
@@ -496,13 +695,16 @@ pub fn produce_preview_bytes(
         let writer = std::io::BufWriter::new(std::io::Cursor::new(&mut jpeg));
         let encoder =
             image::codecs::jpeg::JpegEncoder::new_with_quality(writer, PREVIEW_JPEG_QUALITY);
-        thumb.to_rgb8().write_with_encoder(encoder).ok()?;
+        thumb
+            .to_rgb8()
+            .write_with_encoder(encoder)
+            .map_err(|_| PreviewFail::encode(sig64))?;
     }
     persist_preview_bytes(path, len, nanos, &source_name, &jpeg, &hash);
     if verbose() {
         eprintln!("preview generated [cpu]: {}", path.display());
     }
-    Some((jpeg, w, h))
+    Ok((jpeg, w, h))
 }
 
 /// sha256 of a source file's bytes — the authoritative "did this file
@@ -701,5 +903,60 @@ fn persist_preview_bytes(
         pack.lock()
             .unwrap()
             .put(source_name, len, nanos, hash, THUMB_MAX_DIM as u16, jpeg);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The screen cache is pure regenerable data: over-cap GC must
+    /// delete oldest-first until the total fits, and empty per-source
+    /// dirs must be dropped.
+    #[test]
+    fn screen_cache_gc_evicts_oldest_until_under_cap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("f");
+        let d1 = root.join("aaaa");
+        let d2 = root.join("bbbb");
+        std::fs::create_dir_all(&d1).unwrap();
+        std::fs::create_dir_all(&d2).unwrap();
+
+        // Sparse files: logical size counts toward the cap, no real
+        // blocks are allocated.
+        let big = SCREEN_CACHE_MAX_BYTES + (1 << 30);
+        let old = d1.join("old.jpg");
+        let new = d2.join("new.jpg");
+        std::fs::File::create(&old).unwrap().set_len(big).unwrap();
+        std::fs::File::create(&new).unwrap().set_len(1 << 20).unwrap();
+        // Age `old` well past `new`.
+        let old_f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&old)
+            .unwrap();
+        old_f
+            .set_modified(UNIX_EPOCH + Duration::from_secs(1_000_000))
+            .unwrap();
+
+        let freed = screen_cache_gc_at(&root);
+        assert!(freed >= big, "freed {freed}");
+        assert!(!old.exists(), "oldest file must be evicted");
+        assert!(new.exists(), "younger file must survive");
+        assert!(!d1.exists(), "emptied dir must be removed");
+        assert!(d2.exists());
+    }
+
+    /// Under the cap nothing is touched.
+    #[test]
+    fn screen_cache_gc_noop_under_cap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("f");
+        let d = root.join("cccc");
+        std::fs::create_dir_all(&d).unwrap();
+        let f = d.join("keep.jpg");
+        std::fs::write(&f, b"jpeg").unwrap();
+
+        assert_eq!(screen_cache_gc_at(&root), 0);
+        assert!(f.exists());
     }
 }

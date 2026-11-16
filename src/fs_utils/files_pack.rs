@@ -102,7 +102,12 @@ pub fn save(root: &Path, files: &[(PathBuf, String, u64, u64, u32, u32)]) {
         return;
     }
     let tmp = target.with_extension("tmp");
-    if std::fs::write(&tmp, &buf).is_ok() && std::fs::rename(&tmp, &target).is_err() {
+    // A failed write must not leave the scratch file behind.
+    if std::fs::write(&tmp, &buf).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        return;
+    }
+    if std::fs::rename(&tmp, &target).is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
 }

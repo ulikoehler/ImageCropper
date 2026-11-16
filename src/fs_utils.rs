@@ -55,6 +55,13 @@ pub const TRASH_DIR: &str = ".imagecropper-trash";
 /// unlinks alike — independent of `-j` because delete throughput is bound
 /// by the filesystem, not decode CPU.
 pub const DELETE_WORKERS: usize = 32;
+
+/// True when `err` is ENOSPC — the filesystem has no room for the write.
+/// Preview caches are pure regenerable data, so callers use this to
+/// trigger cleanup and retry rather than failing the operation.
+pub fn is_no_space(err: &std::io::Error) -> bool {
+    err.kind() == std::io::ErrorKind::StorageFull
+}
 pub const ORIGINALS_DIR: &str = ".imagecropper-originals";
 pub const TEMP_DIR: &str = ".imagecropper-tmp";
 pub const PREVIEWS_DIR: &str = ".imagecropper-previews";

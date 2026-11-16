@@ -10,17 +10,21 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     num::NonZeroUsize,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Condvar, Mutex, RwLock,
     },
     thread,
+    time::{Duration, Instant},
 };
 
 use lru::LruCache;
 
-use crate::fs_utils::{adaptive_pool::AdaptivePool, previews::produce_preview_bytes};
+use crate::fs_utils::{
+    adaptive_pool::AdaptivePool,
+    previews::{produce_preview_bytes, PreviewFail},
+};
 use crate::server::io_gate::IoGate;
 
 /// How many of the first live album thumbnails stay pinned in RAM.
@@ -75,13 +79,81 @@ impl Ram {
 /// this every want/sweep/pin racer of the same miss pays a full
 /// decode+encode — and all of them log/cache-check the same file.
 struct Inflight {
-    /// None = still producing; Some(result) = finished (result may be None).
-    done: Mutex<Option<Option<Preview>>>,
+    /// None = still producing; Some(result) = finished (result may be Err).
+    done: Mutex<Option<Result<Preview, PreviewFail>>>,
     cv: Condvar,
 }
 
+/// A remembered produce failure. Decode/encode failures are determined
+/// by the file's content — they are reused while the source signature is
+/// unchanged. IO failures may be transient (mount hiccup, permissions
+/// fixed later) — they expire after [`FAIL_TTL`].
+#[derive(Clone)]
+struct FailEntry {
+    sig: u64,
+    at: Instant,
+    fail: PreviewFail,
+}
+
+/// How long an `io`-kind failure is reused before a real retry.
+const FAIL_TTL: Duration = Duration::from_secs(300);
+
+/// Whether `entry` still describes `path`'s failure: decode/encode hold
+/// while the source signature is unchanged; everything else expires
+/// after [`FAIL_TTL`]. `cur_sig` is the current signature — `None` means
+/// unknown, which can never verify a decode failure.
+fn fail_reusable(entry: &FailEntry, cur_sig: Option<u64>) -> bool {
+    match entry.fail.kind {
+        "decode" | "encode" => entry.sig != 0 && Some(entry.sig) == cur_sig,
+        _ => entry.at.elapsed() < FAIL_TTL,
+    }
+}
+
+/// Look up a still-valid failure for `path`, if any. Decode/encode
+/// entries verify against the manifest signature — or one `stat` when
+/// the manifest doesn't know the path (still far cheaper than the
+/// read+decode being skipped). The entry is cloned out before any stat
+/// so no lock is held across IO.
+fn fail_hit(
+    fails: &Mutex<HashMap<PathBuf, FailEntry>>,
+    sigs: &RwLock<HashMap<PathBuf, u64>>,
+    path: &Path,
+) -> Option<PreviewFail> {
+    let e = fails.lock().unwrap().get(path)?.clone();
+    let reusable = match e.fail.kind {
+        "decode" | "encode" => {
+            let cur = sigs
+                .read()
+                .unwrap()
+                .get(path)
+                .copied()
+                .or_else(|| crate::fs_utils::previews::preview_sig_u64(path));
+            fail_reusable(&e, cur)
+        }
+        _ => e.at.elapsed() < FAIL_TTL,
+    };
+    reusable.then_some(e.fail)
+}
+
+/// Record `fail` for `path` — subsequent produces for the same file
+/// state answer from this instead of re-reading/re-decoding it.
+fn note_fail(fails: &Mutex<HashMap<PathBuf, FailEntry>>, path: &Path, fail: &PreviewFail) {
+    fails.lock().unwrap().insert(
+        path.to_path_buf(),
+        FailEntry {
+            sig: fail.sig,
+            at: Instant::now(),
+            fail: fail.clone(),
+        },
+    );
+}
+
+fn clear_fail(fails: &Mutex<HashMap<PathBuf, FailEntry>>, path: &Path) {
+    fails.lock().unwrap().remove(path);
+}
+
 /// Removes the leader's map entry even on panic — waiters must never hang.
-/// An unfilled result is completed as `None` (produce failure), which the
+/// An unfilled result is completed as an `internal` error, which the
 /// callers already handle via the normal miss path.
 struct InflightGuard<'a> {
     map: &'a Mutex<HashMap<PathBuf, Arc<Inflight>>>,
@@ -94,7 +166,11 @@ impl Drop for InflightGuard<'_> {
         {
             let mut d = self.slot.done.lock().unwrap();
             if d.is_none() {
-                *d = Some(None);
+                *d = Some(Err(PreviewFail {
+                    kind: "internal",
+                    sig: 0,
+                    msg: "produce worker panicked".into(),
+                }));
             }
         }
         self.slot.cv.notify_all();
@@ -146,12 +222,17 @@ impl Drop for GatePermit<'_> {
 }
 
 pub struct PreviewStore {
-    pool: AdaptivePool<Option<Preview>>,
+    pool: AdaptivePool<Result<Preview, PreviewFail>>,
     ram: Mutex<Ram>,
     /// In-flight/queued paths — kept for tests; the pool dedupes anyway.
     pub pending: Mutex<HashSet<PathBuf>>,
     /// Inline produces currently running, keyed by source path.
     inflight: Mutex<HashMap<PathBuf, Arc<Inflight>>>,
+    /// Recent produce failures, keyed by source path — a WANT for a
+    /// known-bad file answers from here instead of re-reading the source.
+    /// Shared with the pool workers (Arc) so background produces populate
+    /// the same cache inline wants consult.
+    fails: Arc<Mutex<HashMap<PathBuf, FailEntry>>>,
     /// Natural source dims already sniffed at manifest build/upsert time —
     /// lets a preview cache hit skip opening the source file at all.
     dims: Arc<RwLock<HashMap<PathBuf, (u32, u32)>>>,
@@ -222,6 +303,8 @@ impl PreviewStore {
         let sigs = Arc::new(RwLock::new(HashMap::new()));
         let worker_sigs = sigs.clone();
         let worker_gate = Arc::clone(&gate);
+        let fails = Arc::new(Mutex::new(HashMap::new()));
+        let worker_fails = fails.clone();
         // One gate shared by pool workers and inline wants: total produce
         // concurrency never exceeds `-j`, and background work is capped at
         // half of it so client wants always find a lane.
@@ -250,14 +333,24 @@ impl PreviewStore {
                 let _permit = worker_produce_gate.acquire_background();
                 let hint = worker_dims.read().unwrap().get(path).copied();
                 let sig = worker_sigs.read().unwrap().get(path).copied();
-                let out =
-                    produce_preview_bytes(path, hint, sig).map(|(jpeg, w, h)| Preview {
+                // A remembered failure for this file state answers
+                // instantly — no source read, no decode.
+                if let Some(f) = fail_hit(&worker_fails, &worker_sigs, path) {
+                    return Err(f);
+                }
+                let out = produce_preview_bytes(path, hint, sig).map(|(jpeg, w, h)| {
+                    Preview {
                         jpeg: Arc::new(jpeg),
                         w,
                         h,
-                    });
-                if out.is_some() {
-                    worker_screen.push(path.to_path_buf());
+                    }
+                });
+                match &out {
+                    Ok(_) => {
+                        clear_fail(&worker_fails, path);
+                        worker_screen.push(path.to_path_buf());
+                    }
+                    Err(f) => note_fail(&worker_fails, path, f),
                 }
                 out
             }),
@@ -268,6 +361,7 @@ impl PreviewStore {
             }),
             pending: Mutex::new(HashSet::new()),
             inflight: Mutex::new(HashMap::new()),
+            fails,
             dims,
             sigs,
             stopped: AtomicBool::new(false),
@@ -336,8 +430,13 @@ impl PreviewStore {
     }
 
     /// Queue a path for preview production; dedupes in-flight jobs.
+    /// Paths with a still-valid remembered failure are skipped — the
+    /// produce would fail identically, so don't burn the read/decode.
     pub fn request(&self, path: PathBuf) {
         if self.stopped() {
+            return;
+        }
+        if self.fail_pending(&path) {
             return;
         }
         let mut pending = self.pending.lock().unwrap();
@@ -345,6 +444,12 @@ impl PreviewStore {
             return;
         }
         self.pool.request(path);
+    }
+
+    /// Whether `path` has a produce failure that still applies — used to
+    /// keep known-bad files out of the pin/preload queues.
+    fn fail_pending(&self, path: &Path) -> bool {
+        fail_hit(&self.fails, &self.sigs, path).is_some()
     }
 
     /// Cached (RAM) copy without hitting disk or queueing.
@@ -389,27 +494,36 @@ impl PreviewStore {
     }
 
     /// Pinned thumbnails that are not resident yet — the pin fill backlog.
+    /// Known-bad paths are excluded: re-queueing them every fill cycle
+    /// would spin produce→fail→requeue forever.
     pub fn missing_pins(&self) -> Vec<PathBuf> {
-        let ram = self.ram.lock().unwrap();
-        ram.pinned
-            .iter()
-            .filter(|p| !ram.cache.contains(*p))
-            .cloned()
+        let missing: Vec<PathBuf> = {
+            let ram = self.ram.lock().unwrap();
+            ram.pinned
+                .iter()
+                .filter(|p| !ram.cache.contains(*p))
+                .cloned()
+                .collect()
+        };
+        missing
+            .into_iter()
+            .filter(|p| !self.fail_pending(p))
             .collect()
     }
 
-    /// Drain finished jobs into the RAM cache; returns (path, preview) pairs
-    /// ready to be pushed to clients.
-    pub fn poll(&self) -> Vec<(PathBuf, Option<Preview>)> {
+    /// Drain finished jobs into the RAM cache; returns (path, result) pairs
+    /// ready to be pushed to clients. `Err` carries the produce failure —
+    /// callers surface it to clients instead of serving silence.
+    pub fn poll(&self) -> Vec<(PathBuf, Result<Preview, PreviewFail>)> {
         let mut done = Vec::new();
         let mut pending = self.pending.lock().unwrap();
         let mut ram = self.ram.lock().unwrap();
-        for (path, preview) in self.pool.poll() {
+        for (path, result) in self.pool.poll() {
             pending.remove(&path);
-            if let Some(p) = &preview {
+            if let Ok(p) = &result {
                 ram.insert(path.clone(), p.clone());
             }
-            done.push((path, preview));
+            done.push((path, result));
         }
         done
     }
@@ -425,17 +539,28 @@ impl PreviewStore {
     /// isn't cached yet — still cheaper than making the client wait for the
     /// background sweep to reach it). Concurrent calls for the same path
     /// share one production: the leader produces, followers wait on the
-    /// slot and clone its result.
-    pub fn get_or_produce(&self, path: &PathBuf) -> Option<Preview> {
+    /// slot and clone its result. `Err` carries why production failed so
+    /// the caller can tell the client instead of serving silence.
+    pub fn get_or_produce(&self, path: &PathBuf) -> Result<Preview, PreviewFail> {
         if let Some(p) = self.cached(path) {
             if crate::fs_utils::verbose() {
                 let kind = if self.is_pinned(path) { "ram" } else { "ram-lru" };
                 eprintln!("preview hit [{kind}]: {}", path.display());
             }
-            return Some(p);
+            return Ok(p);
         }
         if self.stopped() {
-            return None;
+            return Err(PreviewFail {
+                kind: "cancelled",
+                sig: 0,
+                msg: "server shutting down".into(),
+            });
+        }
+        // A remembered failure for this file state answers instantly —
+        // corrupt/undecodable sources would otherwise be re-read and
+        // re-decoded on every client retry.
+        if let Some(f) = fail_hit(&self.fails, &self.sigs, path) {
+            return Err(f);
         }
         // Leader produces; followers wait on the shared slot. A wedged
         // produce (network mount) blocks followers too, but the callers'
@@ -489,23 +614,28 @@ impl PreviewStore {
         let _permit = self.produce_gate.acquire_client();
         let hint = self.dims.read().unwrap().get(path).copied();
         let sig = self.sigs.read().unwrap().get(path).copied();
-        let preview = produce_preview_bytes(path, hint, sig).map(|(jpeg, w, h)| Preview {
+        let result = produce_preview_bytes(path, hint, sig).map(|(jpeg, w, h)| Preview {
             jpeg: Arc::new(jpeg),
             w,
             h,
         });
-        if let Some(p) = &preview {
-            self.ram.lock().unwrap().insert(path.clone(), p.clone());
-            // The fullscreen (`f`) preview generates lazily on the tier-3
-            // fill thread — never inline on the thumbnail hot path.
-            self.screen.push(path.clone());
+        match &result {
+            Ok(p) => {
+                clear_fail(&self.fails, path);
+                self.ram.lock().unwrap().insert(path.clone(), p.clone());
+                // The fullscreen (`f`) preview generates lazily on the tier-3
+                // fill thread — never inline on the thumbnail hot path.
+                self.screen.push(path.clone());
+            }
+            Err(f) => note_fail(&self.fails, path, f),
         }
-        *slot.done.lock().unwrap() = Some(preview.clone());
-        preview
+        *slot.done.lock().unwrap() = Some(result.clone());
+        result
     }
 
     pub fn invalidate(&self, path: &PathBuf) {
         self.ram.lock().unwrap().cache.pop(path);
+        clear_fail(&self.fails, path);
     }
 
     /// Test hook: insert a preview into the RAM cache directly.
@@ -520,11 +650,11 @@ impl PreviewStore {
         self.inflight.lock().unwrap().len()
     }
 
-    /// Drop every cached copy of `path`'s preview (RAM + persisted file)
-    /// and produce a fresh one synchronously. Called when a client reports
-    /// the served bytes as undecodable — the cached file is presumed
-    /// corrupt and must not be served again.
-    pub fn regenerate(&self, path: &PathBuf) -> Option<Preview> {
+    /// Drop every cached copy of `path`'s preview (RAM + persisted file +
+    /// remembered failure) and produce a fresh one synchronously. Called
+    /// when a client reports the served bytes as undecodable — the cached
+    /// file is presumed corrupt and must not be served again.
+    pub fn regenerate(&self, path: &PathBuf) -> Result<Preview, PreviewFail> {
         self.invalidate(path);
         crate::fs_utils::previews::invalidate_preview_bytes(path);
         self.get_or_produce(path)

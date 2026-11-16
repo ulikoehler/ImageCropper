@@ -74,7 +74,9 @@ function onBulk(f){
   const req=bulkReqs.get(f.reqId); if(!req)return;
   if(f.type===BK_FULL_HEAD){
     const v=new DataView(f.payload.buffer,f.payload.byteOffset);
-    req.head={w:v.getUint32(8,true),h:v.getUint32(12,true),fmt:v.getUint8(16)};
+    req.head={w:v.getUint32(8,true),h:v.getUint32(12,true),fmt:v.getUint8(16),
+      // Produce-failure replies append the reason after the 25-byte head.
+      reason:f.payload.length>25?new TextDecoder().decode(f.payload.subarray(25)):""};
     return;
   }
   req.parts.push(f.payload);
@@ -156,7 +158,7 @@ async function refreshManifest(){
   manifest=JSON.parse(new TextDecoder().decode(body));
   mouseSelect=manifest.mouse_select||"sequence";
   items=manifest.items;
-  thumbs.clear();pending.clear();icStats.thumbClears++;decRetry.clear();
+  thumbs.clear();pending.clear();icStats.thumbClears++;decRetry.clear();srvErrs.clear();screenFail.clear();
   restoreThumbs(snap);
   // Selection/focus survive the update: ids may have been renumbered.
   restoreSelection(sel);
@@ -183,7 +185,7 @@ function applyPatch(p){
     items=[];manifest.dirs=[];thumbs.clear();pending.clear();
     icStats.thumbClears++;
     scanning=false;
-    screenBmp=null;screenIdx=-1;decRetry.clear();
+    screenBmp=null;screenIdx=-1;decRetry.clear();srvErrs.clear();screenFail.clear();
     manifest.dirs=(p.dirs_added||[]).slice();
     (p.upsert||[]).forEach(it=>{items[it.id]=it});
     (p.remove||[]).forEach(id=>{if(items[id])items[id].removed=true;thumbs.delete(id)});
@@ -337,10 +339,15 @@ function decodeThumb(id,jpeg){
 // Exponential, capped at 60 s; cleared on success/resync (new bytes may
 // decode fine) and removed on the resync path entirely.
 const decRetry=new Map();   // id -> {n, next:ms}
+// Server-reported produce failures (`thumb-error` events): same backoff
+// treatment as decode failures — the tile shows the red mark and is
+// re-wanted on a timer — plus a persistent count for the status bar.
+// Cleared on resync like decRetry.
+const srvErrs=new Map();    // id -> reason string
 function onDecoded(id,bmp,err){
   decJobs.delete(id);
   if(bmp){
-    icStats.thumbOk++;thumbs.set(id,bmp);decRetry.delete(id);
+    icStats.thumbOk++;thumbs.set(id,bmp);decRetry.delete(id);srvErrs.delete(id);
     // With no manifest dims, the bitmap's aspect is the fallback — and the
     // layout was computed before this thumb existed. Without a re-layout
     // the tile keeps its square placeholder geometry and the image is
@@ -475,6 +482,30 @@ function onData(f){
         it.w=ev.w;it.h=ev.h;layoutDirty=true;scheduleDraw();
       }
     }
+    if(ev.ev==="thumb-error"){
+      // Server-side produce failure for a wanted thumbnail: mark the
+      // tile failed (red mark + timed re-want, same as a decode
+      // failure) instead of letting it spin forever. A sig mismatch
+      // means the file changed since — ignore the stale report.
+      const it=items[ev.id];
+      icStats.srvErr=(icStats.srvErr||0)+1;
+      icStats.lastSrvErr=ev.err||ev.kind||"";
+      if(it&&!it.removed&&!(ev.sig&&ev.sig!==it.sig)){
+        pending.delete(ev.id);
+        for(const [reqId,s] of wantSlots){
+          s.left.delete(ev.id);
+          if(!s.left.size)wantSlots.delete(reqId);
+        }
+        pumpWants();
+        const r=decRetry.get(ev.id)||{n:0,next:0};
+        r.n++;
+        r.next=Date.now()+Math.min(60000,250*(1<<Math.min(r.n,8)));
+        decRetry.set(ev.id,r);
+        srvErrs.set(ev.id,ev.err||ev.kind||"preview failed");
+        statusEl.textContent=`preview failed: ${srvErrs.get(ev.id)}`;
+      }
+      scheduleDraw();
+    }
     if(ev.ev==="scan-start"){scanning=true;scheduleDraw();}
     if(ev.ev==="scan-end"){scanning=false;
       if(ev.count===0&&!scanErrs.length)statusEl.textContent=
@@ -604,17 +635,34 @@ const formatSize=b=>{
 };
 const selBytes=()=>{let s=0;for(const i of selected)s+=(items[i]&&items[i].bytes)||0;return s};
 const screenFetching=new Set();
+// Fullscreen produce failures reported by the server (empty/w=0 HEAD) or
+// a dead bulk request — id -> {msg, next retry ms}. Same 60 s cap as the
+// thumbnail backoff so a permanently bad file doesn't refetch per frame.
+const screenFail=new Map();
 async function fetchScreen(i){
   const it=items[i];
   if(!it||it.removed||screenFetching.has(i))return;
+  const sf=screenFail.get(i);
+  if(sf&&sf.next>Date.now())return;
   screenFetching.add(i);
   try{
     const b=new Uint8Array(14),v=new DataView(b.buffer);
     v.setUint32(0,it.id,true);v.setBigUint64(4,BigInt(it.sig),true);
     v.setUint8(12,2);v.setUint8(13,80);   // fmt=2: ≤1920 screen preview
-    const {body}=await bulkRequest(BK_GET_FULL,b);
+    const {body,head}=await bulkRequest(BK_GET_FULL,b);
+    // w=0 head + empty body = server-side produce failure; the reason
+    // rides after the fixed HEAD fields as UTF-8.
+    if(!body.length||(head&&head.w===0)){
+      screenFail.set(i,{msg:(head&&head.reason)||"preview unavailable",
+        next:Date.now()+60000});
+      if(fsMode)scheduleDraw();
+      return;
+    }
     const bmp=await createImageBitmap(new Blob([body],{type:"image/jpeg"}));
-    screenBmp=bmp;screenIdx=i;if(fsMode)scheduleDraw();
+    screenBmp=bmp;screenIdx=i;screenFail.delete(i);if(fsMode)scheduleDraw();
+  }catch(e){
+    screenFail.set(i,{msg:String(e&&e.message||e),next:Date.now()+60000});
+    if(fsMode)scheduleDraw();
   }finally{screenFetching.delete(i)}
 }
 
@@ -671,9 +719,15 @@ function draw(){
             w=screenBmp.width*s,h=screenBmp.height*s;
       ctx.drawImage(screenBmp,(W-w)/2,(H-h)/2,w,h);
     }else{
-      if(it&&!it.removed)fetchScreen(fi);
-      ctx.fillStyle="#888";ctx.font=`${16*devicePixelRatio}px monospace`;
-      ctx.fillText("loading fullscreen preview…",W/2-160*devicePixelRatio,H/2);
+      const sf=screenFail.get(fi);
+      if(sf&&sf.next>Date.now()){
+        ctx.fillStyle="#888";ctx.font=`${16*devicePixelRatio}px monospace`;
+        ctx.fillText(`preview unavailable — ${sf.msg}`,W/2-180*devicePixelRatio,H/2);
+      }else{
+        if(it&&!it.removed)fetchScreen(fi);
+        ctx.fillStyle="#888";ctx.font=`${16*devicePixelRatio}px monospace`;
+        ctx.fillText("loading fullscreen preview…",W/2-160*devicePixelRatio,H/2);
+      }
     }
     fsPathEl.textContent=fsItemPath(fi);
     fsPathEl.title=fsPathEl.textContent;
@@ -735,7 +789,8 @@ function draw(){
   for(const it of items)if(it&&!it.removed)live++;
   topEl.textContent=`${live} images · ${thumbs.size} cached · ${selected.size} selected`+
     `${selected.size?` (${formatSize(selBytes())})`:""}${delQ?` · deleting ${delQ}`:""}`+
-    `${movQ?` · moving ${movQ}`:""}${scanning?" · scanning…":""}`;
+    `${movQ?` · moving ${movQ}`:""}${srvErrs.size?` · ${srvErrs.size} failed`:""}`+
+    `${scanning?" · scanning…":""}`;
 }
 
 let dataWs=null;

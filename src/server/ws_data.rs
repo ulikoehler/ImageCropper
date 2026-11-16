@@ -227,13 +227,22 @@ async fn handle(socket: WebSocket, state: Arc<ServerState>) {
                             }),
                         )
                         .await;
-                        if res.is_err() {
-                            state.dbg.produce_timeout.fetch_add(
-                                1,
-                                std::sync::atomic::Ordering::Relaxed,
-                            );
-                        }
-                        (id, path, sig, res.ok().and_then(|r| r.ok()).flatten())
+                        // Sweep failures stay silent — the client re-wants
+                        // visible tiles, and THAT path reports the error.
+                        // Reporting here too would flood every connection
+                        // with one event per bad file in the library.
+                        let produced = match res {
+                            Ok(Ok(r)) => Some(r),
+                            Ok(Err(_)) => None,
+                            Err(_) => {
+                                state.dbg.produce_timeout.fetch_add(
+                                    1,
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
+                                None
+                            }
+                        };
+                        (id, path, sig, produced)
                     }));
                 }
                 if handles.is_empty() {
@@ -252,7 +261,15 @@ async fn handle(socket: WebSocket, state: Arc<ServerState>) {
                     };
                     let mut q = queue.lock().await;
                     match produced {
-                        Some(p) => {
+                        Some(Err(f)) => {
+                            q.mark_pushed(id);
+                            state.dbg.produce_none.fetch_add(
+                                1,
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
+                            state.dbg.note_preview_err(f.kind);
+                        }
+                        Some(Ok(p)) => {
                             // Re-verify the id still names the produced file —
                             // a resync/upsert mid-produce would make this push
                             // a wrong thumbnail for the current item.
@@ -373,6 +390,7 @@ async fn handle(socket: WebSocket, state: Arc<ServerState>) {
                         }
                         let previews = state.previews.clone();
                         let out_tx = out_tx.clone();
+                        let ev_tx = ev_tx.clone();
                         let state = state.clone();
                         tokio::spawn(async move {
                             let res = tokio::time::timeout(
@@ -382,31 +400,65 @@ async fn handle(socket: WebSocket, state: Arc<ServerState>) {
                                 }),
                             )
                             .await;
-                            if res.is_err() {
-                                state.dbg.produce_timeout.fetch_add(
-                                    1,
-                                    std::sync::atomic::Ordering::Relaxed,
-                                );
-                            }
-                            let produced =
-                                res.ok().and_then(|r| r.ok()).flatten();
-                            if let Some(p) = produced {
-                                state
-                                    .dbg
-                                    .want_sent
-                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                let _ = out_tx
-                                    .send(Frame::new(
-                                        EV_THUMB,
-                                        frame.req_id,
-                                        thumb_payload(id, sig, &p.jpeg),
-                                    ))
-                                    .await;
-                            } else {
-                                state.dbg.produce_none.fetch_add(
-                                    1,
-                                    std::sync::atomic::Ordering::Relaxed,
-                                );
+                            let produced = match res {
+                                Ok(Ok(r)) => Some(r),
+                                Ok(Err(_)) => None,
+                                Err(_) => {
+                                    state.dbg.produce_timeout.fetch_add(
+                                        1,
+                                        std::sync::atomic::Ordering::Relaxed,
+                                    );
+                                    None
+                                }
+                            };
+                            match produced {
+                                Some(Ok(p)) => {
+                                    state
+                                        .dbg
+                                        .want_sent
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    let _ = out_tx
+                                        .send(Frame::new(
+                                            EV_THUMB,
+                                            frame.req_id,
+                                            thumb_payload(id, sig, &p.jpeg),
+                                        ))
+                                        .await;
+                                }
+                                Some(Err(f)) => {
+                                    state.dbg.produce_none.fetch_add(
+                                        1,
+                                        std::sync::atomic::Ordering::Relaxed,
+                                    );
+                                    state.dbg.note_preview_err(f.kind);
+                                    // A wanted thumbnail that failed must
+                                    // reach the client — silence leaves the
+                                    // tile spinning forever. `sig` goes out
+                                    // as a string: u64 exceeds JS safe-int.
+                                    if let Ok(json) = serde_json::to_string(
+                                        &serde_json::json!({
+                                            "ev": "thumb-error",
+                                            "id": id,
+                                            "sig": sig.to_string(),
+                                            "kind": f.kind,
+                                            "err": f.msg,
+                                        }),
+                                    ) {
+                                        let _ = ev_tx
+                                            .send(Frame::new(
+                                                EV_EVENT,
+                                                0,
+                                                json.into_bytes(),
+                                            ))
+                                            .await;
+                                    }
+                                }
+                                None => {
+                                    state.dbg.produce_none.fetch_add(
+                                        1,
+                                        std::sync::atomic::Ordering::Relaxed,
+                                    );
+                                }
                             }
                         });
                     }
@@ -440,6 +492,8 @@ async fn handle(socket: WebSocket, state: Arc<ServerState>) {
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             let previews = state.previews.clone();
                             let out_tx = out_tx.clone();
+                            let ev_tx = ev_tx.clone();
+                            let state = state.clone();
                             let req_id = frame.req_id;
                             tokio::spawn(async move {
                                 let produced = tokio::time::timeout(
@@ -449,14 +503,40 @@ async fn handle(socket: WebSocket, state: Arc<ServerState>) {
                                     }),
                                 )
                                 .await;
-                                if let Ok(Ok(Some(p))) = produced {
-                                    let _ = out_tx
-                                        .send(Frame::new(
-                                            EV_THUMB,
-                                            req_id,
-                                            thumb_payload(id, cur_sig, &p.jpeg),
-                                        ))
-                                        .await;
+                                match produced {
+                                    Ok(Ok(Ok(p))) => {
+                                        let _ = out_tx
+                                            .send(Frame::new(
+                                                EV_THUMB,
+                                                req_id,
+                                                thumb_payload(id, cur_sig, &p.jpeg),
+                                            ))
+                                            .await;
+                                    }
+                                    // The source itself can't be decoded —
+                                    // tell the client so the tile fails
+                                    // visibly instead of spinning.
+                                    Ok(Ok(Err(f))) => {
+                                        state.dbg.note_preview_err(f.kind);
+                                        if let Ok(json) = serde_json::to_string(
+                                            &serde_json::json!({
+                                                "ev": "thumb-error",
+                                                "id": id,
+                                                "sig": cur_sig.to_string(),
+                                                "kind": f.kind,
+                                                "err": f.msg,
+                                            }),
+                                        ) {
+                                            let _ = ev_tx
+                                                .send(Frame::new(
+                                                    EV_EVENT,
+                                                    0,
+                                                    json.into_bytes(),
+                                                ))
+                                                .await;
+                                        }
+                                    }
+                                    _ => {}
                                 }
                             });
                         }

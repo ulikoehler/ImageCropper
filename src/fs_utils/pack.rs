@@ -379,8 +379,19 @@ impl Pack {
         if self.dead {
             return None;
         }
-        let off = self.len;
-        write_all_at(&mut self.file, rec, off).ok()?;
+        let mut off = self.len;
+        match write_all_at(&mut self.file, rec, off) {
+            Ok(()) => {}
+            Err(e) if crate::fs_utils::is_no_space(&e) => {
+                // Disk full: compaction is the pack's only safe cleanup —
+                // it rewrites just the live records. If it frees enough,
+                // the retry lands at the new (smaller) tail.
+                self.compact_now();
+                off = self.len;
+                write_all_at(&mut self.file, rec, off).ok()?;
+            }
+            Err(_) => return None,
+        }
         self.len += rec.len() as u64;
         self.since_sync += 1;
         if self.since_sync >= SYNC_EVERY {
