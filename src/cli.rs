@@ -12,10 +12,7 @@ use clap::{Args, Parser, Subcommand};
 use rand::seq::SliceRandom;
 
 use crate::fs_utils::{
-    collect_images_limited,
-    exif_datetime_key, spawn_image_scan_limited, FilterSyntax,
-    PathFilter,
-    ScanEvent,
+    collect_images_limited, exif_datetime_key, FilterSyntax, PathFilter, ScanEvent,
 };
 use crate::image_utils::OutputFormat;
 
@@ -100,6 +97,11 @@ pub struct ScanArgs {
     /// Skip destructive operations and just print what would happen
     #[arg(short = 'd', long, default_value_t = false)]
     pub dry_run: bool,
+
+    /// Permanently delete files (unlink) instead of moving them to
+    /// .imagecropper-trash. Unlinks run on a fixed pool of 32 threads.
+    #[arg(long = "force-delete", default_value_t = false)]
+    pub force_delete: bool,
 
     /// Report file sizes and actions as they complete
     #[arg(short = 'v', long, default_value_t = false)]
@@ -285,7 +287,7 @@ pub fn spawn_scan_stream(scan: &ScanArgs) -> Result<ScanStream> {
     let mut seeds = Vec::new();
     let mut skip = std::collections::HashSet::new();
     for root in &scan.paths {
-        if let Some((dirs, s)) = crate::fs_utils::files_pack::load(root) {
+        if let Some((dirs, s)) = crate::fs_utils::files_pack::load(root, scan.recursive) {
             skip.extend(s);
             for (dir, rec) in dirs {
                 for f in rec.files {
@@ -294,7 +296,7 @@ pub fn spawn_scan_stream(scan: &ScanArgs) -> Result<ScanStream> {
                         w: f.w,
                         h: f.h,
                         bytes: f.len,
-                        sig: f.len ^ f.mtime as u64 ^ (f.mtime >> 64) as u64,
+                        sig: f.sig,
                     });
                 }
             }
@@ -349,13 +351,14 @@ pub fn sort_files(files: &mut Vec<PathBuf>, order: SortOrder, inverse: bool) {
     match order {
         SortOrder::Filename => files.sort(),
         SortOrder::Randomize => files.shuffle(&mut rand::rng()),
-        SortOrder::Modified => {
-            files.sort_by_key(|path| std::fs::metadata(path).and_then(|m| m.modified()).ok())
-        }
-        SortOrder::Size | SortOrder::SizeAsc => {
-            files.sort_by_key(|path| std::fs::metadata(path).map(|m| m.len()).unwrap_or(0))
-        }
-        SortOrder::SizeDesc => files.sort_by_key(|path| {
+        // sort_by_cached_key stats each file once — sort_by_key would
+        // stat O(n log n) times, which dominates large scans on HDDs.
+        SortOrder::Modified => files.sort_by_cached_key(|path| {
+            std::fs::metadata(path).and_then(|m| m.modified()).ok()
+        }),
+        SortOrder::Size | SortOrder::SizeAsc => files
+            .sort_by_cached_key(|path| std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)),
+        SortOrder::SizeDesc => files.sort_by_cached_key(|path| {
             std::cmp::Reverse(std::fs::metadata(path).map(|m| m.len()).unwrap_or(0))
         }),
         SortOrder::Exif | SortOrder::ExifAsc | SortOrder::ExifDesc => {

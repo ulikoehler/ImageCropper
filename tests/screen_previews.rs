@@ -48,7 +48,7 @@ fn produce_screen_jpeg_generates_and_caches() {
         let src = tmp.path().join("big.png");
         write_image(&src, &solid_image(3000, 1000, [0, 0, 255, 255]));
 
-        let (jpeg, w, h) = produce_screen_jpeg(&src).expect("screen jpeg");
+        let (jpeg, w, h) = produce_screen_jpeg(&src, None).expect("screen jpeg");
         assert_eq!(&jpeg[0..2], &[0xFF, 0xD8], "JPEG magic");
         assert!(w <= SCREEN_MAX_DIM && h <= SCREEN_MAX_DIM);
         assert_eq!((w, h), (1920, 640), "aspect preserved");
@@ -56,7 +56,7 @@ fn produce_screen_jpeg_generates_and_caches() {
         // Persisted under the global cache — second call is a cache hit.
         let path = screen_preview_path(&src).unwrap();
         assert!(path.exists());
-        let (jpeg2, w2, h2) = produce_screen_jpeg(&src).unwrap();
+        let (jpeg2, w2, h2) = produce_screen_jpeg(&src, None).unwrap();
         assert_eq!(jpeg2, jpeg);
         assert_eq!((w2, h2), (w, h));
     });
@@ -87,7 +87,7 @@ fn remove_previews_for_purges_fullscreen_cache() {
 
         // Generate the cached fullscreen preview, then delete the source's
         // previews as the delete/move queues do.
-        let (jpeg, _, _) = produce_screen_jpeg(&src).expect("screen jpeg");
+        let (jpeg, _, _) = produce_screen_jpeg(&src, None).expect("screen jpeg");
         assert!(!jpeg.is_empty());
         assert!(screen_dir_for(&src).exists());
 

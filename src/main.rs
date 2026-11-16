@@ -113,6 +113,7 @@ fn run_crop(args: CropArgs) -> Result<()> {
         format: args.format,
         parallel: args.scan.parallel,
         benchmark: args.benchmark,
+        force_delete: args.scan.force_delete,
         embedded: false,
     };
     let mut scan_slot = Some(scan);
@@ -160,6 +161,7 @@ fn run_album(args: AlbumArgs) -> Result<()> {
         parallel: args.scan.parallel,
         move_dir,
         mouse_select: args.mouse_select,
+        force_delete: args.scan.force_delete,
         crop: AppOptions {
             dry_run: args.scan.dry_run,
             quality: args.quality,
@@ -168,6 +170,7 @@ fn run_album(args: AlbumArgs) -> Result<()> {
             format: args.format,
             parallel: args.scan.parallel,
             benchmark: false,
+            force_delete: args.scan.force_delete,
             embedded: true,
         },
     };
@@ -216,6 +219,7 @@ fn serve(
         token,
         headless.push_credit_kb,
         move_dir,
+        scan.force_delete,
     );
     // The server binds and prints its URL first; scan feeding and the FS
     // watcher (recursive registration can take a long time on remote
@@ -241,7 +245,15 @@ fn pregenerate_stream(stream: ScanStream, parallel: usize) {
     use std::sync::mpsc::RecvTimeoutError;
     use std::time::Duration;
 
-    let pool = AdaptivePool::new(2, parallel.max(1), |p| produce_preview_bytes(p, None));
+    // Scan events carry the folded signature for free — a pack hit then
+    // needs no stat at all. `Some((0, 0))` dims: pregeneration discards
+    // them, so a cache hit skips even the header read.
+    let sigs = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+    let pool_sigs = sigs.clone();
+    let pool = AdaptivePool::new(2, parallel.max(1), move |p| {
+        let sig = pool_sigs.lock().unwrap().get(p).copied();
+        produce_preview_bytes(p, Some((0, 0)), sig)
+    });
     let mut queued = 0usize;
     let mut done = 0usize;
     let mut scanning = true;
@@ -255,7 +267,9 @@ fn pregenerate_stream(stream: ScanStream, parallel: usize) {
         }
         if scanning {
             match stream.rx.recv_timeout(Duration::from_millis(20)) {
-                Ok(ScanEvent::Found { path, .. }) | Ok(ScanEvent::Cached { path, .. }) => {
+                Ok(ScanEvent::Found { path, sig, .. })
+                | Ok(ScanEvent::Cached { path, sig, .. }) => {
+                    sigs.lock().unwrap().insert(path.clone(), sig);
                     pool.request(path);
                     queued += 1;
                 }

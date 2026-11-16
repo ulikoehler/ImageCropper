@@ -35,7 +35,7 @@ fn corrupt_persisted_preview_is_regenerated() {
     let src = tmp.path().join("p.png");
     write_image(&src, &solid_image(300, 200, [10, 200, 30, 255]));
 
-    let (jpeg, w, h) = produce_preview_bytes(&src, None).expect("produce");
+    let (jpeg, w, h) = produce_preview_bytes(&src, None, None).expect("produce");
     assert_eq!(&jpeg[0..2], &[0xFF, 0xD8]);
     assert_eq!((w, h), (300, 200));
 
@@ -43,7 +43,7 @@ fn corrupt_persisted_preview_is_regenerated() {
     corrupt_pack_bytes(&src, 0x00);
 
     // Next read must regenerate rather than serve the corrupt bytes.
-    let (jpeg2, _, _) = produce_preview_bytes(&src, None).expect("re-produce");
+    let (jpeg2, _, _) = produce_preview_bytes(&src, None, None).expect("re-produce");
     assert_eq!(&jpeg2[0..2], &[0xFF, 0xD8]);
     assert_eq!(&jpeg2[jpeg2.len() - 2..], &[0xFF, 0xD9], "EOI intact");
     assert_eq!(jpeg2, jpeg, "regeneration restores identical bytes");
@@ -58,10 +58,10 @@ fn garbage_persisted_preview_is_regenerated() {
     let tmp = tempdir().unwrap();
     let src = tmp.path().join("g.png");
     write_image(&src, &solid_image(120, 80, [0, 0, 0, 255]));
-    produce_preview_bytes(&src, None).expect("produce");
+    produce_preview_bytes(&src, None, None).expect("produce");
 
     corrupt_pack_bytes(&src, 0xAB);
-    let (jpeg, _, _) = produce_preview_bytes(&src, None).expect("re-produce");
+    let (jpeg, _, _) = produce_preview_bytes(&src, None, None).expect("re-produce");
     assert_eq!(&jpeg[0..2], &[0xFF, 0xD8]);
 }
 
@@ -70,7 +70,7 @@ fn invalidate_preview_bytes_removes_persisted_record() {
     let tmp = tempdir().unwrap();
     let src = tmp.path().join("i.png");
     write_image(&src, &solid_image(64, 64, [255, 255, 0, 255]));
-    produce_preview_bytes(&src, None).expect("produce");
+    produce_preview_bytes(&src, None, None).expect("produce");
     assert!(persisted_thumb_for_test(&src).is_some());
 
     invalidate_preview_bytes(&src);
@@ -80,7 +80,7 @@ fn invalidate_preview_bytes_removes_persisted_record() {
     );
 
     // Producing again must recreate it (next request regenerates).
-    produce_preview_bytes(&src, None).expect("re-produce");
+    produce_preview_bytes(&src, None, None).expect("re-produce");
     assert!(persisted_thumb_for_test(&src).is_some());
 }
 
@@ -113,7 +113,7 @@ fn preview_persists_content_hash_record() {
     let tmp = tempdir().unwrap();
     let src = tmp.path().join("h.png");
     write_image(&src, &solid_image(90, 60, [1, 2, 3, 255]));
-    produce_preview_bytes(&src, None).expect("produce");
+    produce_preview_bytes(&src, None, None).expect("produce");
 
     let expected = imagecropper::fs_utils::previews::source_content_hash(&src).unwrap();
     assert_eq!(
@@ -128,7 +128,7 @@ fn stale_signature_ignored_when_content_is_unchanged() {
     let tmp = tempdir().unwrap();
     let src = tmp.path().join("s.png");
     write_image(&src, &solid_image(120, 90, [9, 9, 9, 255]));
-    produce_preview_bytes(&src, None).expect("produce");
+    produce_preview_bytes(&src, None, None).expect("produce");
     let sig_before = imagecropper::fs_utils::previews::preview_sig_u64(&src).unwrap();
 
     // Touch the file: mtime (and thus the cheap signature) changes, content
@@ -173,7 +173,7 @@ fn stale_signature_enforced_when_content_changed() {
     let tmp = tempdir().unwrap();
     let src = tmp.path().join("c.png");
     write_image(&src, &solid_image(100, 100, [0, 0, 0, 255]));
-    produce_preview_bytes(&src, None).expect("produce");
+    produce_preview_bytes(&src, None, None).expect("produce");
     let sig_before = imagecropper::fs_utils::previews::preview_sig_u64(&src).unwrap();
 
     // Different content, same path.

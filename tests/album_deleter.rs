@@ -14,7 +14,7 @@ fn deleter_trashes_bulk_and_purges_previews() {
         for i in 0..40u8 {
             let path = root.join(format!("img{i:02}.png"));
             write_image(&path, &solid_image(16, 16, [i, 0, 0, 255]));
-            produce_preview_bytes(&path, None).expect("preview");
+            produce_preview_bytes(&path, None, None).expect("preview");
             paths.push(path);
         }
         assert!(previews_dir_for(&paths[0])
@@ -23,7 +23,7 @@ fn deleter_trashes_bulk_and_purges_previews() {
             .next()
             .is_some());
 
-        let mut deleter = Deleter::new(32);
+        let mut deleter = Deleter::new(32, false);
         for path in &paths {
             deleter.queue(path.clone());
         }
@@ -50,6 +50,44 @@ fn deleter_trashes_bulk_and_purges_previews() {
         assert!(
             remaining.is_empty(),
             "batched cleanup must purge every preview"
+        );
+    });
+}
+
+#[test]
+fn deleter_force_delete_unlinks_without_trash() {
+    with_temp_workdir(|root| {
+        let mut paths = Vec::new();
+        for i in 0..40u8 {
+            let path = root.join(format!("img{i:02}.png"));
+            write_image(&path, &solid_image(16, 16, [i, 0, 0, 255]));
+            produce_preview_bytes(&path, None, None).expect("preview");
+            paths.push(path);
+        }
+
+        let mut deleter = Deleter::new(32, true);
+        for path in &paths {
+            deleter.queue(path.clone());
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut done = 0;
+        while done < paths.len() && Instant::now() < deadline {
+            done += deleter
+                .poll()
+                .iter()
+                .filter(|r| r.result.is_ok())
+                .count();
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(done, paths.len(), "all deletions completed");
+
+        for path in &paths {
+            assert!(!path.exists(), "{} should be unlinked", path.display());
+        }
+        assert!(
+            !root.join(TRASH_DIR).exists(),
+            "force delete must not create the trash directory"
         );
     });
 }

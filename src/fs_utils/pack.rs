@@ -20,7 +20,7 @@
 
 use std::{
     collections::HashMap,
-    io::{Read, Seek, SeekFrom, Write},
+    io::Write,
     path::{Path, PathBuf},
     sync::{LazyLock, Mutex},
 };
@@ -62,8 +62,12 @@ pub struct Pack {
     file: std::fs::File,
     pack_path: PathBuf,
     index: HashMap<Key, Entry>,
-    /// Latest content hash per source name (any signature variant).
-    hashes: HashMap<String, [u8; 32]>,
+    /// Source name → its single live signature. At most one signature
+    /// variant per name is ever live (a changed file makes the old
+    /// previews dead bytes), so this replaces both the old `hashes` map
+    /// and the O(index-size) stale-variant scan `put_entry` used to run
+    /// per record — replay and bulk appends were quadratic without it.
+    names: HashMap<String, (u64, u128)>,
     /// Append offset == logical file length.
     len: u64,
     /// Bytes belonging to superseded/tombstoned records.
@@ -114,7 +118,7 @@ impl Pack {
         let mut pack = Self {
             pack_path: path,
             index: HashMap::new(),
-            hashes: HashMap::new(),
+            names: HashMap::new(),
             len: 0,
             garbage: 0,
             dead: false,
@@ -127,58 +131,85 @@ impl Pack {
     }
 
     /// Replay the log; truncate at the first torn/invalid record.
+    ///
+    /// Reads through a 1 MiB window instead of ~4 small reads per record:
+    /// a large pack replays in `size/CAP` syscalls rather than ~4 per
+    /// record, which is what makes opening a 100k-thumbnail pack usable
+    /// on slow/remote filesystems.
     fn replay(&mut self) {
+        const BODY: usize = 8 + 16 + 32 + 2 + 4;
         let file_len = self.file.metadata().map(|m| m.len()).unwrap_or(0);
-        let mut pos = 0u64;
-        let mut hdr = [0u8; 7];
+        // A cloned fd gives the reader its own file offset and keeps the
+        // borrow of `self.file` out of the parse loop. try_clone is a
+        // plain dup(2) — if it ever fails, treat the pack as empty-but-
+        // present: appends continue at `len` and stale records simply
+        // age out as garbage instead of wedging the whole cache.
+        let Ok(file) = self.file.try_clone() else {
+            self.len = file_len;
+            return;
+        };
+        let mut r = Replay::new(file);
+        // Offset just past the last fully-consumed record. A torn tail is
+        // cut HERE, not at the parse cursor: a partial record's header may
+        // already parse cleanly (magic+type+name_len are only 7 bytes),
+        // and truncating past it would leave header bytes that the next
+        // append then lands on top of.
+        let mut end = 0u64;
         loop {
-            if pos + hdr.len() as u64 > file_len {
+            if r.pos + 7 > file_len {
                 break;
             }
-            if self.file.seek(SeekFrom::Start(pos)).is_err()
-                || self.file.read_exact(&mut hdr).is_err()
-            {
-                break;
-            }
-            let magic = u32::from_le_bytes(hdr[0..4].try_into().unwrap());
-            let rtype = hdr[4];
-            let name_len = u16::from_le_bytes(hdr[5..7].try_into().unwrap()) as usize;
+            // Record header: magic u32 | type u8 | name_len u16.
+            let (magic, rtype, name_len) = {
+                let Some(h) = r.peek(7) else { break };
+                (
+                    u32::from_le_bytes(h[0..4].try_into().unwrap()),
+                    h[4],
+                    u16::from_le_bytes(h[5..7].try_into().unwrap()) as usize,
+                )
+            };
             if magic != MAGIC || rtype > TYPE_HASH || name_len > MAX_NAME {
                 break;
             }
-            let mut name = vec![0u8; name_len];
-            if self.file.read_exact(&mut name).is_err() {
-                break;
-            }
-            let name = match String::from_utf8(name) {
-                Ok(n) => n,
-                Err(_) => break,
+            r.advance(7);
+            let is_tomb = rtype == TYPE_TOMBSTONE;
+            let body_len = if is_tomb { 0 } else { BODY };
+            // name (+ fixed body for PUT/HASH) must be contiguous.
+            let parsed = {
+                let Some(nb) = r.peek(name_len + body_len) else {
+                    break;
+                };
+                let Ok(name) = std::str::from_utf8(&nb[..name_len]) else {
+                    break;
+                };
+                if is_tomb {
+                    Some((name.to_string(), 0u64, 0u128, [0u8; 32], 0u16, 0u64))
+                } else {
+                    let b = &nb[name_len..name_len + BODY];
+                    Some((
+                        name.to_string(),
+                        u64::from_le_bytes(b[0..8].try_into().unwrap()),
+                        u128::from_le_bytes(b[8..24].try_into().unwrap()),
+                        b[24..56].try_into().unwrap(),
+                        u16::from_le_bytes(b[56..58].try_into().unwrap()),
+                        u32::from_le_bytes(b[58..62].try_into().unwrap()) as u64,
+                    ))
+                }
             };
-            let after_name = pos + 7 + name_len as u64;
-            if rtype == TYPE_TOMBSTONE {
+            let Some((name, len, nanos, hash, dim, jpeg_len)) = parsed else {
+                break;
+            };
+            r.advance((name_len + body_len) as u64);
+            if is_tomb {
                 self.remove_entries(&name);
-                pos = after_name;
+                end = r.pos;
                 continue;
             }
-            // type 1/2 body header: len u64 | nanos u128 | sha256 | dim | jpeg_len
-            const BODY: usize = 8 + 16 + 32 + 2 + 4;
-            if after_name + BODY as u64 > file_len {
-                break;
-            }
-            let mut body = [0u8; BODY];
-            if self.file.read_exact(&mut body).is_err() {
-                break;
-            }
-            let len = u64::from_le_bytes(body[0..8].try_into().unwrap());
-            let nanos = u128::from_le_bytes(body[8..24].try_into().unwrap());
-            let hash: [u8; 32] = body[24..56].try_into().unwrap();
-            let dim = u16::from_le_bytes(body[56..58].try_into().unwrap());
-            let jpeg_len = u32::from_le_bytes(body[58..62].try_into().unwrap()) as u64;
             let rec_len = 7 + name_len as u64 + BODY as u64 + jpeg_len;
-            if jpeg_len > MAX_JPEG || pos + rec_len > file_len {
+            if jpeg_len > MAX_JPEG || r.pos + jpeg_len > file_len {
                 break;
             }
-            let jpeg_off = after_name + BODY as u64;
+            let jpeg_off = r.pos;
             self.put_entry(
                 name,
                 len,
@@ -193,28 +224,28 @@ impl Pack {
                 },
                 false,
             );
-            pos += rec_len;
+            // Skip the jpeg payload — only its offset was needed.
+            r.advance(jpeg_len);
+            end = r.pos;
         }
-        if pos < file_len {
+        drop(r);
+        if end < file_len {
             // Torn tail (crash mid-append): cut it so later appends don't
             // build on top of garbage.
-            let _ = self.file.set_len(pos);
+            let _ = self.file.set_len(end);
         }
-        self.len = pos;
+        self.len = end;
     }
 
-    /// Drop every index/hash entry for `name` (tombstone replay).
+    /// Drop every index entry for `name` (tombstone replay). O(1) via the
+    /// `names` map — a full `index.retain` scan per tombstone made bulk
+    /// deletes quadratic on replay too.
     fn remove_entries(&mut self, name: &str) {
-        let mut freed = 0u64;
-        self.index.retain(|(n, _, _), e| {
-            let dead = n == name;
-            if dead {
-                freed += e.rec_len;
+        if let Some((l, t)) = self.names.remove(name) {
+            if let Some(e) = self.index.remove(&(name.to_string(), l, t)) {
+                self.garbage += e.rec_len;
             }
-            !dead
-        });
-        self.garbage += freed;
-        self.hashes.remove(name);
+        }
     }
 
     /// Insert/refresh one record entry, pruning other signature variants of
@@ -222,15 +253,11 @@ impl Pack {
     /// bytes. `count_garbage` is off during replay (everything superseded
     /// there is already counted by position).
     fn put_entry(&mut self, name: String, len: u64, nanos: u128, ent: Entry, count: bool) {
-        let stale: Vec<Key> = self
-            .index
-            .keys()
-            .filter(|(n, l, t)| n == &name && (*l, *t) != (len, nanos))
-            .cloned()
-            .collect();
-        for k in stale {
-            if let Some(e) = self.index.remove(&k) {
-                self.garbage += e.rec_len;
+        if let Some(&(ol, ot)) = self.names.get(&name) {
+            if (ol, ot) != (len, nanos) {
+                if let Some(e) = self.index.remove(&(name.clone(), ol, ot)) {
+                    self.garbage += e.rec_len;
+                }
             }
         }
         if let Some(old) = self
@@ -240,7 +267,7 @@ impl Pack {
         {
             self.garbage += old.rec_len;
         }
-        self.hashes.insert(name, ent.hash);
+        self.names.insert(name, (len, nanos));
     }
 
     /// The persisted thumbnail for `(name, len, nanos)` — only when it was
@@ -252,9 +279,20 @@ impl Pack {
             return None;
         }
         let mut buf = vec![0u8; ent.jpeg_len as usize];
-        self.file.seek(SeekFrom::Start(ent.off)).ok()?;
-        self.file.read_exact(&mut buf).ok()?;
+        read_full_at(&mut self.file, &mut buf, ent.off).ok()?;
         Some((buf, hex(&ent.hash)))
+    }
+
+    /// Lookup by folded signature — for callers that already know the
+    /// scan-time sig and want to skip a `stat` on slow mounts. Resolves
+    /// the live `(len, nanos)` through `names`, so a stale sig simply
+    /// misses and the caller falls back to a fresh signature.
+    pub fn lookup_sig(&mut self, name: &str, sig: u64, dim: u16) -> Option<(Vec<u8>, String)> {
+        let &(len, nanos) = self.names.get(name)?;
+        if len ^ nanos as u64 ^ (nanos >> 64) as u64 != sig {
+            return None;
+        }
+        self.lookup(name, len, nanos, dim)
     }
 
     /// Append a full thumbnail record.
@@ -280,7 +318,7 @@ impl Pack {
             self.remove_entries(name);
             // The tombstone emptied the pack → rewrite it: truncate in
             // place instead of keeping a file full of dead records.
-            if self.index.is_empty() && self.hashes.is_empty() && self.len > 0 {
+            if self.index.is_empty() && self.names.is_empty() && self.len > 0 {
                 let _ = self.file.set_len(0);
                 self.len = 0;
                 self.garbage = 0;
@@ -342,13 +380,20 @@ impl Pack {
             return None;
         }
         let off = self.len;
-        self.file.seek(SeekFrom::Start(off)).ok()?;
-        self.file.write_all(rec).ok()?;
+        write_all_at(&mut self.file, rec, off).ok()?;
         self.len += rec.len() as u64;
         self.since_sync += 1;
         if self.since_sync >= SYNC_EVERY {
-            let _ = self.file.sync_data();
             self.since_sync = 0;
+            // fsync on a cloned fd, off the critical path: a slow device
+            // must not stall every lookup/append queued on this pack's
+            // mutex. Losing the unsynced tail is safe either way — the
+            // records just regenerate.
+            if let Ok(f) = self.file.try_clone() {
+                std::thread::spawn(move || {
+                    let _ = f.sync_data();
+                });
+            }
         }
         // payload offset = record start + header (7) — callers add their
         // own variable parts; only `append` uses it, so hand back the base.
@@ -380,17 +425,17 @@ impl Pack {
             let mut jpeg = Vec::new();
             if e.has_jpeg {
                 jpeg.resize(e.jpeg_len as usize, 0);
-                if self.file.seek(SeekFrom::Start(e.off)).is_err()
-                    || self.file.read_exact(&mut jpeg).is_err()
-                {
+                if read_full_at(&mut self.file, &mut jpeg, e.off).is_err() {
                     return; // keep the old pack rather than risk losing data
                 }
             }
             recs.push((k.clone(), *e, jpeg));
         }
         let tmp = self.pack_path.with_extension("pack.tmp");
-        let Ok(mut out) = std::fs::File::create(&tmp) else { return };
+        let Ok(out) = std::fs::File::create(&tmp) else { return };
+        let mut out = std::io::BufWriter::with_capacity(1 << 20, out);
         let mut new_index = HashMap::with_capacity(recs.len());
+        let mut new_names = HashMap::with_capacity(recs.len());
         let mut pos = 0u64;
         let mut ok = true;
         for ((name, len, nanos), e, jpeg) in recs {
@@ -413,10 +458,15 @@ impl Pack {
             let mut ne = e;
             ne.off = jpeg_off;
             ne.rec_len = rec.len() as u64;
+            new_names.insert(name.clone(), (len, nanos));
             new_index.insert((name, len, nanos), ne);
             pos += rec.len() as u64;
         }
-        if !ok || out.sync_all().is_err() || std::fs::rename(&tmp, &self.pack_path).is_err() {
+        if !ok
+            || out.flush().is_err()
+            || out.get_ref().sync_all().is_err()
+            || std::fs::rename(&tmp, &self.pack_path).is_err()
+        {
             let _ = std::fs::remove_file(&tmp);
             return;
         }
@@ -427,19 +477,23 @@ impl Pack {
         {
             self.file = f;
             self.index = new_index;
+            self.names = new_names;
             self.len = pos;
             self.garbage = 0;
         }
     }
 
-    /// Latest recorded content hash for `name` (any signature variant).
+    /// Latest recorded content hash for `name` — the live signature
+    /// variant's record carries it.
     pub fn stored_hash(&self, name: &str) -> Option<String> {
-        self.hashes.get(name).map(hex)
+        let (l, t) = *self.names.get(name)?;
+        let ent = self.index.get(&(name.to_string(), l, t))?;
+        Some(hex(&ent.hash))
     }
 
-    /// No live records and no hashes — the pack file itself is removable.
+    /// No live records — the pack file itself is removable.
     pub fn is_empty(&self) -> bool {
-        self.index.is_empty() && self.hashes.is_empty()
+        self.index.is_empty()
     }
 
     /// Absolute offset of `name`'s jpeg payload — tests corrupt bytes at
@@ -505,14 +559,185 @@ static PACKS: LazyLock<Mutex<HashMap<PathBuf, std::sync::Arc<Mutex<Pack>>>>> =
 
 /// The pack for `dir`, opening + replaying it on first use.
 pub fn pack_for(dir: &Path) -> Option<std::sync::Arc<Mutex<Pack>>> {
-    let mut packs = PACKS.lock().unwrap();
-    if let Some(p) = packs.get(dir) {
-        return Some(p.clone());
+    {
+        let packs = PACKS.lock().unwrap();
+        if let Some(p) = packs.get(dir) {
+            return Some(p.clone());
+        }
     }
+    // Open outside the registry lock: replaying a large pack is slow I/O
+    // and must not serialize every other directory's first lookup. A
+    // racing opener for the same dir loses the insert — `Pack::open` is
+    // idempotent (replay + legacy sweep), so the dropped handle is fine.
     let pack = Pack::open(dir)?;
     let pack = std::sync::Arc::new(Mutex::new(pack));
-    packs.insert(dir.to_path_buf(), pack.clone());
-    Some(pack)
+    let mut packs = PACKS.lock().unwrap();
+    Some(packs.entry(dir.to_path_buf()).or_insert(pack).clone())
+}
+
+/// Sequential windowed reader for log replay: parses record headers out
+/// of a 1 MiB buffer filled by positioned reads, so a whole pack costs
+/// `size/CAP` syscalls instead of ~4 per record. Payloads larger than
+/// the remaining window are skipped by offset arithmetic — never read.
+struct Replay {
+    file: std::fs::File,
+    buf: Vec<u8>,
+    /// Absolute file offset of `buf[0]`.
+    base: u64,
+    /// Bytes valid in `buf`.
+    len: usize,
+    /// Absolute parse offset; always `>= base`.
+    pos: u64,
+}
+
+impl Replay {
+    const CAP: usize = 1 << 20;
+
+    fn new(file: std::fs::File) -> Self {
+        Self {
+            file,
+            buf: vec![0; Self::CAP],
+            base: 0,
+            len: 0,
+            pos: 0,
+        }
+    }
+
+    /// Ensure `n` bytes are readable at `pos`; false at EOF/error.
+    /// `n` must be ≤ CAP (the largest possible record header is ~4.2 KB).
+    fn fill(&mut self, n: usize) -> bool {
+        debug_assert!(n <= Self::CAP);
+        loop {
+            let off = (self.pos - self.base) as usize;
+            if off + n <= self.len {
+                return true;
+            }
+            // Slide the unread tail to the front — or drop the window
+            // entirely when `pos` jumped past it (a skipped payload).
+            if off < self.len {
+                let keep = self.len - off;
+                self.buf.copy_within(off..self.len, 0);
+                self.len = keep;
+            } else {
+                self.len = 0;
+            }
+            self.base = self.pos;
+            let before = self.len;
+            while self.len < self.buf.len() {
+                match read_at_most(&mut self.file, &mut self.buf[self.len..], self.base + self.len as u64) {
+                    Ok(0) | Err(_) => break,
+                    Ok(r) => self.len += r,
+                }
+            }
+            if self.len == before {
+                // No progress — EOF or a read error; can't satisfy `n`.
+                return false;
+            }
+        }
+    }
+
+    /// Immutable view of `n` bytes at `pos` (call `fill` first via peek).
+    fn peek(&mut self, n: usize) -> Option<&[u8]> {
+        if !self.fill(n) {
+            return None;
+        }
+        let off = (self.pos - self.base) as usize;
+        Some(&self.buf[off..off + n])
+    }
+
+    /// Move the parse offset forward `n` bytes (must be peeked already).
+    fn advance(&mut self, n: u64) {
+        self.pos += n;
+    }
+}
+
+/// Positioned read of up to `buf.len()` bytes at `off`; returns the byte
+/// count (0 at EOF). Loops internally past `Interrupted`.
+fn read_at_most(file: &mut std::fs::File, buf: &mut [u8], off: u64) -> std::io::Result<usize> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileExt;
+        loop {
+            match file.read_at(buf, off) {
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                r => return r,
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        use std::io::{Read, Seek, SeekFrom};
+        file.seek(SeekFrom::Start(off))?;
+        loop {
+            match file.read(buf) {
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                r => return r,
+            }
+        }
+    }
+}
+
+/// Read exactly `buf.len()` bytes at `off`; `UnexpectedEof` on short read.
+fn read_full_at(file: &mut std::fs::File, mut buf: &mut [u8], mut off: u64) -> std::io::Result<()> {
+    while !buf.is_empty() {
+        match read_at_most(file, buf, off)? {
+            0 => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "pack record truncated",
+                ))
+            }
+            n => {
+                buf = &mut buf[n..];
+                off += n as u64;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Write all of `buf` at `off`, looping past short writes.
+fn write_all_at(file: &mut std::fs::File, mut buf: &[u8], mut off: u64) -> std::io::Result<()> {
+    while !buf.is_empty() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::FileExt;
+            match file.write_at(buf, off) {
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Ok(0) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::WriteZero,
+                        "pack write made no progress",
+                    ))
+                }
+                Ok(n) => {
+                    buf = &buf[n..];
+                    off += n as u64;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            use std::io::{Seek, SeekFrom, Write};
+            file.seek(SeekFrom::Start(off))?;
+            match file.write(buf) {
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Ok(0) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::WriteZero,
+                        "pack write made no progress",
+                    ))
+                }
+                Ok(n) => {
+                    buf = &buf[n..];
+                    off += n as u64;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+    Ok(())
 }
 
 /// If `dir`'s pack has no live records left, drop it from the registry and

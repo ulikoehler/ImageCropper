@@ -2,6 +2,7 @@ use std::{
     ffi::OsStr,
     fs,
     path::{Path, PathBuf},
+    time::UNIX_EPOCH,
 };
 
 use anyhow::{anyhow, Context, Result};
@@ -50,6 +51,10 @@ pub fn sigint_count() -> usize {
 }
 
 pub const TRASH_DIR: &str = ".imagecropper-trash";
+/// Fixed worker count for deletions — trash moves and `--force-delete`
+/// unlinks alike — independent of `-j` because delete throughput is bound
+/// by the filesystem, not decode CPU.
+pub const DELETE_WORKERS: usize = 32;
 pub const ORIGINALS_DIR: &str = ".imagecropper-originals";
 pub const TEMP_DIR: &str = ".imagecropper-tmp";
 pub const PREVIEWS_DIR: &str = ".imagecropper-previews";
@@ -156,8 +161,10 @@ fn normalize_filter_path(path: &Path) -> String {
 #[derive(Debug, Clone)]
 pub enum ScanEvent {
     /// An image file matched — emitted the moment it is discovered, with
-    /// its byte size (one metadata call inside the walker thread).
-    Found { path: PathBuf, bytes: u64 },
+    /// its byte size and folded content signature (both from the one
+    /// metadata call the walker already makes — consumers never need to
+    /// re-stat the file for listing purposes).
+    Found { path: PathBuf, bytes: u64, sig: u64 },
     /// A cached entry from `files.pack` (dir mtime unchanged): the consumer
     /// gets the recorded dims + signature, no re-sniff needed.
     Cached {
@@ -211,6 +218,18 @@ pub fn walk_images_seeded(
     let limit = max.filter(|n| *n > 0).unwrap_or(usize::MAX);
     let mut emitted = 0usize;
     let (seeds, skip) = plan.unwrap_or_default();
+    // Parent dirs of the Cached seeds: their direct files already
+    // arrived, so Found events for them are suppressed — but the walker
+    // still descends (only leaf dirs are in `skip`; a non-leaf dir's
+    // mtime says nothing about files inside its subdirectories).
+    let seeded: std::collections::HashSet<PathBuf> = seeds
+        .iter()
+        .filter_map(|ev| match ev {
+            ScanEvent::Cached { path, .. } => path.parent().map(Path::to_path_buf),
+            _ => None,
+        })
+        .collect();
+    let covered = |p: &Path| p.parent().is_some_and(|d| seeded.contains(d));
     for ev in seeds {
         if emitted >= limit {
             return;
@@ -222,24 +241,34 @@ pub fn walk_images_seeded(
         if emitted >= limit {
             return;
         }
-        if !path.exists() {
-            emit(ScanEvent::Error(format!(
-                "{} does not exist",
-                path.display()
-            )));
-            continue;
-        }
+        // One stat covers exists/is_file/is_dir and the signature — the
+        // old code stat'ed the root up to three times.
+        let meta = match fs::metadata(path) {
+            Ok(m) => m,
+            Err(e) => {
+                let msg = if e.kind() == std::io::ErrorKind::NotFound {
+                    format!("{} does not exist", path.display())
+                } else {
+                    format!("Unable to access {}: {e}", path.display())
+                };
+                emit(ScanEvent::Error(msg));
+                continue;
+            }
+        };
 
-        if path.is_file() {
-            if is_supported_image(path) && filter.is_none_or(|f| f.matches(path)) {
-                let bytes = path.metadata().map(|m| m.len()).unwrap_or(0);
+        if meta.is_file() {
+            if !covered(path)
+                && is_supported_image(path)
+                && filter.is_none_or(|f| f.matches(path))
+            {
                 emit(ScanEvent::Found {
                     path: path.to_path_buf(),
-                    bytes,
+                    bytes: meta.len(),
+                    sig: meta_sig(&meta),
                 });
                 emitted += 1;
             }
-        } else if path.is_dir() {
+        } else if meta.is_dir() {
             if recursive {
                 for entry in WalkDir::new(path)
                     .follow_links(false)
@@ -252,14 +281,18 @@ pub fn walk_images_seeded(
                     })
                     .filter_map(|e| e.ok())
                 {
+                    if covered(entry.path()) {
+                        continue;
+                    }
                     if entry.file_type().is_file()
                         && is_supported_image(entry.path())
                         && filter.is_none_or(|f| f.matches(entry.path()))
                     {
-                        let bytes = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                        let meta = entry.metadata().ok();
                         emit(ScanEvent::Found {
                             path: entry.path().to_path_buf(),
-                            bytes,
+                            bytes: meta.as_ref().map(|m| m.len()).unwrap_or(0),
+                            sig: meta.as_ref().map(meta_sig).unwrap_or(0),
                         });
                         emitted += 1;
                         if emitted >= limit {
@@ -279,16 +312,43 @@ pub fn walk_images_seeded(
                     Ok(entries) => {
                         for entry in entries.flatten() {
                             let p = entry.path();
-                            if p.is_file()
-                                && is_supported_image(&p)
-                                && filter.is_none_or(|f| f.matches(&p))
+                            // d_type from the dirent is free; only
+                            // symlinks need a stat (they're followed,
+                            // matching the old p.is_file() semantics).
+                            let file_type = entry.file_type().ok();
+                            let is_symlink = file_type
+                                .as_ref()
+                                .map(|t| t.is_symlink())
+                                .unwrap_or(false);
+                            let is_file = file_type
+                                .as_ref()
+                                .map(|t| t.is_file() || (t.is_symlink() && p.is_file()))
+                                .unwrap_or_else(|| p.is_file());
+                            if covered(&p)
+                                || !is_file
+                                || !is_supported_image(&p)
+                                || !filter.is_none_or(|f| f.matches(&p))
                             {
-                                let bytes = p.metadata().map(|m| m.len()).unwrap_or(0);
-                                emit(ScanEvent::Found { path: p, bytes });
-                                emitted += 1;
-                                if emitted >= limit {
-                                    return;
-                                }
+                                continue;
+                            }
+                            // One stat for size + mtime signature.
+                            // DirEntry::metadata doesn't follow links —
+                            // identical for regular files; symlinks (or
+                            // unknown d_type) re-stat with follow, like
+                            // the old p.metadata() did.
+                            let meta = if is_symlink || file_type.is_none() {
+                                fs::metadata(&p).ok()
+                            } else {
+                                entry.metadata().ok()
+                            };
+                            emit(ScanEvent::Found {
+                                bytes: meta.as_ref().map(|m| m.len()).unwrap_or(0),
+                                sig: meta.as_ref().map(meta_sig).unwrap_or(0),
+                                path: p,
+                            });
+                            emitted += 1;
+                            if emitted >= limit {
+                                return;
                             }
                         }
                     }
@@ -371,13 +431,53 @@ pub fn collect_images_limited(
     Ok(files)
 }
 
+/// Folded content signature from already-fetched metadata — identical to
+/// `previews::preview_sig_u64` so scan events and preview lookups agree.
+fn meta_sig(meta: &fs::Metadata) -> u64 {
+    let nanos = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    meta.len() ^ nanos as u64 ^ (nanos >> 64) as u64
+}
+
 fn is_supported_image(path: &Path) -> bool {
-    matches!(
-        path.extension()
-            .and_then(|ext| ext.to_str())
-            .map(|s| s.to_ascii_lowercase()),
-        Some(ref ext) if SUPPORTED_EXTENSIONS.contains(&ext.as_str())
-    )
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| {
+            SUPPORTED_EXTENSIONS
+                .iter()
+                .any(|s| ext.eq_ignore_ascii_case(s))
+        })
+}
+
+/// Map `items` through `f` preserving order — serial for small inputs, a
+/// few scoped threads for larger ones. For batches of independent
+/// filesystem calls (dir stats, per-file header sniffs) where a handful
+/// of workers hides per-op latency without unbounded thread counts.
+pub(crate) fn par_map<T, R>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R>
+where
+    T: Sync,
+    R: Send,
+{
+    const PAR: usize = 8;
+    const MIN_PAR: usize = 16;
+    if items.len() < MIN_PAR {
+        return items.iter().map(f).collect();
+    }
+    let chunk = items.len().div_ceil(items.len().min(PAR));
+    std::thread::scope(|s| {
+        let handles: Vec<_> = items
+            .chunks(chunk)
+            .map(|c| s.spawn(|| c.iter().map(&f).collect::<Vec<R>>()))
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|h| h.join().expect("par_map worker panicked"))
+            .collect()
+    })
 }
 
 pub fn prepare_dir(base: &Path, name: &str) -> Result<PathBuf> {

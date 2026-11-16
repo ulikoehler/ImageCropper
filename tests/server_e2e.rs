@@ -44,6 +44,7 @@ async fn e2e_hello_manifest_thumbs_delete() {
         None,
         4096,
         None,
+        false,
     );
     state.spawn_pumps();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -166,6 +167,7 @@ async fn e2e_healthz_and_static() {
         None,
         4096,
         None,
+        false,
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -193,6 +195,7 @@ async fn e2e_ws_auth_rejects_and_accepts_token() {
         Some("s3cret".into()),
         4096,
         None,
+        false,
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -251,6 +254,7 @@ async fn e2e_orig_downloads_the_source_file() {
         Some("s3cret".into()),
         4096,
         None,
+        false,
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();

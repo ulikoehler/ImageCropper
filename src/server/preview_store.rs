@@ -155,6 +155,10 @@ pub struct PreviewStore {
     /// Natural source dims already sniffed at manifest build/upsert time —
     /// lets a preview cache hit skip opening the source file at all.
     dims: Arc<RwLock<HashMap<PathBuf, (u32, u32)>>>,
+    /// Folded source signatures from the same sniffing — lets a preview
+    /// cache hit skip the `stat` too (one less round-trip per file on
+    /// slow mounts). Stale entries only cost a pack miss.
+    sigs: Arc<RwLock<HashMap<PathBuf, u64>>>,
     /// Set by `stop()`: all new production (pool AND inline `get_or_produce`)
     /// is refused. Cached RAM hits are still served.
     stopped: AtomicBool,
@@ -169,11 +173,15 @@ pub struct PreviewStore {
 }
 
 /// Background queue for fullscreen-preview generation. Producing a 4K
-/// preview costs a full-res decode+resize, so it must never run inline on
-/// the thumbnail hot path — a single tier-3 thread drains it, deduped.
+/// preview costs a full-res decode+resize — a *second* full read of every
+/// source file — so it only runs for the pinned album head (what users
+/// actually browse), deduped, at tier-3 priority.
 struct ScreenFill {
     queue: Mutex<VecDeque<PathBuf>>,
     pending: Mutex<HashSet<PathBuf>>,
+    /// Pinned paths only — the speculative fill must not double SMB/HDD
+    /// read volume for files nobody will ever view fullscreen.
+    allowed: Mutex<HashSet<PathBuf>>,
     cv: Condvar,
 }
 
@@ -183,6 +191,10 @@ impl ScreenFill {
             self.queue.lock().unwrap().push_back(path);
             self.cv.notify_one();
         }
+    }
+
+    fn set_allowed(&self, paths: HashSet<PathBuf>) {
+        *self.allowed.lock().unwrap() = paths;
     }
 }
 
@@ -207,6 +219,8 @@ impl PreviewStore {
     ) -> Self {
         let dims = Arc::new(RwLock::new(HashMap::new()));
         let worker_dims = dims.clone();
+        let sigs = Arc::new(RwLock::new(HashMap::new()));
+        let worker_sigs = sigs.clone();
         let worker_gate = Arc::clone(&gate);
         // One gate shared by pool workers and inline wants: total produce
         // concurrency never exceeds `-j`, and background work is capped at
@@ -223,9 +237,11 @@ impl PreviewStore {
         let screen = Arc::new(ScreenFill {
             queue: Mutex::new(VecDeque::new()),
             pending: Mutex::new(HashSet::new()),
+            allowed: Mutex::new(HashSet::new()),
             cv: Condvar::new(),
         });
         let worker_screen = Arc::clone(&screen);
+        let screen_sigs = sigs.clone();
         let store = Self {
             pool: AdaptivePool::new(2, concurrency.max(1), move |path| {
                 // Speculative preload: yield to live client requests instead
@@ -233,8 +249,9 @@ impl PreviewStore {
                 worker_gate.yield_to_clients();
                 let _permit = worker_produce_gate.acquire_background();
                 let hint = worker_dims.read().unwrap().get(path).copied();
+                let sig = worker_sigs.read().unwrap().get(path).copied();
                 let out =
-                    produce_preview_bytes(path, hint).map(|(jpeg, w, h)| Preview {
+                    produce_preview_bytes(path, hint, sig).map(|(jpeg, w, h)| Preview {
                         jpeg: Arc::new(jpeg),
                         w,
                         h,
@@ -252,6 +269,7 @@ impl PreviewStore {
             pending: Mutex::new(HashSet::new()),
             inflight: Mutex::new(HashMap::new()),
             dims,
+            sigs,
             stopped: AtomicBool::new(false),
             gate,
             screen,
@@ -281,9 +299,16 @@ impl PreviewStore {
                     }
                 };
                 screen.pending.lock().unwrap().remove(&path);
+                // Only the pinned album head gets speculative fullscreen
+                // previews — everything else generates on demand. On slow
+                // mounts this halves source read volume.
+                if !screen.allowed.lock().unwrap().contains(&path) {
+                    continue;
+                }
                 // Tier-3: yield to client requests and the scan hold.
                 gate.yield_to_priority(crate::server::io_gate::SCAN_HOLD_PAUSE);
-                crate::fs_utils::previews::ensure_screen_preview(&path, None, None);
+                let sig = screen_sigs.read().unwrap().get(&path).copied();
+                crate::fs_utils::previews::ensure_screen_preview(&path, sig);
             });
         }
         store
@@ -299,6 +324,14 @@ impl PreviewStore {
     pub fn note_dims(&self, path: &PathBuf, dims: (u32, u32)) {
         if dims != (0, 0) {
             self.dims.write().unwrap().insert(path.clone(), dims);
+        }
+    }
+
+    /// Record the folded source signature so preview production can
+    /// resolve a pack hit without stat'ing the source on slow mounts.
+    pub fn note_sig(&self, path: &PathBuf, sig: u64) {
+        if sig != 0 {
+            self.sigs.write().unwrap().insert(path.clone(), sig);
         }
     }
 
@@ -327,13 +360,16 @@ impl PreviewStore {
         let pins: HashSet<PathBuf> = paths.into_iter().collect();
         let missing: Vec<PathBuf> = {
             let mut ram = self.ram.lock().unwrap();
-            ram.pinned = pins;
+            ram.pinned = pins.clone();
             ram.pinned
                 .iter()
                 .filter(|p| !ram.cache.contains(*p))
                 .cloned()
                 .collect()
         };
+        // The deferred screen-fill only prefetches fullscreen previews
+        // for the pinned album head.
+        self.screen.set_allowed(pins);
         for path in &missing {
             // Idempotent: the pool dedupes, so an already-queued preview is
             // not produced twice.
@@ -452,7 +488,8 @@ impl PreviewStore {
         // produce is shared.
         let _permit = self.produce_gate.acquire_client();
         let hint = self.dims.read().unwrap().get(path).copied();
-        let preview = produce_preview_bytes(path, hint).map(|(jpeg, w, h)| Preview {
+        let sig = self.sigs.read().unwrap().get(path).copied();
+        let preview = produce_preview_bytes(path, hint, sig).map(|(jpeg, w, h)| Preview {
             jpeg: Arc::new(jpeg),
             w,
             h,

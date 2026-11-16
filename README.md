@@ -121,7 +121,7 @@ imagecropper album -m ~/keep -r ~/incoming-photos
 *   **Arrow Keys**: Move the focused tile (plain arrows select it, **Shift** extends the selection, **Ctrl** moves without changing the selection).
 *   **Space**: Toggle the focused image's selection.
 *   **Ctrl + A**: Select all images.
-*   **Delete**: Selected tiles vanish immediately; the actual move to `.imagecropper-trash` runs on a background deletion queue whose worker count tracks the preview pool's autotuned concurrency (same storage, same optimal parallelism). The top line shows the live queue (`deleting N`, `moving N`).
+*   **Delete**: Selected tiles vanish immediately; the actual move to `.imagecropper-trash` runs on a background deletion queue whose worker count tracks the preview pool's autotuned concurrency (same storage, same optimal parallelism). With `--force-delete` the files are unlinked permanently on a fixed pool of 32 threads instead. The top line shows the live queue (`deleting N`, `moving N`).
 *   **m**: Same flow for the `-m/--move` directory — tiles vanish at keypress, the move completes in the background. (No-op with a status hint when `-m` was not given.)
 *   **f (hold)**: Loupe the image under the mouse fullscreen (falls back to the focused image when hovering nothing) using the preloaded ≤1920px preview; release to return to the grid. Moving the mouse while held switches the loupe to the newly hovered tile.
 *   **+ / -**: Fine-grained zoom of the tile size.
@@ -214,7 +214,7 @@ imagecropper crop [OPTIONS] <PATHS>...
 
 *   **Cropped Images**: Saved in the same directory with the `.avif` extension.
 *   **Originals**: Moved to `.imagecropper-originals/` in the directory where the image is located.
-*   **Trash**: Moved to `.imagecropper-trash/` in the directory where the image is located.
+*   **Trash**: Moved to `.imagecropper-trash/` in the directory where the image is located — unless `--force-delete` is given, which unlinks the file permanently instead.
 
 ## License
 

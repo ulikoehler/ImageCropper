@@ -15,7 +15,7 @@ fn drain(rx: std::sync::mpsc::Receiver<ScanEvent>) -> (Vec<(PathBuf, u64)>, Vec<
     let mut errors = Vec::new();
     for ev in rx {
         match ev {
-            ScanEvent::Found { path, bytes } => found.push((path, bytes)),
+            ScanEvent::Found { path, bytes, .. } => found.push((path, bytes)),
             ScanEvent::Cached { path, bytes, .. } => found.push((path, bytes)),
             ScanEvent::Error(e) => errors.push(e),
         }
@@ -32,6 +32,7 @@ fn scan_args(root: &std::path::Path) -> ScanArgs {
         blacklist: vec![],
         parallel: 4,
         dry_run: false,
+        force_delete: false,
         verbose: false,
         inverse: false,
         order: SortOrder::Filename,

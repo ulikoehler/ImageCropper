@@ -17,7 +17,9 @@ use image::DynamicImage;
 
 use crate::{
     fs_utils::{prepare_dir, sigint_received, verbose, PREVIEWS_DIR},
-    image_utils::{decode_image_bytes, decode_image_bytes_tagged, resize_to_fit},
+    image_utils::{
+        decode_image_bytes, decode_image_bytes_tagged_cpu, resize_to_fit,
+    },
 };
 
 /// Maximum dimension of generated previews (pixels). Pack records carry
@@ -97,31 +99,32 @@ pub fn screen_dir_for(source: &Path) -> PathBuf {
         .join(format!("{:016x}", source_key(source)))
 }
 
-/// Screen-preview path for a known signature — no I/O at all.
-fn screen_path_with_sig(source: &Path, len: u64, nanos: u128) -> PathBuf {
-    let sig = len ^ nanos as u64 ^ (nanos >> 64) as u64;
+/// Screen-preview path for a known signature — no I/O at all. `sig` is
+/// the folded `(len, nanos)` signature `preview_sig_u64` returns.
+fn screen_path_with_sig(source: &Path, sig: u64) -> PathBuf {
     screen_dir_for(source).join(format!("{sig}-f{SCREEN_MAX_DIM}.jpg"))
 }
 
 /// Expected fullscreen-preview path for the source's current signature.
 /// Stale variants (different signature) are pruned on write.
 pub fn screen_preview_path(source: &Path) -> Option<PathBuf> {
-    let (len, nanos) = source_signature(source)?;
-    Some(screen_path_with_sig(source, len, nanos))
+    let sig = preview_sig_u64(source)?;
+    Some(screen_path_with_sig(source, sig))
 }
 
 /// Read the cached fullscreen preview, generating + persisting it if
-/// missing. Returns (jpeg bytes, preview w, preview h).
-pub fn produce_screen_jpeg(source: &Path) -> Option<(Vec<u8>, u32, u32)> {
+/// missing. `sig_hint` carries a scan-time signature so the `stat` can
+/// be skipped entirely on slow mounts. Returns (jpeg bytes, w, h).
+pub fn produce_screen_jpeg(source: &Path, sig_hint: Option<u64>) -> Option<(Vec<u8>, u32, u32)> {
     // Ctrl-C: no new production — this runs on detached blocking tasks that
     // outlive the pools' cancel.
     if sigint_received() {
         return None;
     }
-    let (len, nanos) = source_signature(source)?;
-    let path = screen_path_with_sig(source, len, nanos);
+    let sig = sig_hint.or_else(|| preview_sig_u64(source))?;
+    let path = screen_path_with_sig(source, sig);
     if !path.exists() {
-        ensure_screen_preview(source, None, Some((len, nanos)));
+        ensure_screen_preview(source, Some(sig));
     }
     let jpeg = std::fs::read(&path).ok()?;
     // Dimensions from the bytes in hand — never re-open the file.
@@ -135,8 +138,8 @@ pub fn produce_screen_jpeg(source: &Path) -> Option<(Vec<u8>, u32, u32)> {
 
 /// Like [`produce_screen_jpeg`] but returns the decoded preview image —
 /// the form the native hold-`f` fullscreen view needs.
-pub fn produce_screen_image(source: &Path) -> Option<DynamicImage> {
-    let (jpeg, _, _) = produce_screen_jpeg(source)?;
+pub fn produce_screen_image(source: &Path, sig_hint: Option<u64>) -> Option<DynamicImage> {
+    let (jpeg, _, _) = produce_screen_jpeg(source, sig_hint)?;
     decode_image_bytes(source, &jpeg).ok()
 }
 
@@ -175,67 +178,17 @@ fn persist_screen_jpeg(source: &Path, expected: &Path, screen: &DynamicImage, en
     persist_screen_bytes(source, expected, &jpeg, engine);
 }
 
-/// Submit the screen-size encode chain off the session's decoded
-/// buffer — returns the pending job + target path so the caller can
-/// overlap it with other GPU work before `finish`. The full-res
-/// pixels never round-trip through the host.
-fn screen_encode_start(
-    source: &Path,
-    session: &crate::gpujpeg::GpuJpeg,
-    sig: Option<(u64, u128)>,
-) -> Option<(PathBuf, crate::gpujpeg::EncodeJob)> {
-    let (len, nanos) = sig.or_else(|| source_signature(source))?;
-    let expected = screen_path_with_sig(source, len, nanos);
-    if expected.exists() {
-        return None;
-    }
-    let job = session.encode_resized_start(
-        SCREEN_MAX_DIM,
-        SCREEN_MAX_DIM,
-        PREVIEW_JPEG_QUALITY.into(),
-    )?;
-    Some((expected, job))
-}
-
-/// Resolve a [`screen_encode_start`] job and persist the JPEG.
-fn screen_encode_finish(job: Option<(PathBuf, crate::gpujpeg::EncodeJob)>, source: &Path) {
-    if let Some((expected, job)) = job {
-        if let Some((jpeg, _, _)) = job.finish() {
-            persist_screen_bytes(source, &expected, &jpeg, "gpu");
-        }
-    }
-}
-
-/// GPU-session variant of [`ensure_screen_preview`]: resizes straight
-/// off the session's decoded buffer — the full-res pixels never
-/// round-trip through the host.
-fn ensure_screen_preview_gpu(
-    source: &Path,
-    session: &crate::gpujpeg::GpuJpeg,
-    sig: Option<(u64, u128)>,
-) {
-    let pending = screen_encode_start(source, session, sig);
-    screen_encode_finish(pending, source);
-}
-
-/// Ensure a fullscreen-size preview exists in the global cache. `decoded`
-/// may pass an already-decoded source image to avoid a second decode;
-/// `sig` carries the caller's `source_signature` to skip a second stat.
-pub(crate) fn ensure_screen_preview(
-    source: &Path,
-    decoded: Option<&DynamicImage>,
-    sig: Option<(u64, u128)>,
-) {
-    let Some((len, nanos)) = sig.or_else(|| source_signature(source)) else {
+/// Ensure a fullscreen-size preview exists in the global cache. `sig`
+/// carries the caller's folded signature (`preview_sig_u64`) to skip a
+/// stat on slow mounts; a stale hint just misses `expected.exists()`
+/// and regenerates under the hinted name — the read below is current
+/// content either way, and stale variants are pruned on write.
+pub(crate) fn ensure_screen_preview(source: &Path, sig: Option<u64>) {
+    let Some(sig) = sig.or_else(|| preview_sig_u64(source)) else {
         return;
     };
-    let expected = screen_path_with_sig(source, len, nanos);
+    let expected = screen_path_with_sig(source, sig);
     if expected.exists() {
-        return;
-    }
-    if let Some(img) = decoded {
-        let screen = resize_to_fit(img.clone(), SCREEN_MAX_DIM, SCREEN_MAX_DIM);
-        persist_screen_jpeg(source, &expected, &screen, "cpu");
         return;
     }
     let Some(bytes) = std::fs::read(source).ok() else {
@@ -366,19 +319,46 @@ fn preview_belongs_to(preview_name: &str, sources: &HashSet<String>) -> bool {
 /// Load the cached preview or generate, persist and return a fresh one.
 /// Returns the decoded preview image (≤ `THUMB_MAX_DIM`).
 ///
-/// Cache-hit I/O on slow/remote filesystems is kept minimal: one
-/// `stat` (signature) plus one `read` of the deterministic preview
-/// path — no directory scan, no second stat, no touching the source.
-pub fn produce_preview_image(path: &Path) -> Option<DynamicImage> {
-    let (len, nanos) = source_signature(path)?;
+/// `sig_hint` carries the scan-time signature: a pack hit then needs no
+/// `stat` at all — on slow mounts that is one less round-trip per file.
+/// A stale hint simply misses and the normal signature path runs.
+///
+/// Cache-hit I/O on slow/remote filesystems is kept minimal: at most one
+/// `stat` (signature) plus one `read` of the pack record — no directory
+/// scan, no touching the source.
+pub fn produce_preview_image(path: &Path, sig_hint: Option<u64>) -> Option<DynamicImage> {
     let source_name = path.file_name()?.to_string_lossy().into_owned();
     let dir = previews_dir_for(path);
+
+    // Fast path: caller knows the scan-time signature — resolve the live
+    // pack variant without stat'ing the source.
+    if let Some(sig) = sig_hint.filter(|s| *s != 0) {
+        if let Some(pack) = crate::fs_utils::pack::pack_for(&dir) {
+            let mut pack = pack.lock().unwrap();
+            if let Some((jpeg, _)) = pack.lookup_sig(&source_name, sig, THUMB_MAX_DIM as u16) {
+                // Cached thumbnails are ≤256px — decode on CPU; a GPU
+                // round-trip costs more than zune at this size.
+                let (decoded, engine) = decode_image_bytes_tagged_cpu(path, &jpeg);
+                if let Ok(img) = decoded {
+                    if verbose() {
+                        eprintln!("preview cache hit [{engine}]: {}", path.display());
+                    }
+                    return Some(img);
+                }
+                pack.remove(&source_name);
+            }
+        }
+    }
+
+    let (len, nanos) = source_signature(path)?;
 
     // Fast path: the pack has a current-signature thumbnail for this file.
     if let Some(pack) = crate::fs_utils::pack::pack_for(&dir) {
         let mut pack = pack.lock().unwrap();
         if let Some((jpeg, _)) = pack.lookup(&source_name, len, nanos, THUMB_MAX_DIM as u16) {
-            let (decoded, engine) = decode_image_bytes_tagged(path, &jpeg);
+            // Cached thumbnails are ≤256px — decode on CPU; a GPU
+            // round-trip costs more than zune at this size.
+            let (decoded, engine) = decode_image_bytes_tagged_cpu(path, &jpeg);
             if let Ok(img) = decoded {
                 if verbose() {
                     eprintln!("preview cache hit [{engine}]: {}", path.display());
@@ -391,26 +371,25 @@ pub fn produce_preview_image(path: &Path) -> Option<DynamicImage> {
     }
 
     // Slow path: decode the source, downscale, persist. Restart-marker
-    // JPEGs go entirely through the GPU session — decode + both resizes
+    // JPEGs go entirely through the GPU session — decode + the resize
     // run on the GPU and the full-res image never reaches the host. A
     // session whose resample buffers exceed the device limits falls
-    // through to the CPU decode.
+    // through to the CPU decode. The fullscreen preview is NOT generated
+    // here — it is produced lazily on hold-`f`/screen-fill, never inline
+    // on the thumbnail hot path.
     let bytes = std::fs::read(path).ok()?;
     let hash = sha256_hex(&bytes);
-    let gpu = crate::gpujpeg::open(&bytes)
-        .and_then(|s| s.resize_image(THUMB_MAX_DIM, THUMB_MAX_DIM).map(|img| (s, img)));
-    let (thumb, engine) = match gpu {
-        Some((session, img)) => {
-            ensure_screen_preview_gpu(path, &session, Some((len, nanos)));
-            (img, "gpu")
-        }
+    let thumb = match crate::gpujpeg::open(&bytes)
+        .and_then(|s| s.resize_image(THUMB_MAX_DIM, THUMB_MAX_DIM))
+    {
+        Some(img) => (img, "gpu"),
         None => {
             let image = decode_image_bytes(path, &bytes).ok()?;
             drop(bytes);
-            ensure_screen_preview(path, Some(&image), Some((len, nanos)));
             (resize_to_fit(image, THUMB_MAX_DIM, THUMB_MAX_DIM), "cpu")
         }
     };
+    let (thumb, engine) = thumb;
     persist_preview(path, len, nanos, &source_name, &thumb, &hash);
     if verbose() {
         eprintln!("preview generated [{engine}]: {}", path.display());
@@ -425,17 +404,44 @@ pub fn produce_preview_image(path: &Path) -> Option<DynamicImage> {
 ///
 /// `dims_hint` (w,h already known — e.g. from the manifest) lets a cache
 /// hit skip opening the source file entirely; without it the source's
-/// header is read for dimensions, same as before.
+/// header is read for dimensions, same as before. `sig_hint` carries
+/// the scan-time signature: a pack hit then skips the `stat` too —
+/// callers that pass `Some((0, 0))` as dims (e.g. headless pregeneration,
+/// which discards dimensions) get a pure pack read with zero source I/O.
 pub fn produce_preview_bytes(
     path: &Path,
     dims_hint: Option<(u32, u32)>,
+    sig_hint: Option<u64>,
 ) -> Option<(Vec<u8>, u32, u32)> {
     if sigint_received() {
         return None;
     }
-    let (len, nanos) = source_signature(path)?;
     let source_name = path.file_name()?.to_string_lossy().into_owned();
     let dir = previews_dir_for(path);
+
+    // Fast path: caller knows the scan-time signature — a pack hit needs
+    // no stat at all (one less round-trip per file on slow mounts).
+    if let Some(sig) = sig_hint.filter(|s| *s != 0) {
+        if let Some(pack) = crate::fs_utils::pack::pack_for(&dir) {
+            let mut pack = pack.lock().unwrap();
+            if let Some((jpeg, _hash)) =
+                pack.lookup_sig(&source_name, sig, THUMB_MAX_DIM as u16)
+            {
+                if jpeg_plausible(&jpeg) {
+                    let dims = dims_hint
+                        .or_else(|| image::image_dimensions(path).ok())
+                        .unwrap_or((0, 0));
+                    if verbose() {
+                        eprintln!("preview cache hit [pack-sig]: {}", path.display());
+                    }
+                    return Some((jpeg, dims.0, dims.1));
+                }
+                pack.remove(&source_name);
+            }
+        }
+    }
+
+    let (len, nanos) = source_signature(path)?;
 
     if let Some(pack) = crate::fs_utils::pack::pack_for(&dir) {
         let mut pack = pack.lock().unwrap();

@@ -28,7 +28,7 @@ fn thumbnailer_generates_and_persists_previews() {
     write_image(&image_path, &solid_image(2000, 1000, [255, 0, 0, 255]));
 
     let mut thumbnailer = Thumbnailer::new(2);
-    thumbnailer.request(image_path.clone());
+    thumbnailer.request(image_path.clone(), 0);
 
     // Wait for the worker to deliver a thumbnail.
     let deadline = Instant::now() + Duration::from_secs(30);
@@ -79,7 +79,7 @@ fn changed_source_produces_fresh_preview() {
     write_image(&image_path, &solid_image(64, 64, [0, 255, 0, 255]));
 
     let mut thumbnailer = Thumbnailer::new(1);
-    thumbnailer.request(image_path.clone());
+    thumbnailer.request(image_path.clone(), 0);
     let deadline = Instant::now() + Duration::from_secs(30);
     while Instant::now() < deadline && thumbnailer.poll().is_empty() {
         std::thread::sleep(Duration::from_millis(20));
@@ -102,8 +102,8 @@ fn remove_previews_for_deletes_cached_files() {
     let other = root.join("other.png");
     write_image(&source, &solid_image(16, 16, [1, 1, 1, 255]));
     write_image(&other, &solid_image(16, 16, [2, 2, 2, 255]));
-    imagecropper::fs_utils::previews::produce_preview_bytes(&source, None).unwrap();
-    imagecropper::fs_utils::previews::produce_preview_bytes(&other, None).unwrap();
+    imagecropper::fs_utils::previews::produce_preview_bytes(&source, None, None).unwrap();
+    imagecropper::fs_utils::previews::produce_preview_bytes(&other, None, None).unwrap();
     assert!(imagecropper::fs_utils::previews::persisted_thumb_for_test(&source).is_some());
     assert!(imagecropper::fs_utils::previews::persisted_thumb_for_test(&other).is_some());
 
@@ -131,7 +131,7 @@ fn remove_previews_for_many_purges_only_listed_sources() {
         .map(|(i, name)| {
             let p = root.join(name);
             write_image(&p, &solid_image(12, 12, [i as u8, 0, 0, 255]));
-            imagecropper::fs_utils::previews::produce_preview_bytes(&p, None).unwrap();
+            imagecropper::fs_utils::previews::produce_preview_bytes(&p, None, None).unwrap();
             p
         })
         .collect();
@@ -158,7 +158,7 @@ fn thumbnailer_reports_failures_for_undecodable_files() {
     std::fs::write(&path, b"not an image").unwrap();
 
     let mut thumbnailer = Thumbnailer::new(1);
-    thumbnailer.request(path);
+    thumbnailer.request(path, 0);
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut result = None;
     while Instant::now() < deadline {

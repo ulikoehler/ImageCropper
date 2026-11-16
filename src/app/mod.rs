@@ -37,6 +37,8 @@ pub struct AppOptions {
     pub format: OutputFormat,
     pub parallel: usize,
     pub benchmark: bool,
+    /// Unlink deleted files permanently instead of moving to trash.
+    pub force_delete: bool,
     /// When true, shutdown requests set `exit_to_album` instead of closing
     /// the window — used when the crop UI is embedded inside the album view.
     pub embedded: bool,
@@ -72,6 +74,8 @@ pub struct ImageCropperApp {
     /// Set when the app is embedded in the album view and the user asked to
     /// leave crop mode (Esc, or after the image list completed).
     pub exit_to_album: bool,
+    /// `--force-delete`: unlink instead of moving to `.imagecropper-trash`.
+    pub force_delete: bool,
     /// Streaming directory scan (background); `None` once complete.
     pub scan_rx: Option<std::sync::mpsc::Receiver<crate::fs_utils::ScanEvent>>,
     pub scan_done: bool,
@@ -146,6 +150,7 @@ impl ImageCropperApp {
             exit_summary_printed: false,
             embedded: options.embedded,
             exit_to_album: false,
+            force_delete: options.force_delete,
             scan_done: scan_rx.is_none(),
             scan_rx,
             scan_order,
@@ -529,7 +534,11 @@ impl ImageCropperApp {
         };
 
         if self.dry_run {
-            println!("Dry run: would move {} to {}", path.display(), TRASH_DIR);
+            if self.force_delete {
+                println!("Dry run: would unlink {}", path.display());
+            } else {
+                println!("Dry run: would move {} to {}", path.display(), TRASH_DIR);
+            }
             self.status = format!("Dry run: skipped deleting {}", path.display());
             self.advance(ctx, render_state);
             return;
@@ -546,18 +555,29 @@ impl ImageCropperApp {
             }
         }
 
-        let parent = path.parent().unwrap_or_else(|| Path::new("."));
-        let Ok(target_dir) = prepare_dir(parent, TRASH_DIR) else {
-            self.status = "Unable to prepare trash directory".into();
-            return;
-        };
-        if let Err(err) = move_with_unique_name(&path, &target_dir) {
-            self.status = format!("Failed to delete: {err:#}");
-            return;
+        if self.force_delete {
+            if let Err(err) = std::fs::remove_file(&path) {
+                self.status = format!("Failed to delete: {err:#}");
+                return;
+            }
+        } else {
+            let parent = path.parent().unwrap_or_else(|| Path::new("."));
+            let Ok(target_dir) = prepare_dir(parent, TRASH_DIR) else {
+                self.status = "Unable to prepare trash directory".into();
+                return;
+            };
+            if let Err(err) = move_with_unique_name(&path, &target_dir) {
+                self.status = format!("Failed to delete: {err:#}");
+                return;
+            }
         }
         remove_previews_for(&path);
 
-        self.status = format!("Moved {} to {}", path.display(), TRASH_DIR);
+        self.status = if self.force_delete {
+            format!("Deleted {}", path.display())
+        } else {
+            format!("Moved {} to {}", path.display(), TRASH_DIR)
+        };
         self.canvas.clear();
         self.loader.cache.remove(&path);
         self.files.remove(self.current_index);

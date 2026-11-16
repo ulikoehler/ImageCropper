@@ -107,7 +107,7 @@ pub struct ActionDone {
     pub new_path: Option<PathBuf>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
-    /// For crop/resave: the new file's sig; for delete: trashed bytes.
+    /// For crop/resave: the new file's sig; for delete: deleted bytes.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub new_sig: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -153,15 +153,17 @@ pub fn verify_sig(path: &Path, expected: u64) -> Result<()> {
 
 /// Execute one action. `path` is the manifest-resolved source path.
 /// `move_dir` is the `-m/--move` destination; required for `Action::Move`.
+/// `force_delete` unlinks on `Action::Delete` instead of trashing.
 pub fn execute(
     action: &Action,
     path: &Path,
     saver: &mut Saver,
     move_dir: Option<&Path>,
+    force_delete: bool,
 ) -> Result<(Option<u64>, Option<u64>)> {
     match action {
         Action::Delete { sig, .. } => {
-            let bytes = trash_one(path, *sig)?;
+            let bytes = delete_one(path, *sig, force_delete)?;
             remove_previews_for(path);
             Ok((None, Some(bytes)))
         }
@@ -234,13 +236,18 @@ pub fn execute(
     }
 }
 
-/// Move `path` into the trash directory next to it. Returns bytes trashed.
-fn trash_one(path: &Path, sig: u64) -> Result<u64> {
+/// Delete `path`: unlink permanently under `force_delete` (`--force-delete`),
+/// else move it into the trash directory next to it. Returns bytes deleted.
+fn delete_one(path: &Path, sig: u64, force_delete: bool) -> Result<u64> {
     verify_sig(path, sig)?;
     let bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let trash = prepare_dir(parent, TRASH_DIR)?;
-    move_with_unique_name(path, &trash)?;
+    if force_delete {
+        std::fs::remove_file(path)?;
+    } else {
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        let trash = prepare_dir(parent, TRASH_DIR)?;
+        move_with_unique_name(path, &trash)?;
+    }
     Ok(bytes)
 }
 
@@ -301,7 +308,12 @@ struct DestructivePool {
 }
 
 impl DestructivePool {
-    fn new(workers: usize, move_dir: Option<PathBuf>, gate: Arc<IoGate>) -> Self {
+    fn new(
+        workers: usize,
+        move_dir: Option<PathBuf>,
+        gate: Arc<IoGate>,
+        force_delete: bool,
+    ) -> Self {
         let queues = Arc::new((
             Mutex::new(JobQueues {
                 moves: VecDeque::new(),
@@ -345,7 +357,7 @@ impl DestructivePool {
                 // to take the next job.
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     match job.kind {
-                        ActionKind::Delete => trash_one(&job.path, job.sig),
+                        ActionKind::Delete => delete_one(&job.path, job.sig, force_delete),
                         ActionKind::Move => move_one(&job.path, job.sig, move_dir.as_deref()),
                         ActionKind::Crop | ActionKind::Resave => unreachable!(),
                     }
@@ -435,8 +447,20 @@ pub struct ActionQueue {
 
 impl ActionQueue {
     /// `delete_workers` bounds how many deletes/moves run at once.
-    pub fn new(saver_threads: usize, delete_workers: usize, move_dir: Option<PathBuf>) -> Self {
-        Self::with_gate(saver_threads, delete_workers, move_dir, IoGate::new())
+    /// `force_delete` unlinks on delete instead of moving to trash.
+    pub fn new(
+        saver_threads: usize,
+        delete_workers: usize,
+        move_dir: Option<PathBuf>,
+        force_delete: bool,
+    ) -> Self {
+        Self::with_gate(
+            saver_threads,
+            delete_workers,
+            move_dir,
+            IoGate::new(),
+            force_delete,
+        )
     }
 
     /// Same as [`ActionQueue::new`] with the server's shared IO gate so
@@ -446,6 +470,7 @@ impl ActionQueue {
         delete_workers: usize,
         move_dir: Option<PathBuf>,
         gate: Arc<IoGate>,
+        force_delete: bool,
     ) -> Self {
         let (job_tx, job_rx) = mpsc::channel::<(u32, Action, PathBuf)>();
         let (result_tx, result_rx) = mpsc::channel::<ActionDone>();
@@ -511,7 +536,13 @@ impl ActionQueue {
                         // ActionDone instead of silently losing the job (the
                         // tag would sit in `serial` forever).
                         let exec = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            execute(&action, &path, &mut saver, serial_move_dir.as_deref())
+                            execute(
+                                &action,
+                                &path,
+                                &mut saver,
+                                serial_move_dir.as_deref(),
+                                force_delete,
+                            )
                         }))
                         .unwrap_or_else(|_| Err(anyhow!("worker panicked")));
                         match exec {
@@ -569,7 +600,12 @@ impl ActionQueue {
         Self {
             job_tx,
             result_rx: Mutex::new(result_rx),
-            destructive_pool: DestructivePool::new(delete_workers, move_dir, Arc::clone(&gate)),
+            destructive_pool: DestructivePool::new(
+                delete_workers,
+                move_dir,
+                Arc::clone(&gate),
+                force_delete,
+            ),
             immediate: Mutex::new(Vec::new()),
             destructive: Mutex::new(HashSet::new()),
             serial: Mutex::new(HashSet::new()),

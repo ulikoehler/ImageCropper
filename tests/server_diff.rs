@@ -44,6 +44,7 @@ fn rescan_keeps_ids_stable_and_never_resyncs() {
         None,
         4096,
         None,
+        false,
     );
     let ids_before: Vec<u32> = ["a.png", "b.png", "c.png", "d.png"]
         .iter()
@@ -95,6 +96,7 @@ fn rescan_appends_new_files_without_touching_existing_ids() {
         None,
         4096,
         None,
+        false,
     );
     let a_id = state.position_of(&root.join("a.png")).unwrap();
 
@@ -130,6 +132,7 @@ fn upsert_and_remove_broadcast_to_all_subscribers() {
         None,
         4096,
         None,
+        false,
     );
 
     // Two "clients" subscribed simultaneously.
@@ -188,6 +191,7 @@ fn marked_for_deletion_stays_out_of_rebuilds_and_upserts() {
         None,
         4096,
         None,
+        false,
     );
     let mut rx = state.events.subscribe();
 
@@ -248,6 +252,7 @@ fn restore_path_revives_a_failed_delete() {
         None,
         4096,
         None,
+        false,
     );
     let mut rx = state.events.subscribe();
     state.remove_path(&path_a);
@@ -301,6 +306,7 @@ fn finish_scan_broadcasts_resync_patch() {
         None,
         4096,
         None,
+        false,
     );
     let mut rx = state.events.subscribe();
 
@@ -340,6 +346,7 @@ fn a_completed_delete_stays_gone_through_stale_rescans() {
         None,
         4096,
         None,
+        false,
     );
     assert_eq!(state.item_count(), 1);
 
@@ -384,6 +391,7 @@ fn rescan_mid_insert_resyncs_into_sorted_order() {
         None,
         4096,
         None,
+        false,
     );
     let mut rx = state.events.subscribe();
 
@@ -422,6 +430,7 @@ fn rescan_without_reorder_never_resyncs_on_appends() {
         None,
         4096,
         None,
+        false,
     );
     let mut rx = state.events.subscribe();
 
@@ -466,6 +475,7 @@ fn moved_file_never_resurfaces_through_rescan() {
         None,
         4096,
         Some(dest.clone()),
+        false,
     );
     let mut rx = state.events.subscribe();
     let b = root.join("b.png");

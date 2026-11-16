@@ -4,7 +4,7 @@ use anyhow::Result;
 
 use crate::fs_utils::{
     adaptive_pool::AdaptivePool, move_with_unique_name, prepare_dir,
-    previews::remove_previews_for_many, TRASH_DIR,
+    previews::remove_previews_for_many, DELETE_WORKERS, TRASH_DIR,
 };
 
 /// Outcome of one queued deletion: number of bytes that were trashed.
@@ -14,13 +14,12 @@ pub struct DeleteResult {
 }
 
 /// Background queue that moves deleted images to `.imagecropper-trash`
-/// (same semantics as the crop UI) and removes their cached previews.
+/// (same semantics as the crop UI) — or unlinks them under
+/// `--force-delete` — and removes their cached previews.
 ///
-/// Concurrency self-tunes to the storage device like the preview pools, but
-/// with a much higher ceiling: trashing is metadata-only, so fast storage
-/// benefits from many parallel renames. It starts at the ceiling and probes
-/// down, so a bulk delete runs at full width immediately on SSD/NVMe while
-/// HDD/remote mounts settle to a lower count.
+/// Both modes run on a fixed pool of [`DELETE_WORKERS`] threads: delete
+/// throughput is bound by the filesystem, not decode CPU, and a fixed
+/// count avoids autotuning flapping on slow mounts.
 pub struct Deleter {
     pool: AdaptivePool<Result<u64>>,
     pub pending: HashSet<PathBuf>,
@@ -31,11 +30,16 @@ pub struct Deleter {
 }
 
 impl Deleter {
-    /// `concurrency` is the parallelism ceiling (e.g. `max(32, -j)`).
-    pub fn new(concurrency: usize) -> Self {
-        let concurrency = concurrency.max(1);
+    /// `force_delete` unlinks instead of trashing. `concurrency` is
+    /// accepted for API compatibility — the pool is always exactly
+    /// [`DELETE_WORKERS`] threads.
+    pub fn new(_concurrency: usize, force_delete: bool) -> Self {
+        let work: fn(&std::path::Path) -> Result<u64> =
+            if force_delete { force_delete_one } else { delete_one };
+        let pool = AdaptivePool::new(DELETE_WORKERS, DELETE_WORKERS, work);
+        pool.set_worker_override(DELETE_WORKERS);
         Self {
-            pool: AdaptivePool::new(concurrency, concurrency, delete_one),
+            pool,
             pending: HashSet::new(),
             cleanup: Vec::new(),
         }
@@ -72,5 +76,12 @@ fn delete_one(path: &std::path::Path) -> Result<u64> {
     let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
     let trash = prepare_dir(parent, TRASH_DIR)?;
     move_with_unique_name(path, &trash)?;
+    Ok(bytes)
+}
+
+/// `--force-delete`: unlink permanently — no trash directory involved.
+fn force_delete_one(path: &std::path::Path) -> Result<u64> {
+    let bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    std::fs::remove_file(path)?;
     Ok(bytes)
 }

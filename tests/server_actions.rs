@@ -12,12 +12,13 @@ fn delete_moves_to_trash_and_purges_previews() {
     with_temp_workdir(|root| {
         let img = root.join("a.png");
         write_image(&img, &solid_image(40, 40, [9, 9, 9, 255]));
-        produce_preview_bytes(&img, None).unwrap();
+        produce_preview_bytes(&img, None, None).unwrap();
         assert!(previews_dir_for(&img).read_dir().unwrap().next().is_some());
 
         let sig = preview_sig_u64(&img).unwrap();
         let mut saver = Saver::new(1);
-        let (_, bytes) = execute(&Action::Delete { id: 0, sig }, &img, &mut saver, None).unwrap();
+        let (_, bytes) =
+            execute(&Action::Delete { id: 0, sig }, &img, &mut saver, None, false).unwrap();
 
         assert!(!img.exists());
         assert!(root.join(TRASH_DIR).join("a.png").exists());
@@ -33,6 +34,75 @@ fn delete_moves_to_trash_and_purges_previews() {
 }
 
 #[test]
+fn force_delete_unlinks_without_trash() {
+    with_temp_workdir(|root| {
+        let img = root.join("a.png");
+        write_image(&img, &solid_image(40, 40, [9, 9, 9, 255]));
+        produce_preview_bytes(&img, None, None).unwrap();
+
+        let sig = preview_sig_u64(&img).unwrap();
+        let mut saver = Saver::new(1);
+        let (_, bytes) =
+            execute(&Action::Delete { id: 0, sig }, &img, &mut saver, None, true).unwrap();
+
+        assert!(!img.exists());
+        assert!(bytes.unwrap() > 0);
+        assert!(
+            !root.join(TRASH_DIR).exists(),
+            "force delete must not create the trash directory"
+        );
+        assert!(
+            previews_dir_for(&img)
+                .read_dir()
+                .map(|mut d| d.next().is_none())
+                .unwrap_or(true),
+            "previews purged with the file"
+        );
+    });
+}
+
+#[test]
+fn force_delete_queue_unlinks_bulk() {
+    with_temp_workdir(|root| {
+        let mut jobs = Vec::new();
+        for i in 0..40u32 {
+            let img = root.join(format!("bulk{i:02}.png"));
+            write_image(&img, &solid_image(8, 8, [i as u8, 0, 0, 255]));
+            let sig = preview_sig_u64(&img).unwrap();
+            jobs.push((img, sig));
+        }
+
+        let queue = ActionQueue::new(1, 32, None, true);
+        for (i, (path, sig)) in jobs.iter().enumerate() {
+            queue.dispatch(
+                i as u32,
+                Action::Delete {
+                    id: i as u32,
+                    sig: *sig,
+                },
+                path.clone(),
+            );
+        }
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let mut done = Vec::new();
+        while done.len() < jobs.len() && std::time::Instant::now() < deadline {
+            done.extend(queue.poll());
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert_eq!(done.len(), jobs.len(), "all delete actions completed");
+        assert!(done.iter().all(|d| d.ok), "all deletes succeeded");
+        for (path, _) in &jobs {
+            assert!(!path.exists(), "{} should be unlinked", path.display());
+        }
+        assert!(
+            !root.join(TRASH_DIR).exists(),
+            "force delete must not create the trash directory"
+        );
+    });
+}
+
+#[test]
 fn stale_sig_rejects() {
     with_temp_workdir(|root| {
         let img = root.join("a.png");
@@ -41,7 +111,7 @@ fn stale_sig_rejects() {
         // (producing the preview writes it). Without one the check cannot
         // tell mtime churn from a real change and records the hash instead
         // of blocking the action.
-        imagecropper::fs_utils::previews::produce_preview_bytes(&img, None).expect("preview");
+        imagecropper::fs_utils::previews::produce_preview_bytes(&img, None, None).expect("preview");
         let old_sig = preview_sig_u64(&img).unwrap();
 
         // Real content change → rejected, file untouched.
@@ -49,7 +119,7 @@ fn stale_sig_rejects() {
         write_image(&img, &solid_image(20, 12, [9, 9, 9, 255]));
         assert!(verify_sig(&img, old_sig).is_err());
         let mut saver = Saver::new(1);
-        let r = execute(&Action::Delete { id: 0, sig: old_sig }, &img, &mut saver, None);
+        let r = execute(&Action::Delete { id: 0, sig: old_sig }, &img, &mut saver, None, false);
         assert!(r.is_err());
         assert!(img.exists(), "rejected action must not touch the file");
     });
@@ -84,6 +154,7 @@ fn crop_action_queues_save() {
             &img,
             &mut saver,
             None,
+            false,
         )
         .unwrap();
         // Wait for the async save: original moves to .imagecropper-originals,
@@ -109,14 +180,20 @@ fn move_lands_in_move_dir_and_purges_previews() {
     with_temp_workdir(|root| {
         let img = root.join("b.png");
         write_image(&img, &solid_image(24, 24, [200, 100, 50, 255]));
-        produce_preview_bytes(&img, None).unwrap();
+        produce_preview_bytes(&img, None, None).unwrap();
         let dest = root.join("moved");
         std::fs::create_dir_all(&dest).unwrap();
 
         let sig = preview_sig_u64(&img).unwrap();
         let mut saver = Saver::new(1);
-        let (_, bytes) =
-            execute(&Action::Move { id: 0, sig }, &img, &mut saver, Some(&dest)).unwrap();
+        let (_, bytes) = execute(
+            &Action::Move { id: 0, sig },
+            &img,
+            &mut saver,
+            Some(&dest),
+            false,
+        )
+        .unwrap();
 
         assert!(!img.exists(), "source removed");
         assert!(dest.join("b.png").exists(), "file landed in move dir");
@@ -138,7 +215,7 @@ fn move_without_dir_errors() {
         write_image(&img, &solid_image(8, 8, [1, 1, 1, 255]));
         let sig = preview_sig_u64(&img).unwrap();
         let mut saver = Saver::new(1);
-        let r = execute(&Action::Move { id: 0, sig }, &img, &mut saver, None);
+        let r = execute(&Action::Move { id: 0, sig }, &img, &mut saver, None, false);
         assert!(r.is_err());
         assert!(img.exists());
     });
@@ -153,7 +230,7 @@ fn move_already_in_dir_errors() {
         write_image(&img, &solid_image(8, 8, [2, 2, 2, 255]));
         let sig = preview_sig_u64(&img).unwrap();
         let mut saver = Saver::new(1);
-        let r = execute(&Action::Move { id: 0, sig }, &img, &mut saver, Some(&dest));
+        let r = execute(&Action::Move { id: 0, sig }, &img, &mut saver, Some(&dest), false);
         assert!(r.is_err(), "moving a file onto itself is an error");
         assert!(img.exists());
     });
@@ -166,12 +243,12 @@ fn action_queue_deletes_bulk_in_parallel() {
         for i in 0..40u32 {
             let img = root.join(format!("bulk{i:02}.png"));
             write_image(&img, &solid_image(8, 8, [i as u8, 0, 0, 255]));
-            produce_preview_bytes(&img, None).unwrap();
+            produce_preview_bytes(&img, None, None).unwrap();
             let sig = preview_sig_u64(&img).unwrap();
             jobs.push((img, sig));
         }
 
-        let queue = ActionQueue::new(1, 32, None);
+        let queue = ActionQueue::new(1, 32, None, false);
         for (i, (path, sig)) in jobs.iter().enumerate() {
             queue.dispatch(
                 i as u32,
@@ -222,7 +299,7 @@ fn action_queue_deletes_bulk_in_parallel() {
 fn queued_deletes_all_finish() {
     with_temp_workdir(|root| {
         // One worker, many jobs: the queue is the thing under test.
-        let queue = ActionQueue::new(1, 1, None);
+        let queue = ActionQueue::new(1, 1, None, false);
         let mut tags = Vec::new();
         for i in 0..50u32 {
             let img = root.join(format!("queued{i:02}.png"));
@@ -262,7 +339,7 @@ fn moves_jump_ahead_of_queued_deletes() {
     with_temp_workdir(|root| {
         let move_dir = root.join("moved");
         std::fs::create_dir(&move_dir).unwrap();
-        let queue = ActionQueue::new(1, 1, Some(move_dir.clone()));
+        let queue = ActionQueue::new(1, 1, Some(move_dir.clone()), false);
 
         let mk = |name: &str| {
             let img = root.join(name);
@@ -307,7 +384,7 @@ fn moves_jump_ahead_of_queued_deletes() {
 fn deletes_yield_to_client_work_and_still_finish() {
     with_temp_workdir(|root| {
         let gate = imagecropper::server::IoGate::new();
-        let queue = ActionQueue::with_gate(1, 4, None, gate.clone());
+        let queue = ActionQueue::with_gate(1, 4, None, gate.clone(), false);
         let img = root.join("yield.png");
         write_image(&img, &solid_image(8, 8, [3, 3, 3, 255]));
         let sig = preview_sig_u64(&img).unwrap();

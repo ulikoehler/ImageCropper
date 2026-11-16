@@ -20,7 +20,7 @@ fn pinned_previews_are_never_evicted() {
         for i in 0..8u32 {
             let p = root.join(format!("img{i}.png"));
             write_image(&p, &solid_image(16, 16, [i as u8, 0, 0, 255]));
-            produce_preview_bytes(&p, None).unwrap();
+            produce_preview_bytes(&p, None, None).unwrap();
             paths.push(p);
         }
 
@@ -53,7 +53,7 @@ fn unpinned_previews_still_rotate() {
         for i in 0..6u32 {
             let p = root.join(format!("u{i}.png"));
             write_image(&p, &solid_image(16, 16, [0, i as u8, 0, 255]));
-            produce_preview_bytes(&p, None).unwrap();
+            produce_preview_bytes(&p, None, None).unwrap();
             paths.push(p);
         }
         let store = store(2, 0);
@@ -88,6 +88,7 @@ fn server_pins_the_first_live_items() {
             None,
             4096,
             None,
+            false,
         );
         state.refresh_pins();
         assert_eq!(state.previews.pinned_count(), 5);

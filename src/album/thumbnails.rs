@@ -33,24 +33,34 @@ pub struct ThumbResult {
 /// and stale preview files are cleaned up.
 pub struct Thumbnailer {
     pool: AdaptivePool<Option<egui::ColorImage>>,
-    /// Fullscreen-size (≤1920) preview jobs for hold-`f`.
+    /// Fullscreen-size (1920) preview jobs for hold-`f`.
     screen_pool: AdaptivePool<Option<egui::ColorImage>>,
     pub pending: HashSet<PathBuf>,
     pending_screen: HashSet<PathBuf>,
+    /// Scan-time signatures per path — a preview cache hit then needs no
+    /// source `stat`, one less round-trip per file on slow mounts.
+    sigs: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<PathBuf, u64>>>,
 }
 
 impl Thumbnailer {
     /// `concurrency` is the scaling ceiling (`-j`).
     pub fn new(concurrency: usize) -> Self {
+        let sigs =
+            std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        let thumb_sigs = sigs.clone();
+        let screen_sigs = sigs.clone();
         Self {
-            pool: AdaptivePool::new(2, concurrency.max(1), |path| {
-                produce_preview_image(path).map(|i| to_color_image(&i))
+            pool: AdaptivePool::new(2, concurrency.max(1), move |path| {
+                let sig = thumb_sigs.lock().unwrap().get(path).copied();
+                produce_preview_image(path, sig).map(|i| to_color_image(&i))
             }),
-            screen_pool: AdaptivePool::new(2, 4, |path| {
-                produce_screen_image(path).map(|i| to_color_image(&i))
+            screen_pool: AdaptivePool::new(2, 4, move |path| {
+                let sig = screen_sigs.lock().unwrap().get(path).copied();
+                produce_screen_image(path, sig).map(|i| to_color_image(&i))
             }),
             pending: HashSet::new(),
             pending_screen: HashSet::new(),
+            sigs,
         }
     }
 
@@ -60,11 +70,15 @@ impl Thumbnailer {
     }
 
     /// Queue a thumbnail job; deduplicates against in-flight jobs.
-    pub fn request(&mut self, path: PathBuf) {
+    /// `sig` is the scan-time signature (0 = unknown → the produce stats).
+    pub fn request(&mut self, path: PathBuf, sig: u64) {
         if self.pending.contains(&path) {
             return;
         }
         self.pending.insert(path.clone());
+        if sig != 0 {
+            self.sigs.lock().unwrap().insert(path.clone(), sig);
+        }
         self.pool.request(path);
     }
 
@@ -79,11 +93,14 @@ impl Thumbnailer {
     }
 
     /// Queue a fullscreen-size (≤1920) preview job for hold-`f`.
-    pub fn request_screen(&mut self, path: PathBuf) {
+    pub fn request_screen(&mut self, path: PathBuf, sig: u64) {
         if self.pending_screen.contains(&path) {
             return;
         }
         self.pending_screen.insert(path.clone());
+        if sig != 0 {
+            self.sigs.lock().unwrap().insert(path.clone(), sig);
+        }
         self.screen_pool.request(path);
     }
 

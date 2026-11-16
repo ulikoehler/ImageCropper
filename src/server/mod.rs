@@ -26,6 +26,8 @@ use axum::{routing::get, Router};
 use rand::seq::SliceRandom;
 use tokio::sync::broadcast;
 
+use crate::fs_utils::par_map;
+
 pub use actions::{Action, ActionDone, ActionEnvelope, ActionKind, ActionQueue, RotateOp};
 pub use io_gate::IoGate;
 pub use manifest::{Manifest, ManifestItem, ManifestPatch, ServeMode};
@@ -117,6 +119,7 @@ impl ServerState {
         token: Option<String>,
         push_credit_kb: u32,
         move_dir: Option<PathBuf>,
+        force_delete: bool,
     ) -> Arc<Self> {
         let manifest = Manifest::build(&files, &roots, mode, mouse_select, 1);
         // One gate for the whole server: preview production marks live
@@ -134,6 +137,7 @@ impl ServerState {
         for item in &manifest.items {
             if let Some(path) = manifest.path_of(item.id) {
                 previews.note_dims(&path, (item.w, item.h));
+                previews.note_sig(&path, item.sig);
             }
         }
         previews.request_all(files.iter());
@@ -144,9 +148,12 @@ impl ServerState {
             previews,
             actions: Arc::new(ActionQueue::with_gate(
                 parallel.max(1).min(4),
-                parallel.max(32),
+                // Deletes — trash moves and --force-delete unlinks — run
+                // on a fixed 32-thread pool, independent of -j.
+                crate::fs_utils::DELETE_WORKERS,
                 move_dir,
                 Arc::clone(&io_gate),
+                force_delete,
             )),
             events,
             mode,
@@ -267,50 +274,80 @@ impl ServerState {
         self.manifest.read().unwrap().position_of(path)
     }
 
+    /// Per-file manifest metadata for upserts. `known` carries whatever
+    /// the scan already knows for free: `(w, h, bytes, sig)` — `w == 0`
+    /// means dims are still unknown (a `Found` event: signature+size came
+    /// with the walker's stat, dims still need a header read). `None`
+    /// means nothing is known (action-driven upserts) — stat + sniff.
+    fn sniff_file(
+        &self,
+        path: PathBuf,
+        known: Option<(u32, u32, u64, u64)>,
+    ) -> (PathBuf, u32, u32, u64, u64) {
+        if let Some((w, h, bytes, sig)) = known {
+            if w != 0 && h != 0 {
+                return (path, w, h, bytes, sig);
+            }
+            // Signature known, dims not: an unchanged signature reuses
+            // stored dims — no stat and no header read at all.
+            if sig != 0 {
+                let m = self.manifest.read().unwrap();
+                if let Some(id) = m.positions.get(&path) {
+                    let it = &m.items[*id as usize];
+                    if it.sig == sig {
+                        return (path, it.w, it.h, bytes, sig);
+                    }
+                }
+            }
+            // Only the header read remains — sig+bytes need no stat.
+            let (w, h) = image::image_dimensions(&path).unwrap_or((0, 0));
+            return (path, w, h, bytes, sig);
+        }
+        // Nothing known: stat for the signature, reuse dims on match,
+        // then sniff the header and size.
+        let sig = crate::fs_utils::previews::preview_sig_u64(&path).unwrap_or(0);
+        if sig != 0 {
+            let m = self.manifest.read().unwrap();
+            if let Some(id) = m.positions.get(&path) {
+                let it = &m.items[*id as usize];
+                if it.sig == sig {
+                    return (path, it.w, it.h, it.bytes, sig);
+                }
+            }
+        }
+        let (w, h) = image::image_dimensions(&path).unwrap_or((0, 0));
+        let bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        (path, w, h, bytes, sig)
+    }
+
     /// Insert newly discovered files or update existing entries in place
     /// (streaming scan + post-action upserts). Keeps the positional id of
     /// known paths so client indexing stays stable; unknown paths append.
     /// Queues previews and broadcasts a `manifest-patch` event so clients
     /// upsert differentially instead of re-pulling the manifest.
     /// Returns how many items were inserted or updated.
-    /// `bytes` = walker-supplied size when known (`None` → sniffed here).
+    /// `known` = `(w, h, bytes, sig)` when the scan already knows them
+    /// (`w == 0` → dims still to sniff); `None` → fully sniffed here.
     pub fn upsert_files(&self, files: Vec<(PathBuf, Option<(u32, u32, u64, u64)>)>) -> usize {
         // Phase 1 (no lock): sniff per-file metadata — this is the I/O part
-        // and must not block manifest readers.
-        let sniffed: Vec<(PathBuf, u32, u32, u64, u64)> = files
+        // and must not block manifest readers. Parallel across the batch:
+        // each file costs an open+header-read, which dominates cold scans
+        // on fast storage.
+        let items: Vec<(PathBuf, Option<(u32, u32, u64, u64)>)> = files
             .into_iter()
             // Queued for delete/move — "marked for deletion", must not
             // resurface before the op lands. Already departed (a scan batch
             // enumerated the directory before the rename) — must not come
             // back either.
             .filter(|(p, _)| !self.actions.is_pending(p) && !self.is_gone(p))
-            .map(|(p, known)| {
-                // `known` may carry full cached metadata (files.pack seed):
-                // (w, h, bytes, sig) — only a stat is needed to reuse it.
-                if let Some((w, h, bytes, sig)) = known {
-                    return (p, w, h, bytes, sig);
-                }
-                // Mtime-only recheck: an unchanged signature reuses stored
-                // dims instead of re-sniffing the image header.
-                let sig = crate::fs_utils::previews::preview_sig_u64(&p).unwrap_or(0);
-                if sig != 0 {
-                    let m = self.manifest.read().unwrap();
-                    if let Some(id) = m.positions.get(&p) {
-                        let it = &m.items[*id as usize];
-                        if it.sig == sig {
-                            return (p, it.w, it.h, it.bytes, sig);
-                        }
-                    }
-                }
-                let (w, h) = image::image_dimensions(&p).unwrap_or((0, 0));
-                let bytes = std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
-                (p, w, h, bytes, sig)
-            })
             .collect();
-        // Feed the dims hint map before queueing — manifest sniffing already
-        // paid for this information, so preview cache hits won't pay again.
-        for (p, w, h, _, _) in &sniffed {
+        let sniffed: Vec<(PathBuf, u32, u32, u64, u64)> =
+            par_map(&items, |(p, known)| self.sniff_file(p.clone(), *known));
+        // Feed the dims/sig hint maps before queueing — manifest sniffing
+        // already paid for this, so preview cache hits won't stat again.
+        for (p, w, h, _, sig) in &sniffed {
             self.previews.note_dims(p, (*w, *h));
+            self.previews.note_sig(p, *sig);
         }
 
         let (added, patch_json) = {
@@ -519,11 +556,15 @@ impl ServerState {
     /// Sort `files` by the `-o` order, using the signature-keyed sort-key
     /// cache so repeated passes don't re-stat or re-parse every file.
     /// Equivalent to [`crate::cli::sort_files`] plus memoization.
+    /// `sigs` supplies known signatures (manifest or scan hints) so the
+    /// per-file validation `stat` is skipped entirely — on slow mounts
+    /// that is the difference between N round-trips and zero.
     pub fn sort_with_order(
         &self,
         files: &mut Vec<PathBuf>,
         order: crate::cli::SortOrder,
         inverse: bool,
+        sigs: Option<&HashMap<PathBuf, u64>>,
     ) {
         use crate::cli::SortOrder as S;
         match order {
@@ -540,8 +581,11 @@ impl ServerState {
                 let mut keyed: Vec<(Option<u128>, PathBuf)> = files
                     .drain(..)
                     .map(|path| {
-                        let sig =
-                            crate::fs_utils::previews::preview_sig_u64(&path).unwrap_or(0);
+                        let sig = sigs
+                            .and_then(|m| m.get(&path).copied())
+                            .unwrap_or_else(|| {
+                                crate::fs_utils::previews::preview_sig_u64(&path).unwrap_or(0)
+                            });
                         let cached = self
                             .key_cache
                             .lock()
@@ -616,16 +660,28 @@ impl ServerState {
             // renumbers slots the client tombstoned → tiles "reappear".
             return;
         }
-        let current: Vec<PathBuf> = {
+        // Manifest order + per-path sigs/hints in one pass — sorting and
+        // the hinted rebuild then need zero filesystem I/O for files the
+        // manifest already describes.
+        let (mut files, sigs, hints) = {
             let m = self.manifest.read().unwrap();
-            (0..m.items.len())
-                .filter_map(|i| m.path_of(i as u32))
-                .collect()
+            let mut files = Vec::new();
+            let mut sigs = HashMap::new();
+            let mut hints = HashMap::new();
+            for i in 0..m.items.len() {
+                if let Some(p) = m.path_of(i as u32) {
+                    let it = &m.items[i];
+                    files.push(p.clone());
+                    sigs.insert(p.clone(), it.sig);
+                    hints.insert(p, (it.w, it.h, it.bytes, it.sig));
+                }
+            }
+            (files, sigs, hints)
         };
-        let mut files = current.clone();
-        self.sort_with_order(&mut files, order, inverse);
+        let current = files.clone();
+        self.sort_with_order(&mut files, order, inverse, Some(&sigs));
         if files != current {
-            self.rebuild_manifest(files, &self.roots);
+            self.rebuild_manifest_hinted(files, &hints, &self.roots);
             self.broadcast_resync();
         }
     }
@@ -642,14 +698,23 @@ impl ServerState {
         if self.actions.pending() > 0 {
             return;
         }
-        let mut files: Vec<PathBuf> = {
+        let (mut files, sigs, hints) = {
             let m = self.manifest.read().unwrap();
-            (0..m.items.len())
-                .filter_map(|i| m.path_of(i as u32))
-                .collect()
+            let mut files = Vec::new();
+            let mut sigs = HashMap::new();
+            let mut hints = HashMap::new();
+            for i in 0..m.items.len() {
+                if let Some(p) = m.path_of(i as u32) {
+                    let it = &m.items[i];
+                    files.push(p.clone());
+                    sigs.insert(p.clone(), it.sig);
+                    hints.insert(p, (it.w, it.h, it.bytes, it.sig));
+                }
+            }
+            (files, sigs, hints)
         };
-        self.sort_with_order(&mut files, order, inverse);
-        self.rebuild_manifest(files, &self.roots);
+        self.sort_with_order(&mut files, order, inverse, Some(&sigs));
+        self.rebuild_manifest_hinted(files, &hints, &self.roots);
         self.broadcast_resync();
     }
 
@@ -770,6 +835,19 @@ impl ServerState {
     /// selection — during a delete storm that leaves the grid permanently
     /// blank while resyncs keep clearing what just arrived.
     pub fn rebuild_manifest_diff(&self, files: Vec<PathBuf>, roots: &[PathBuf], reorder: bool) {
+        self.rebuild_manifest_diff_hinted(files, &HashMap::new(), roots, reorder)
+    }
+
+    /// [`Self::rebuild_manifest_diff`] with scan-time `(w, h, bytes, sig)`
+    /// hints per path — a seeded rescan knows them for free, so unchanged
+    /// files cost zero I/O even on slow mounts.
+    pub fn rebuild_manifest_diff_hinted(
+        &self,
+        files: Vec<PathBuf>,
+        hints: &HashMap<PathBuf, (u32, u32, u64, u64)>,
+        roots: &[PathBuf],
+        reorder: bool,
+    ) {
         // Pending deletes must not resurface; departed paths must not come
         // back (the listing may predate the rename).
         let files: Vec<PathBuf> = files
@@ -812,7 +890,7 @@ impl ServerState {
                     .cloned(),
             );
             if expected != files {
-                self.rebuild_manifest(files, roots);
+                self.rebuild_manifest_hinted(files, hints, roots);
                 self.broadcast_resync();
                 return;
             }
@@ -830,22 +908,11 @@ impl ServerState {
                 })
                 .collect()
         };
-        let sniffed: Vec<(PathBuf, u32, u32, u64, u64)> = files
-            .iter()
-            .map(|path| {
-                let sig = crate::fs_utils::previews::preview_sig_u64(path).unwrap_or(0);
-                if let Some(&(w, h, bytes, old_sig)) = prior.get(path) {
-                    if sig == old_sig && sig != 0 {
-                        return (path.clone(), w, h, bytes, sig);
-                    }
-                }
-                let (w, h) = image::image_dimensions(path).unwrap_or((0, 0));
-                let bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-                (path.clone(), w, h, bytes, sig)
-            })
-            .collect();
-        for (p, w, h, _, _) in &sniffed {
+        let sniffed: Vec<(PathBuf, u32, u32, u64, u64)> =
+            par_map(&files, |path| sniff_item(path, hints.get(path).copied(), &prior));
+        for (p, w, h, _, sig) in &sniffed {
             self.previews.note_dims(p, (*w, *h));
+            self.previews.note_sig(p, *sig);
         }
 
         let (json, added) = {
@@ -958,6 +1025,18 @@ impl ServerState {
     /// Rebuild the manifest (e.g. after fs changes) and bump the version.
     /// Returns the new manifest for broadcast/patch purposes.
     pub fn rebuild_manifest(&self, files: Vec<PathBuf>, roots: &[PathBuf]) {
+        self.rebuild_manifest_hinted(files, &HashMap::new(), roots)
+    }
+
+    /// [`Self::rebuild_manifest`] with scan-time `(w, h, bytes, sig)`
+    /// hints per path — callers that just sorted the manifest can pass
+    /// its own signatures, making an unchanged-file rebuild cost zero I/O.
+    pub fn rebuild_manifest_hinted(
+        &self,
+        files: Vec<PathBuf>,
+        hints: &HashMap<PathBuf, (u32, u32, u64, u64)>,
+        roots: &[PathBuf],
+    ) {
         // Paths queued for delete/move are "marked for deletion" — a rebuild
         // must not resurrect them just because the file still exists. Paths
         // that already left (the listing predates the rename) must not come
@@ -981,16 +1060,20 @@ impl ServerState {
                     .collect();
             (m.version + 1, prior)
         };
+        // Sniff in parallel up front — `Manifest::build_with`'s closure is
+        // serial, so pre-computing keeps a full rebuild from becoming a
+        // serial stat+open per file.
+        let sniffed: std::collections::HashMap<PathBuf, (u32, u32, u64, u64)> =
+            par_map(&files, |p| sniff_item(p, hints.get(p).copied(), &prior))
+                .into_iter()
+                .map(|(p, w, h, b, s)| (p, (w, h, b, s)))
+                .collect();
+        for (p, (w, h, _, sig)) in &sniffed {
+            self.previews.note_dims(p, (*w, *h));
+            self.previews.note_sig(p, *sig);
+        }
         let sniff = move |path: &Path| {
-            let sig = crate::fs_utils::previews::preview_sig_u64(path).unwrap_or(0);
-            if let Some(&(w, h, bytes, old_sig)) = prior.get(path) {
-                if sig == old_sig && sig != 0 {
-                    return (w, h, bytes, sig);
-                }
-            }
-            let (w, h) = image::image_dimensions(path).unwrap_or((0, 0));
-            let bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-            (w, h, bytes, sig)
+            sniffed.get(path).copied().unwrap_or((0, 0, 0, 0))
         };
         // Re-filter right before the swap: a delete/move may have landed
         // while `files` was being sniffed — the tombstone must win.
@@ -1004,6 +1087,57 @@ impl ServerState {
         // The album order/contents changed — re-pin the top of it.
         self.pins_changed();
     }
+}
+
+/// Stat + dims for one path during a manifest (re)build, reusing `prior`
+/// dims/sig when the (size, mtime) signature is unchanged — a rescan then
+/// stats each file instead of re-parsing every image header, which matters
+/// a lot on slow/remote mounts. One `metadata` call yields both the folded
+/// signature and the byte size — the old code stat'd twice per changed
+/// file.
+fn sniff_path(
+    path: &Path,
+    prior: &std::collections::HashMap<PathBuf, (u32, u32, u64, u64)>,
+) -> (PathBuf, u32, u32, u64, u64) {
+    let (len, nanos) = crate::fs_utils::previews::source_signature(path).unwrap_or((0, 0));
+    let sig = len ^ nanos as u64 ^ (nanos >> 64) as u64;
+    if let Some(&(w, h, bytes, old_sig)) = prior.get(path) {
+        if sig == old_sig && sig != 0 {
+            return (path.to_path_buf(), w, h, bytes, sig);
+        }
+    }
+    let (w, h) = image::image_dimensions(path).unwrap_or((0, 0));
+    (path.to_path_buf(), w, h, len, sig)
+}
+
+/// [`sniff_path`] plus scan hints: `hint` = `(w, h, bytes, sig)` the scan
+/// already knows — `w == 0` means dims are unknown (header read only, no
+/// stat); a fully-known hint (seeded rescan, `Cached` event) costs zero
+/// I/O. A stale hint degrades to the hinted sig + a header read — still
+/// no stat.
+fn sniff_item(
+    path: &Path,
+    hint: Option<(u32, u32, u64, u64)>,
+    prior: &std::collections::HashMap<PathBuf, (u32, u32, u64, u64)>,
+) -> (PathBuf, u32, u32, u64, u64) {
+    if let Some((w, h, bytes, sig)) = hint {
+        if sig != 0 {
+            if w != 0 && h != 0 {
+                return (path.to_path_buf(), w, h, bytes, sig);
+            }
+            // Signature known, dims not: an unchanged signature reuses
+            // stored dims — no stat and no header read at all.
+            if let Some(&(pw, ph, _, psig)) = prior.get(path) {
+                if psig == sig {
+                    return (path.to_path_buf(), pw, ph, bytes, sig);
+                }
+            }
+            // Only the header read remains — sig+bytes need no stat.
+            let (w, h) = image::image_dimensions(path).unwrap_or((0, 0));
+            return (path.to_path_buf(), w, h, bytes, sig);
+        }
+    }
+    sniff_path(path, prior)
 }
 
 /// Spawn the streaming-scan feeder: paths from a [`crate::cli::ScanStream`]
@@ -1038,9 +1172,10 @@ pub fn spawn_scan_feeder(state: &Arc<ServerState>, stream: crate::cli::ScanStrea
         let mut last_report = t0;
         loop {
             let timed_out = match stream.rx.recv_timeout(FLUSH) {
-                Ok(ScanEvent::Found { path, bytes }) => {
-                    let _ = bytes;
-                    batch.push((path, None));
+                Ok(ScanEvent::Found { path, bytes, sig }) => {
+                    // sig+bytes came free with the walker's stat — the
+                    // upsert never needs to re-stat this file.
+                    batch.push((path, Some((0, 0, bytes, sig))));
                     found += 1;
                     false
                 }
@@ -1110,19 +1245,28 @@ pub fn spawn_scan_feeder(state: &Arc<ServerState>, stream: crate::cli::ScanStrea
         // Persist the scan result so the next run seeds instantly.
         {
             let m = state.manifest.read().unwrap();
-            let mut per_root: std::collections::HashMap<PathBuf, Vec<(PathBuf, String, u64, u128, u32, u32)>> =
-                std::collections::HashMap::new();
+            let mut per_root: std::collections::HashMap<
+                PathBuf,
+                Vec<(PathBuf, String, u64, u64, u32, u32)>,
+            > = std::collections::HashMap::new();
             for (i, it) in m.items.iter().enumerate() {
                 if it.removed {
                     continue;
                 }
                 let Some(p) = m.path_of(i as u32) else { continue };
-                let Some((len, nanos)) = crate::fs_utils::previews::source_signature(&p) else { continue };
                 let Some(parent) = p.parent() else { continue };
                 let root = state.roots.iter().find(|r| p.starts_with(r));
                 let Some(root) = root else { continue };
-                per_root.entry(root.clone()).or_default().push(
-                    (parent.to_path_buf(), it.name.clone(), len, nanos, it.w, it.h));
+                // it.bytes/it.sig are the signature the scan already
+                // recorded — no per-file stat needed to persist the pack.
+                per_root.entry(root.clone()).or_default().push((
+                    parent.to_path_buf(),
+                    it.name.clone(),
+                    it.bytes,
+                    it.sig,
+                    it.w,
+                    it.h,
+                ));
             }
             drop(m);
             for (root, files) in per_root {

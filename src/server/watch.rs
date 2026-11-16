@@ -2,6 +2,7 @@
 //! broadcasts `fs-changed` so clients re-pull. Debounced 250 ms; reserved
 //! dirs are excluded by the rescan itself (RESERVED_DIRS).
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::Arc;
@@ -64,22 +65,96 @@ pub fn spawn(state: Arc<ServerState>, scan: ScanArgs) {
         // is owned by this thread — it stays alive for the process lifetime.
         while rx.recv().is_ok() {
             while rx.recv_timeout(DEBOUNCE).is_ok() {}
-            if let Ok(mut files) = crate::cli::collect_files(&scan) {
-                // The listing arrives unsorted; apply the `-o` order
-                // through the shared signature-keyed cache (rescans must
-                // not re-stat/re-parse every file on a slow mount).
-                state.sort_with_order(&mut files, scan.order, scan.inverse);
-                // Differential rebuild: surviving files keep their ids, so
-                // clients keep thumbnails/wants/selection. A full resync
-                // here renumbers everything and — during a delete storm —
-                // keeps wiping the thumbnails that just arrived. It only
-                // happens when the sorted order itself changed (e.g. a new
-                // file inserting mid-list), never for plain deletes.
-                // Randomize is exempt — a shuffled listing must not force
-                // a reshuffle on every rescan.
-                let reorder = scan.order != crate::cli::SortOrder::Randomize;
-                state.rebuild_manifest_diff(files, &scan.paths, reorder);
+            // Seeded rescan: files.pack prunes unchanged leaf dirs and the
+            // walker skips stats for covered files — on slow mounts a full
+            // re-walk + re-stat per fs event is the dominant cost. The
+            // scan events carry (bytes, sig, dims) so the manifest rebuild
+            // needs no per-file stat either.
+            let mut seeds = Vec::new();
+            let mut skip = std::collections::HashSet::new();
+            for root in &scan.paths {
+                if let Some((dirs, s)) =
+                    crate::fs_utils::files_pack::load(root, scan.recursive)
+                {
+                    skip.extend(s);
+                    for (dir, rec) in dirs {
+                        for f in rec.files {
+                            seeds.push(crate::fs_utils::ScanEvent::Cached {
+                                path: dir.join(&f.name),
+                                w: f.w,
+                                h: f.h,
+                                bytes: f.len,
+                                sig: f.sig,
+                            });
+                        }
+                    }
+                }
             }
+            let filter = match crate::fs_utils::PathFilter::compile(
+                scan.filter_syntax,
+                &scan.whitelist,
+                &scan.blacklist,
+            ) {
+                Ok(f) => f,
+                Err(e) => {
+                    eprintln!("watch: {e}");
+                    continue;
+                }
+            };
+            let mut files = Vec::new();
+            let mut sigs = HashMap::new();
+            let mut hints = HashMap::new();
+            let mut saw_error = false;
+            crate::fs_utils::walk_images_seeded(
+                &scan.paths,
+                scan.recursive,
+                filter.as_ref(),
+                scan.max_files,
+                Some((seeds, skip)),
+                &mut |ev| match ev {
+                    crate::fs_utils::ScanEvent::Found { path, bytes, sig } => {
+                        files.push(path.clone());
+                        sigs.insert(path.clone(), sig);
+                        hints.insert(path, (0, 0, bytes, sig));
+                    }
+                    crate::fs_utils::ScanEvent::Cached {
+                        path,
+                        w,
+                        h,
+                        bytes,
+                        sig,
+                    } => {
+                        files.push(path.clone());
+                        sigs.insert(path.clone(), sig);
+                        hints.insert(path, (w, h, bytes, sig));
+                    }
+                    crate::fs_utils::ScanEvent::Error(e) => {
+                        eprintln!("watch: scan: {e}");
+                        saw_error = true;
+                    }
+                },
+            );
+            // A scan error aborts the rescan (same as the old
+            // collect_files → Err path): a partial listing would
+            // tombstone files that merely failed to stat. An empty
+            // result is likewise not a valid rescan.
+            if saw_error || files.is_empty() {
+                continue;
+            }
+            // The listing arrives unsorted; apply the `-o` order
+            // through the shared signature-keyed cache — scan sigs make
+            // the per-file validation stat unnecessary.
+            state.sort_with_order(&mut files, scan.order, scan.inverse, Some(&sigs));
+            // Differential rebuild: surviving files keep their ids, so
+            // clients keep thumbnails/wants/selection. A full resync
+            // here renumbers everything and — during a delete storm —
+            // keeps wiping the thumbnails that just arrived. It only
+            // happens when the sorted order itself changed (e.g. a new
+            // file inserting mid-list), never for plain deletes.
+            // Randomize is exempt — a shuffled listing must not force
+            // a reshuffle on every rescan.
+            let reorder = scan.order != crate::cli::SortOrder::Randomize;
+            state.rebuild_manifest_diff_hinted(files, &hints, &scan.paths, reorder);
         }
     });
 }

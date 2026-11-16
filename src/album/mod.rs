@@ -50,6 +50,8 @@ pub struct AlbumOptions {
     pub move_dir: Option<PathBuf>,
     /// Drag-select behavior: contiguous sequence vs rectangle intersect.
     pub mouse_select: crate::cli::MouseSelectMode,
+    /// Unlink deleted files permanently instead of moving to trash.
+    pub force_delete: bool,
     /// Options used when launching the embedded crop UI via `c`.
     pub crop: AppOptions,
 }
@@ -66,6 +68,9 @@ struct Entry {
     failed: bool,
     /// Byte size from the scan walker (0 when unknown).
     bytes: u64,
+    /// Folded content signature from the scan (0 when unknown) — lets a
+    /// preview cache hit skip the source stat on slow mounts.
+    sig: u64,
 }
 
 impl Entry {
@@ -78,6 +83,7 @@ impl Entry {
             full_color: None,
             failed: false,
             bytes,
+            sig: 0,
         }
     }
 }
@@ -157,6 +163,8 @@ pub struct AlbumApp {
     drag_active: bool,
     /// Drag-select mode (`sequence` default / `rubber-band`).
     mouse_select: crate::cli::MouseSelectMode,
+    /// `--force-delete`: unlink instead of moving to `.imagecropper-trash`.
+    force_delete: bool,
     /// Screen-space rects of the tiles painted this frame (hit-testing).
     painted: Vec<(usize, Rect)>,
 }
@@ -176,7 +184,7 @@ impl AlbumApp {
             entries: files.into_iter().map(|p| Entry::new(p, 0)).collect(),
             positions: HashMap::new(),
             thumbnailer: Thumbnailer::new(parallel),
-            deleter: Deleter::new(destructive_parallel),
+            deleter: Deleter::new(destructive_parallel, options.force_delete),
             mover: options
                 .move_dir
                 .clone()
@@ -217,6 +225,7 @@ impl AlbumApp {
             drag_anchor: None,
             drag_active: false,
             mouse_select: options.mouse_select,
+            force_delete: options.force_delete,
             painted: Vec::new(),
         }
         .reindex()
@@ -244,11 +253,34 @@ impl AlbumApp {
         if let Some(rx) = &self.scan_rx {
             loop {
                 match rx.try_recv() {
-                    Ok(ScanEvent::Found { path, bytes })
-                    | Ok(ScanEvent::Cached { path, bytes, .. }) => {
+                    Ok(ScanEvent::Found {
+                        path, bytes, sig, ..
+                    }) => {
                         if !self.positions.contains_key(&path) {
                             self.positions.insert(path.clone(), self.entries.len());
-                            self.entries.push(Entry::new(path, bytes));
+                            let mut e = Entry::new(path, bytes);
+                            e.sig = sig;
+                            self.entries.push(e);
+                        }
+                    }
+                    Ok(ScanEvent::Cached {
+                        path,
+                        w,
+                        h,
+                        bytes,
+                        sig,
+                    }) => {
+                        if !self.positions.contains_key(&path) {
+                            self.positions.insert(path.clone(), self.entries.len());
+                            let mut e = Entry::new(path, bytes);
+                            e.sig = sig;
+                            // files.pack knows the real dims — tiles get
+                            // the right shape immediately instead of
+                            // waiting for the thumbnail decode.
+                            if w != 0 && h != 0 {
+                                e.aspect = w as f32 / h as f32;
+                            }
+                            self.entries.push(e);
                         }
                     }
                     Ok(ScanEvent::Error(e)) => {
@@ -438,7 +470,7 @@ impl AlbumApp {
         if entry.color.is_some() || entry.texture.is_some() || entry.failed {
             return;
         }
-        self.thumbnailer.request(entry.path.clone());
+        self.thumbnailer.request(entry.path.clone(), entry.sig);
     }
 
     /// Painted tile whose center is closest to `p` — the sequence-mode
@@ -521,7 +553,11 @@ impl AlbumApp {
 
         if self.dry_run {
             for path in &paths {
-                println!("Dry run: would move {} to trash", path.display());
+                if self.force_delete {
+                    println!("Dry run: would unlink {}", path.display());
+                } else {
+                    println!("Dry run: would move {} to trash", path.display());
+                }
             }
             self.status = format!("Dry run: skipped deleting {} image(s)", paths.len());
         } else {
@@ -742,8 +778,20 @@ impl AlbumApp {
             }
 
             if keys.select_all {
-                self.selected = (0..self.entries.len()).collect();
-                self.status = format!("Selected all {} images", self.entries.len());
+                // Ctrl+A selects what's on screen — not the whole album —
+                // and skips tiles whose preview hasn't arrived yet (the
+                // "…" spinner): acting on files you can't see is how
+                // bulk deletes go wrong.
+                self.selected = self
+                    .last_visible
+                    .clone()
+                    .filter(|&i| {
+                        self.entries.get(i).is_some_and(|e| {
+                            e.texture.is_some() || e.color.is_some() || e.failed
+                        })
+                    })
+                    .collect();
+                self.status = format!("Selected {} visible images", self.selected.len());
             }
 
             let extend = modifiers.shift;
@@ -818,7 +866,8 @@ impl AlbumApp {
             if show_fullscreen {
                 if let Some(entry) = self.entries.get_mut(fs_target) {
                     if entry.full_color.is_none() {
-                        self.thumbnailer.request_screen(entry.path.clone());
+                        self.thumbnailer
+                            .request_screen(entry.path.clone(), entry.sig);
                     }
                 }
             }

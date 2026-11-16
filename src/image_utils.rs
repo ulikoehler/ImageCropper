@@ -72,6 +72,25 @@ pub fn decode_image_bytes_tagged(
     path: &Path,
     bytes: &[u8],
 ) -> (image::ImageResult<DynamicImage>, &'static str) {
+    decode_tagged(path, bytes, true)
+}
+
+/// CPU-only variant of [`decode_image_bytes_tagged`] for small cached
+/// previews (≤256px thumbnails): a GPU round-trip plus the process-wide
+/// device mutex costs more than zune at thumbnail sizes, and it would
+/// contend with full-resolution decodes.
+pub fn decode_image_bytes_tagged_cpu(
+    path: &Path,
+    bytes: &[u8],
+) -> (image::ImageResult<DynamicImage>, &'static str) {
+    decode_tagged(path, bytes, false)
+}
+
+fn decode_tagged(
+    path: &Path,
+    bytes: &[u8],
+    use_gpu: bool,
+) -> (image::ImageResult<DynamicImage>, &'static str) {
     let is_jpeg = path
         .extension()
         .and_then(|e| e.to_str())
@@ -82,9 +101,11 @@ pub fn decode_image_bytes_tagged(
         // GPU decode: baseline + progressive, restart markers or not
         // (DRI=0 gets virtual intervals via the survey pass) —
         // ~10x libjpeg; unsupported inputs fall through to zune.
-        if let Some((rgba, w, h)) = crate::gpujpeg::decode_rgba(bytes) {
-            if let Some(img) = image::RgbaImage::from_raw(w, h, rgba) {
-                return (Ok(image::DynamicImage::ImageRgba8(img)), "gpu");
+        if use_gpu {
+            if let Some((rgba, w, h)) = crate::gpujpeg::decode_rgba(bytes) {
+                if let Some(img) = image::RgbaImage::from_raw(w, h, rgba) {
+                    return (Ok(image::DynamicImage::ImageRgba8(img)), "gpu");
+                }
             }
         }
         // Allow incomplete JPEGs to still be rendered
