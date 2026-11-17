@@ -16,7 +16,7 @@ mod ws_bulk;
 mod ws_data;
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -1401,22 +1401,29 @@ pub fn run_server(
     let result = rt.block_on(async move {
         let listener = tokio::net::TcpListener::bind(addr).await?;
         let bound = listener.local_addr()?;
-        // A wildcard bind (0.0.0.0) isn't a useful browser address — open
-        // loopback instead. The token goes straight into the URL so the
-        // client's WS connects carry `?token=` automatically.
-        let host = if bound.ip().is_unspecified() {
-            "127.0.0.1".to_string()
-        } else {
-            bound.ip().to_string()
-        };
+        // The token goes straight into the URL so the client's WS
+        // connects carry `?token=` automatically.
         let url = match &state.token {
-            Some(t) => format!("http://{host}:{}/?token={t}", bound.port()),
-            None => format!("http://{host}:{}/", bound.port()),
+            Some(t) => format!("http://{bound}/?token={t}"),
+            None => format!("http://{bound}/"),
         };
         eprintln!("Serving at {url}");
         state.spawn_pumps();
         if open_browser {
-            let _ = webbrowser::open(&url);
+            // A wildcard bind (0.0.0.0) isn't a useful browser address —
+            // open loopback instead.
+            let browser_url = if bound.ip().is_unspecified() {
+                let loopback: IpAddr = if bound.is_ipv6() {
+                    Ipv6Addr::LOCALHOST.into()
+                } else {
+                    Ipv4Addr::LOCALHOST.into()
+                };
+                let local = SocketAddr::new(loopback, bound.port());
+                url.replacen(&bound.to_string(), &local.to_string(), 1)
+            } else {
+                url.clone()
+            };
+            let _ = webbrowser::open(&browser_url);
         }
         on_ready();
         tokio::select! {
