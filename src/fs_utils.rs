@@ -14,6 +14,7 @@ use walkdir::WalkDir;
 pub mod adaptive_pool;
 pub mod files_pack;
 pub mod pack;
+pub mod pipeline;
 pub mod previews;
 
 static VERBOSE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -386,7 +387,14 @@ pub fn spawn_image_scan_limited(
     spawn_image_scan_seeded(paths, recursive, filter, max, None)
 }
 
-/// [`spawn_image_scan_limited`] with a `files.pack` seed plan.
+/// Bound on the scan event channel — the listing stage of the thumbnail
+/// pipeline. The walker blocks once consumers fall this far behind
+/// instead of building an unbounded in-memory listing ahead of reads.
+pub const SCAN_QUEUE_CAP: usize = 4096;
+
+/// [`spawn_image_scan_limited`] with a `files.pack` seed plan. The event
+/// channel is bounded ([`SCAN_QUEUE_CAP`]) so listing backpressures on
+/// the read/compute stages rather than queuing unboundedly.
 pub fn spawn_image_scan_seeded(
     paths: Vec<PathBuf>,
     recursive: bool,
@@ -394,7 +402,7 @@ pub fn spawn_image_scan_seeded(
     max: Option<usize>,
     plan: Option<(Vec<ScanEvent>, std::collections::HashSet<PathBuf>)>,
 ) -> std::sync::mpsc::Receiver<ScanEvent> {
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = std::sync::mpsc::sync_channel(SCAN_QUEUE_CAP);
     std::thread::spawn(move || {
         walk_images_seeded(&paths, recursive, filter.as_ref(), max, plan, &mut |ev| {
             let _ = tx.send(ev);

@@ -1,6 +1,8 @@
-//! PreviewStore: worker pool producing persisted JPEG preview bytes, with an
-//! in-RAM LRU in front of `.imagecropper-previews`. Emits "ready" signals so
-//! the PushScheduler can stream previews as they're generated.
+//! PreviewStore: pipelined thumbnail engine (listing→read→compute over
+//! bounded queues, see [`ThumbPipeline`]) producing persisted JPEG
+//! preview bytes, with an in-RAM LRU in front of `.imagecropper-previews`.
+//! Emits "ready" signals so the PushScheduler can stream previews as
+//! they're generated.
 //!
 //! The first [`PIN_LIMIT`] live album items are *pinned*: their previews are
 //! kept resident in RAM (never evicted) and re-produced whenever they go
@@ -22,8 +24,8 @@ use std::{
 use lru::LruCache;
 
 use crate::fs_utils::{
-    adaptive_pool::AdaptivePool,
-    previews::{produce_preview_bytes, PreviewFail},
+    pipeline::{ReadStage, ThumbPipeline},
+    previews::{preview_compute_bytes, preview_read, produce_preview_bytes, PreviewFail, ReadJob},
 };
 use crate::server::io_gate::IoGate;
 
@@ -226,7 +228,10 @@ impl Drop for GatePermit<'_> {
 }
 
 pub struct PreviewStore {
-    pool: AdaptivePool<Result<Preview, PreviewFail>>,
+    /// Background produce pipeline: listing→read→compute over bounded
+    /// queues (see [`ThumbPipeline`]). The read stage autotunes to the
+    /// storage device; compute runs at the `-j` ceiling.
+    pool: ThumbPipeline<Result<Preview, PreviewFail>>,
     ram: Mutex<Ram>,
     /// In-flight/queued paths — kept for tests; the pool dedupes anyway.
     pub pending: Mutex<HashSet<PathBuf>>,
@@ -327,37 +332,52 @@ impl PreviewStore {
             allowed: Mutex::new(HashSet::new()),
             cv: Condvar::new(),
         });
-        let worker_screen = Arc::clone(&screen);
         let screen_sigs = sigs.clone();
         let store = Self {
-            pool: AdaptivePool::new(2, concurrency.max(1), move |path| {
-                // Speculative preload: yield to live client requests instead
-                // of competing with them for IO.
-                worker_gate.yield_to_clients();
-                let _permit = worker_produce_gate.acquire_background();
-                let hint = worker_dims.read().unwrap().get(path).copied();
-                let sig = worker_sigs.read().unwrap().get(path).copied();
-                // A remembered failure for this file state answers
-                // instantly — no source read, no decode.
-                if let Some(f) = fail_hit(&worker_fails, &worker_sigs, path) {
-                    return Err(f);
-                }
-                let out = produce_preview_bytes(path, hint, sig).map(|(jpeg, w, h)| {
-                    Preview {
+            pool: ThumbPipeline::new(
+                2,
+                concurrency.max(1),
+                move |path| {
+                    // Speculative preload: yield to live client requests
+                    // instead of competing with them for IO.
+                    worker_gate.yield_to_clients();
+                    // A remembered failure for this file state answers
+                    // instantly — no source read, no decode.
+                    if let Some(f) = fail_hit(&worker_fails, &worker_sigs, path) {
+                        return ReadStage::Done(Err(f));
+                    }
+                    let hint = worker_dims.read().unwrap().get(path).copied();
+                    let sig = worker_sigs.read().unwrap().get(path).copied();
+                    match preview_read(path, sig) {
+                        Err(f) => ReadStage::Done(Err(f)),
+                        Ok(ReadJob::Cached { jpeg }) => {
+                            // Pack hits skip the compute stage entirely;
+                            // dims resolve from the manifest hint or one
+                            // header read (same as produce_preview_bytes).
+                            let dims = hint
+                                .or_else(|| image::image_dimensions(path).ok())
+                                .unwrap_or((0, 0));
+                            ReadStage::Done(Ok(Preview {
+                                jpeg: Arc::new(jpeg),
+                                w: dims.0,
+                                h: dims.1,
+                            }))
+                        }
+                        Ok(job) => ReadStage::Job(job),
+                    }
+                },
+                move |path, job| {
+                    // The produce gate bounds concurrent decodes —
+                    // background producers cap at half the `-j` budget so
+                    // client wants always find a lane.
+                    let _permit = worker_produce_gate.acquire_background();
+                    preview_compute_bytes(path, job).map(|(jpeg, w, h)| Preview {
                         jpeg: Arc::new(jpeg),
                         w,
                         h,
-                    }
-                });
-                match &out {
-                    Ok(_) => {
-                        clear_fail(&worker_fails, path);
-                        worker_screen.push(path.to_path_buf());
-                    }
-                    Err(f) => note_fail(&worker_fails, path, f),
-                }
-                out
-            }),
+                    })
+                },
+            ),
             ram: Mutex::new(Ram {
                 cache: LruCache::new(NonZeroUsize::new(capacity).unwrap()),
                 pinned: HashSet::new(),
@@ -436,6 +456,8 @@ impl PreviewStore {
     /// Queue a path for preview production; dedupes in-flight jobs.
     /// Paths with a still-valid remembered failure are skipped — the
     /// produce would fail identically, so don't burn the read/decode.
+    /// A re-request for an already-produced file costs one pack lookup
+    /// (the read stage short-circuits `Cached` hits into `Done`).
     pub fn request(&self, path: PathBuf) {
         if self.stopped() {
             return;
@@ -517,15 +539,22 @@ impl PreviewStore {
 
     /// Drain finished jobs into the RAM cache; returns (path, result) pairs
     /// ready to be pushed to clients. `Err` carries the produce failure —
-    /// callers surface it to clients instead of serving silence.
+    /// callers surface it to clients instead of serving silence. Successes
+    /// clear the remembered-failure cache and schedule the deferred
+    /// fullscreen fill; failures populate it.
     pub fn poll(&self) -> Vec<(PathBuf, Result<Preview, PreviewFail>)> {
         let mut done = Vec::new();
-        let mut pending = self.pending.lock().unwrap();
-        let mut ram = self.ram.lock().unwrap();
         for (path, result) in self.pool.poll() {
-            pending.remove(&path);
-            if let Ok(p) = &result {
-                ram.insert(path.clone(), p.clone());
+            self.pending.lock().unwrap().remove(&path);
+            match &result {
+                Ok(p) => {
+                    self.ram.lock().unwrap().insert(path.clone(), p.clone());
+                    clear_fail(&self.fails, &path);
+                    // The fullscreen (`f`) preview generates lazily on the
+                    // tier-3 fill thread — never inline on the hot path.
+                    self.screen.push(path.clone());
+                }
+                Err(f) => note_fail(&self.fails, &path, f),
             }
             done.push((path, result));
         }

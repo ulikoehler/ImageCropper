@@ -9,7 +9,6 @@ use imagecropper::app::{AppOptions, ImageCropperApp};
 use imagecropper::cli::{
     spawn_scan_stream, AlbumArgs, Cli, Commands, CropArgs, HeadlessArgs, ScanStream,
 };
-use imagecropper::fs_utils::previews::produce_preview_bytes;
 use imagecropper::fs_utils::ScanEvent;
 use imagecropper::image_utils::decode_image_bytes;
 use imagecropper::server::{run_server, ServeMode, ServerState};
@@ -237,23 +236,38 @@ fn headless_album(args: &AlbumArgs, stream: ScanStream) -> Result<()> {
     Ok(())
 }
 
-/// Worker-pool pregeneration fed by a streaming scan — preview work starts
-/// while the directory listing is still being produced (pipelined; matters
-/// on slow mounts). Concurrency self-tunes to the storage device.
+/// Pipelined pregeneration fed by a streaming scan — listing, source
+/// reads and decode/encode all run as concurrent stages over bounded
+/// queues (see [`ThumbPipeline`]), so preview work starts while the
+/// directory listing is still being produced. The read stage self-tunes
+/// to the storage device; compute runs at the `-j` ceiling.
 fn pregenerate_stream(stream: ScanStream, parallel: usize) {
-    use imagecropper::fs_utils::adaptive_pool::AdaptivePool;
+    use imagecropper::fs_utils::{
+        pipeline::{ReadStage, ThumbPipeline},
+        previews::{preview_compute_bytes, preview_read, ReadJob},
+    };
     use std::sync::mpsc::RecvTimeoutError;
     use std::time::Duration;
 
     // Scan events carry the folded signature for free — a pack hit then
-    // needs no stat at all. `Some((0, 0))` dims: pregeneration discards
-    // them, so a cache hit skips even the header read.
+    // needs no stat at all. Cache hits short-circuit in the read stage:
+    // pregeneration discards dims, so `Done(Ok((jpeg, 0, 0)))` mirrors
+    // produce_preview_bytes(path, Some((0, 0)), sig).
     let sigs = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
     let pool_sigs = sigs.clone();
-    let pool = AdaptivePool::new(2, parallel.max(1), move |p| {
-        let sig = pool_sigs.lock().unwrap().get(p).copied();
-        produce_preview_bytes(p, Some((0, 0)), sig)
-    });
+    let pool = ThumbPipeline::new(
+        2,
+        parallel.max(1),
+        move |p| {
+            let sig = pool_sigs.lock().unwrap().get(p).copied();
+            match preview_read(p, sig) {
+                Err(f) => ReadStage::Done(Err(f)),
+                Ok(ReadJob::Cached { jpeg }) => ReadStage::Done(Ok((jpeg, 0, 0))),
+                Ok(job) => ReadStage::Job(job),
+            }
+        },
+        preview_compute_bytes,
+    );
     let mut queued = 0usize;
     let mut done = 0usize;
     let mut scanning = true;

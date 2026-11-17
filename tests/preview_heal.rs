@@ -260,3 +260,28 @@ fn produce_failure_is_cached_and_reported() {
     write_image(&gone, &solid_image(64, 64, [1, 2, 3, 255]));
     assert!(store.get_or_produce(&gone).is_ok());
 }
+
+/// A source that exists but can't be read classifies as `gone` too —
+/// permission-denied files must drop off the client listing just like
+/// deleted ones, not sit as dead tiles.
+#[test]
+#[cfg(unix)]
+fn unreadable_source_classifies_as_gone() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempdir().unwrap();
+    let locked = tmp.path().join("locked.png");
+    write_image(&locked, &solid_image(64, 64, [9, 9, 9, 255]));
+    let restore = || {
+        let _ = std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o644));
+    };
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::read(&locked).is_ok() {
+        // Root (and some ACLs) bypass mode bits — nothing to assert.
+        restore();
+        return;
+    }
+    let store = imagecropper::server::PreviewStore::new(2, 4);
+    let err = store.get_or_produce(&locked).unwrap_err();
+    restore();
+    assert_eq!(err.kind, "gone");
+}

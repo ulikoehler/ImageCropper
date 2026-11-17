@@ -1197,6 +1197,15 @@ pub fn spawn_scan_feeder(state: &Arc<ServerState>, stream: crate::cli::ScanStrea
         loop {
             let timed_out = match stream.rx.recv_timeout(FLUSH) {
                 Ok(ScanEvent::Found { path, bytes, sig }) => {
+                    // Feed the preview pipeline immediately — listing →
+                    // read → compute run as parallel stages, so waiting
+                    // for this file's manifest upsert would serialize
+                    // thumbnails behind the metadata sniff. The upsert's
+                    // own `request_all` stays as the dedup'd safety net.
+                    state.previews.note_sig(&path, sig);
+                    if !state.actions.is_pending(&path) && !state.is_gone(&path) {
+                        state.previews.request(path.clone());
+                    }
                     // sig+bytes came free with the walker's stat — the
                     // upsert never needs to re-stat this file.
                     batch.push((path, Some((0, 0, bytes, sig))));
@@ -1204,6 +1213,11 @@ pub fn spawn_scan_feeder(state: &Arc<ServerState>, stream: crate::cli::ScanStrea
                     false
                 }
                 Ok(ScanEvent::Cached { path, w, h, bytes, sig }) => {
+                    state.previews.note_sig(&path, sig);
+                    state.previews.note_dims(&path, (w, h));
+                    if !state.actions.is_pending(&path) && !state.is_gone(&path) {
+                        state.previews.request(path.clone());
+                    }
                     batch.push((path, Some((w, h, bytes, sig))));
                     found += 1;
                     false

@@ -5,7 +5,8 @@ use eframe::egui;
 use crate::{
     fs_utils::{
         adaptive_pool::AdaptivePool,
-        previews::{produce_preview_image, produce_screen_image},
+        pipeline::{ReadStage, ThumbPipeline},
+        previews::{preview_compute_image, preview_read, produce_screen_image},
     },
     image_utils::to_color_image,
 };
@@ -23,16 +24,18 @@ pub struct ThumbResult {
 }
 
 /// Background preview generator that loads/generates small previews for all
-/// images. Concurrency self-tunes to the storage device (see
-/// [`AdaptivePool`]): sequential-ish for HDD/remote mounts, up to
-/// `concurrency` for SSD.
+/// images. Listing, file reads and decode/encode run as pipeline stages
+/// over bounded queues (see [`ThumbPipeline`]): the read stage
+/// self-tunes to the storage device (sequential-ish for HDD/remote
+/// mounts, up to `concurrency` for SSD), compute runs at the `-j`
+/// ceiling, and backpressure keeps in-flight source bytes bounded.
 ///
 /// Previews are persisted in a `.imagecropper-previews` directory next to the
 /// source image. The preview file name embeds the source file's size and
 /// modification time, so changed files automatically produce fresh previews
 /// and stale preview files are cleaned up.
 pub struct Thumbnailer {
-    pool: AdaptivePool<Option<egui::ColorImage>>,
+    pool: ThumbPipeline<Option<egui::ColorImage>>,
     /// Fullscreen-size (1920) preview jobs for hold-`f`.
     screen_pool: AdaptivePool<Option<egui::ColorImage>>,
     pub pending: HashSet<PathBuf>,
@@ -50,12 +53,22 @@ impl Thumbnailer {
         let thumb_sigs = sigs.clone();
         let screen_sigs = sigs.clone();
         Self {
-            pool: AdaptivePool::new(2, concurrency.max(1), move |path| {
-                let sig = thumb_sigs.lock().unwrap().get(path).copied();
-                produce_preview_image(path, sig)
-                    .ok()
-                    .map(|i| to_color_image(&i))
-            }),
+            pool: ThumbPipeline::new(
+                2,
+                concurrency.max(1),
+                move |path| {
+                    let sig = thumb_sigs.lock().unwrap().get(path).copied();
+                    match preview_read(path, sig) {
+                        Ok(job) => ReadStage::Job(job),
+                        Err(_) => ReadStage::Done(None),
+                    }
+                },
+                |path, job| {
+                    preview_compute_image(path, job)
+                        .ok()
+                        .map(|i| to_color_image(&i))
+                },
+            ),
             screen_pool: AdaptivePool::new(2, 4, move |path| {
                 let sig = screen_sigs.lock().unwrap().get(path).copied();
                 produce_screen_image(path, sig)

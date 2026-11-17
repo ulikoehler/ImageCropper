@@ -93,17 +93,21 @@ impl PreviewFail {
     pub fn io(sig: u64, err: &std::io::Error) -> Self {
         Self::new("io", sig, err.to_string())
     }
-    /// Failure touching the *source* file — `NotFound` means it was
+    /// Failure touching the *source* file. `NotFound` means it was
     /// deleted outside ImageCropper (manual delete, another client, a
-    /// dropped mount), so it becomes kind `"gone"` and the server drops
-    /// the item from the listing instead of reporting a retryable
-    /// preview error. Cache-file reads must keep [`Self::io`]: a missing
-    /// cache entry is a miss, not a deleted source.
+    /// dropped mount); `PermissionDenied` and `NotADirectory` mean the
+    /// listing can see it but nobody can read it — for the client that
+    /// is the same as gone, so all three become kind `"gone"` and the
+    /// server drops the item from the listing (tombstone + patch) instead
+    /// of reporting a retryable preview error that leaves a dead tile.
+    /// Cache-file reads must keep [`Self::io`]: a missing cache entry is
+    /// a miss, not a deleted source.
     pub fn source_io(sig: u64, err: &std::io::Error) -> Self {
-        let kind = if err.kind() == std::io::ErrorKind::NotFound {
-            "gone"
-        } else {
-            "io"
+        let kind = match err.kind() {
+            std::io::ErrorKind::NotFound
+            | std::io::ErrorKind::PermissionDenied
+            | std::io::ErrorKind::NotADirectory => "gone",
+            _ => "io",
         };
         Self::new(kind, sig, err.to_string())
     }
@@ -517,8 +521,38 @@ fn preview_belongs_to(preview_name: &str, sources: &HashSet<String>) -> bool {
     }
 }
 
-/// Load the cached preview or generate, persist and return a fresh one.
-/// Returns the decoded preview image (≤ `THUMB_MAX_DIM`).
+/// Bytes the read stage of a thumbnail pipeline hands to the compute
+/// stage — the payload of the bounded `mid` queue in
+/// [`ThumbPipeline`](crate::fs_utils::pipeline::ThumbPipeline).
+pub enum ReadJob {
+    /// Pack-hit thumbnail jpeg — decode it (image path) or serve it
+    /// as-is (bytes path). No source read happened.
+    Cached { jpeg: Vec<u8> },
+    /// Freshly read source bytes on a cache miss — the compute stage
+    /// runs the full decode/resize/encode/persist. `sig` is the packed
+    /// signature (for error labels); `len`/`nanos` key the pack record.
+    Source {
+        bytes: Vec<u8>,
+        len: u64,
+        nanos: u128,
+        sig: u64,
+    },
+}
+
+impl ReadJob {
+    /// Memory cost of this job for the byte-bounded mid queue.
+    pub fn byte_len(&self) -> usize {
+        match self {
+            Self::Cached { jpeg } => jpeg.len(),
+            Self::Source { bytes, .. } => bytes.len(),
+        }
+    }
+}
+
+/// Read stage of the thumbnail pipeline — everything I/O-bound: pack
+/// lookups, the signature stat and the source `fs::read`. Produces a
+/// [`ReadJob`] the compute stage turns into a result; cache hits come
+/// back `Cached` so the pipeline can skip the source read entirely.
 ///
 /// `sig_hint` carries the scan-time signature: a pack hit then needs no
 /// `stat` at all — on slow mounts that is one less round-trip per file.
@@ -527,102 +561,7 @@ fn preview_belongs_to(preview_name: &str, sources: &HashSet<String>) -> bool {
 /// Cache-hit I/O on slow/remote filesystems is kept minimal: at most one
 /// `stat` (signature) plus one `read` of the pack record — no directory
 /// scan, no touching the source.
-pub fn produce_preview_image(
-    path: &Path,
-    sig_hint: Option<u64>,
-) -> Result<DynamicImage, PreviewFail> {
-    let source_name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .ok_or_else(|| PreviewFail::new("io", 0, "invalid path"))?;
-    let dir = previews_dir_for(path);
-
-    // Fast path: caller knows the scan-time signature — resolve the live
-    // pack variant without stat'ing the source.
-    if let Some(sig) = sig_hint.filter(|s| *s != 0) {
-        if let Some(pack) = crate::fs_utils::pack::pack_for(&dir) {
-            let mut pack = pack.lock().unwrap();
-            if let Some((jpeg, _)) = pack.lookup_sig(&source_name, sig, THUMB_MAX_DIM as u16) {
-                // Cached thumbnails are ≤256px — decode on CPU; a GPU
-                // round-trip costs more than zune at this size.
-                let (decoded, engine) = decode_image_bytes_tagged_cpu(path, &jpeg);
-                if let Ok(img) = decoded {
-                    if verbose() {
-                        eprintln!("preview cache hit [{engine}]: {}", path.display());
-                    }
-                    return Ok(img);
-                }
-                pack.remove(&source_name);
-            }
-        }
-    }
-
-    let (len, nanos) = source_signature_ex(path)
-        .map_err(|e| PreviewFail::source_io(0, &e))?;
-    let sig64 = sig_u64(len, nanos);
-
-    // Fast path: the pack has a current-signature thumbnail for this file.
-    if let Some(pack) = crate::fs_utils::pack::pack_for(&dir) {
-        let mut pack = pack.lock().unwrap();
-        if let Some((jpeg, _)) = pack.lookup(&source_name, len, nanos, THUMB_MAX_DIM as u16) {
-            // Cached thumbnails are ≤256px — decode on CPU; a GPU
-            // round-trip costs more than zune at this size.
-            let (decoded, engine) = decode_image_bytes_tagged_cpu(path, &jpeg);
-            if let Ok(img) = decoded {
-                if verbose() {
-                    eprintln!("preview cache hit [{engine}]: {}", path.display());
-                }
-                return Ok(img);
-            }
-            // Corrupt record — tombstone so it can never wedge us.
-            pack.remove(&source_name);
-        }
-    }
-
-    // Slow path: decode the source, downscale, persist. Restart-marker
-    // JPEGs go entirely through the GPU session — decode + the resize
-    // run on the GPU and the full-res image never reaches the host. A
-    // session whose resample buffers exceed the device limits falls
-    // through to the CPU decode. The fullscreen preview is NOT generated
-    // here — it is produced lazily on hold-`f`/screen-fill, never inline
-    // on the thumbnail hot path.
-    let bytes = std::fs::read(path).map_err(|e| PreviewFail::source_io(sig64, &e))?;
-    let hash = sha256_hex(&bytes);
-    let thumb = match crate::gpujpeg::open(&bytes)
-        .and_then(|s| s.resize_image(THUMB_MAX_DIM, THUMB_MAX_DIM))
-    {
-        Some(img) => (img, "gpu"),
-        None => {
-            let image =
-                decode_image_bytes(path, &bytes).map_err(|e| PreviewFail::decode(sig64, e))?;
-            drop(bytes);
-            (resize_to_fit(image, THUMB_MAX_DIM, THUMB_MAX_DIM), "cpu")
-        }
-    };
-    let (thumb, engine) = thumb;
-    persist_preview(path, len, nanos, &source_name, &thumb, &hash);
-    if verbose() {
-        eprintln!("preview generated [{engine}]: {}", path.display());
-    }
-    Ok(thumb)
-}
-
-/// Like [`produce_preview_image`] but returns the persisted JPEG bytes plus
-/// the source image's natural dimensions — the form the web server needs.
-/// Also ensures the fullscreen-size preview exists in `~/.cache`, so
-/// hold-`f` previews are preloaded alongside thumbnails.
-///
-/// `dims_hint` (w,h already known — e.g. from the manifest) lets a cache
-/// hit skip opening the source file entirely; without it the source's
-/// header is read for dimensions, same as before. `sig_hint` carries
-/// the scan-time signature: a pack hit then skips the `stat` too —
-/// callers that pass `Some((0, 0))` as dims (e.g. headless pregeneration,
-/// which discards dimensions) get a pure pack read with zero source I/O.
-pub fn produce_preview_bytes(
-    path: &Path,
-    dims_hint: Option<(u32, u32)>,
-    sig_hint: Option<u64>,
-) -> Result<(Vec<u8>, u32, u32), PreviewFail> {
+pub fn preview_read(path: &Path, sig_hint: Option<u64>) -> Result<ReadJob, PreviewFail> {
     if sigint_received() {
         return Err(PreviewFail::cancelled());
     }
@@ -641,13 +580,10 @@ pub fn produce_preview_bytes(
                 pack.lookup_sig(&source_name, sig, THUMB_MAX_DIM as u16)
             {
                 if jpeg_plausible(&jpeg) {
-                    let dims = dims_hint
-                        .or_else(|| image::image_dimensions(path).ok())
-                        .unwrap_or((0, 0));
                     if verbose() {
                         eprintln!("preview cache hit [pack-sig]: {}", path.display());
                     }
-                    return Ok((jpeg, dims.0, dims.1));
+                    return Ok(ReadJob::Cached { jpeg });
                 }
                 pack.remove(&source_name);
             }
@@ -656,7 +592,7 @@ pub fn produce_preview_bytes(
 
     let (len, nanos) = source_signature_ex(path)
         .map_err(|e| PreviewFail::source_io(0, &e))?;
-    let sig64 = sig_u64(len, nanos);
+    let sig = sig_u64(len, nanos);
 
     if let Some(pack) = crate::fs_utils::pack::pack_for(&dir) {
         let mut pack = pack.lock().unwrap();
@@ -664,13 +600,10 @@ pub fn produce_preview_bytes(
             pack.lookup(&source_name, len, nanos, THUMB_MAX_DIM as u16)
         {
             if jpeg_plausible(&jpeg) {
-                let dims = dims_hint
-                    .or_else(|| image::image_dimensions(path).ok())
-                    .unwrap_or((0, 0));
                 if verbose() {
                     eprintln!("preview cache hit [pack]: {}", path.display());
                 }
-                return Ok((jpeg, dims.0, dims.1));
+                return Ok(ReadJob::Cached { jpeg });
             }
             // Corrupt/truncated record (killed mid-write, disk damage) —
             // serving it would wedge clients into decode-fail loops.
@@ -682,45 +615,188 @@ pub fn produce_preview_bytes(
         }
     }
 
-    let bytes = std::fs::read(path).map_err(|e| PreviewFail::source_io(sig64, &e))?;
-    // The source is already in memory — the content hash is nearly free and
-    // becomes the preview's authoritative metadata.
-    let hash = sha256_hex(&bytes);
-    if let Some(session) = crate::gpujpeg::open(&bytes) {
-        let (w, h) = (session.width, session.height);
-        // Encode buffers that exceed the device limits → CPU path below.
-        if let Some((jpeg, _, _)) =
-            session.encode_resized(THUMB_MAX_DIM, THUMB_MAX_DIM, PREVIEW_JPEG_QUALITY.into())
-        {
-            persist_preview_bytes(path, len, nanos, &source_name, &jpeg, &hash);
-            // The fullscreen preview is generated by the store's deferred
-            // screen-fill — never inline on the thumbnail hot path.
-            if verbose() {
-                eprintln!("preview generated [gpu]: {}", path.display());
+    let bytes = std::fs::read(path).map_err(|e| PreviewFail::source_io(sig, &e))?;
+    Ok(ReadJob::Source {
+        bytes,
+        len,
+        nanos,
+        sig,
+    })
+}
+
+/// Compute stage for the image form — [`DynamicImage`] thumbnails for the
+/// native album UI. `Cached` jpegs decode on CPU (≤256px; a GPU
+/// round-trip costs more than zune at this size); `Source` bytes run the
+/// full produce: decode, resize, persist.
+pub fn preview_compute_image(path: &Path, job: ReadJob) -> Result<DynamicImage, PreviewFail> {
+    match job {
+        ReadJob::Cached { jpeg } => {
+            let (decoded, engine) = decode_image_bytes_tagged_cpu(path, &jpeg);
+            match decoded {
+                Ok(img) => {
+                    if verbose() {
+                        eprintln!("preview cache hit [{engine}]: {}", path.display());
+                    }
+                    Ok(img)
+                }
+                Err(_) => {
+                    // Corrupt record — tombstone so it can never wedge
+                    // us, then re-run the read stage for the source.
+                    if let Some(name) = path.file_name().map(|n| n.to_string_lossy().into_owned())
+                    {
+                        if let Some(pack) =
+                            crate::fs_utils::pack::pack_for(&previews_dir_for(path))
+                        {
+                            pack.lock().unwrap().remove(&name);
+                        }
+                    }
+                    preview_compute_image(path, preview_read(path, None)?)
+                }
             }
-            return Ok((jpeg, w, h));
+        }
+        ReadJob::Source {
+            bytes,
+            len,
+            nanos,
+            sig,
+        } => {
+            let source_name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .ok_or_else(|| PreviewFail::new("io", 0, "invalid path"))?;
+            let hash = sha256_hex(&bytes);
+            // Restart-marker JPEGs go entirely through the GPU session —
+            // decode + the resize run on the GPU and the full-res image
+            // never reaches the host. A session whose resample buffers
+            // exceed the device limits falls through to the CPU decode.
+            let (thumb, engine) = match crate::gpujpeg::open(&bytes)
+                .and_then(|s| s.resize_image(THUMB_MAX_DIM, THUMB_MAX_DIM))
+            {
+                Some(img) => (img, "gpu"),
+                None => {
+                    let image = decode_image_bytes(path, &bytes)
+                        .map_err(|e| PreviewFail::decode(sig, e))?;
+                    drop(bytes);
+                    (resize_to_fit(image, THUMB_MAX_DIM, THUMB_MAX_DIM), "cpu")
+                }
+            };
+            persist_preview(path, len, nanos, &source_name, &thumb, &hash);
+            if verbose() {
+                eprintln!("preview generated [{engine}]: {}", path.display());
+            }
+            Ok(thumb)
         }
     }
+}
 
-    let image = decode_image_bytes(path, &bytes).map_err(|e| PreviewFail::decode(sig64, e))?;
-    drop(bytes);
-    let (w, h) = (image.width(), image.height());
-    let thumb = resize_to_fit(image, THUMB_MAX_DIM, THUMB_MAX_DIM);
-    let mut jpeg = Vec::new();
-    {
-        let writer = std::io::BufWriter::new(std::io::Cursor::new(&mut jpeg));
-        let encoder =
-            image::codecs::jpeg::JpegEncoder::new_with_quality(writer, PREVIEW_JPEG_QUALITY);
-        thumb
-            .to_rgb8()
-            .write_with_encoder(encoder)
-            .map_err(|_| PreviewFail::encode(sig64))?;
+/// Compute stage for the bytes form — `(jpeg, w, h)` for the web server
+/// and headless pregeneration. `Cached` bytes are served as-is with
+/// `(0, 0)` dims — pipeline callers that need natural dims resolve them
+/// in the read stage (hint map or header sniff) and never reach this
+/// arm. `Source` bytes run decode+resize+encode+persist, GPU-first.
+pub fn preview_compute_bytes(
+    path: &Path,
+    job: ReadJob,
+) -> Result<(Vec<u8>, u32, u32), PreviewFail> {
+    match job {
+        ReadJob::Cached { jpeg } => Ok((jpeg, 0, 0)),
+        ReadJob::Source {
+            bytes,
+            len,
+            nanos,
+            sig,
+        } => {
+            let source_name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .ok_or_else(|| PreviewFail::new("io", 0, "invalid path"))?;
+            // The source is already in memory — the content hash is
+            // nearly free and becomes the preview's authoritative
+            // metadata.
+            let hash = sha256_hex(&bytes);
+            if let Some(session) = crate::gpujpeg::open(&bytes) {
+                let (w, h) = (session.width, session.height);
+                // Encode buffers that exceed the device limits → CPU path.
+                if let Some((jpeg, _, _)) = session.encode_resized(
+                    THUMB_MAX_DIM,
+                    THUMB_MAX_DIM,
+                    PREVIEW_JPEG_QUALITY.into(),
+                ) {
+                    persist_preview_bytes(path, len, nanos, &source_name, &jpeg, &hash);
+                    // The fullscreen preview is generated by the store's
+                    // deferred screen-fill — never inline on the hot path.
+                    if verbose() {
+                        eprintln!("preview generated [gpu]: {}", path.display());
+                    }
+                    return Ok((jpeg, w, h));
+                }
+            }
+
+            let image =
+                decode_image_bytes(path, &bytes).map_err(|e| PreviewFail::decode(sig, e))?;
+            drop(bytes);
+            let (w, h) = (image.width(), image.height());
+            let thumb = resize_to_fit(image, THUMB_MAX_DIM, THUMB_MAX_DIM);
+            let mut jpeg = Vec::new();
+            {
+                let writer = std::io::BufWriter::new(std::io::Cursor::new(&mut jpeg));
+                let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(
+                    writer,
+                    PREVIEW_JPEG_QUALITY,
+                );
+                thumb
+                    .to_rgb8()
+                    .write_with_encoder(encoder)
+                    .map_err(|_| PreviewFail::encode(sig))?;
+            }
+            persist_preview_bytes(path, len, nanos, &source_name, &jpeg, &hash);
+            if verbose() {
+                eprintln!("preview generated [cpu]: {}", path.display());
+            }
+            Ok((jpeg, w, h))
+        }
     }
-    persist_preview_bytes(path, len, nanos, &source_name, &jpeg, &hash);
-    if verbose() {
-        eprintln!("preview generated [cpu]: {}", path.display());
+}
+
+/// Load the cached preview or generate, persist and return a fresh one.
+/// Returns the decoded preview image (≤ `THUMB_MAX_DIM`) — the sequential
+/// composition of [`preview_read`] + [`preview_compute_image`].
+///
+/// `sig_hint` carries the scan-time signature: a pack hit then needs no
+/// `stat` at all — on slow mounts that is one less round-trip per file.
+/// A stale hint simply misses and the normal signature path runs.
+pub fn produce_preview_image(
+    path: &Path,
+    sig_hint: Option<u64>,
+) -> Result<DynamicImage, PreviewFail> {
+    preview_compute_image(path, preview_read(path, sig_hint)?)
+}
+
+/// Like [`produce_preview_image`] but returns the persisted JPEG bytes plus
+/// the source image's natural dimensions — the form the web server needs.
+/// The sequential composition of [`preview_read`] +
+/// [`preview_compute_bytes`].
+///
+/// `dims_hint` (w,h already known — e.g. from the manifest) lets a cache
+/// hit skip opening the source file entirely; without it the source's
+/// header is read for dimensions, same as before. `sig_hint` carries
+/// the scan-time signature: a pack hit then skips the `stat` too —
+/// callers that pass `Some((0, 0))` as dims (e.g. headless pregeneration,
+/// which discards dimensions) get a pure pack read with zero source I/O.
+pub fn produce_preview_bytes(
+    path: &Path,
+    dims_hint: Option<(u32, u32)>,
+    sig_hint: Option<u64>,
+) -> Result<(Vec<u8>, u32, u32), PreviewFail> {
+    match preview_read(path, sig_hint)? {
+        ReadJob::Cached { jpeg } => {
+            let dims = dims_hint
+                .or_else(|| image::image_dimensions(path).ok())
+                .unwrap_or((0, 0));
+            Ok((jpeg, dims.0, dims.1))
+        }
+        job @ ReadJob::Source { .. } => preview_compute_bytes(path, job),
     }
-    Ok((jpeg, w, h))
 }
 
 /// sha256 of a source file's bytes — the authoritative "did this file
