@@ -568,6 +568,19 @@ impl ServerState {
         }
     }
 
+    /// The source can't even be stat'ed — missing entirely, or under a
+    /// path component that denies access — so for the user it is gone
+    /// regardless of what action just failed on it. Evict the entry
+    /// (tombstone + removal patch) instead of resurrecting a dead tile.
+    /// Returns false while the file is still readable.
+    pub fn evict_if_unreadable(&self, path: &Path) -> bool {
+        if crate::fs_utils::previews::preview_sig_u64(path).is_some() {
+            return false;
+        }
+        self.remove_path(path);
+        true
+    }
+
     /// Sort `files` by the `-o` order, using the signature-keyed sort-key
     /// cache so repeated passes don't re-stat or re-parse every file.
     /// Equivalent to [`crate::cli::sort_files`] plus memoization.
@@ -792,7 +805,7 @@ impl ServerState {
                     }
                 }
                 // Action completions → differential manifest updates + events.
-                for done in state.actions.poll() {
+                for mut done in state.actions.poll() {
                     use crate::server::actions::ActionKind;
                     match (done.ok, done.kind) {
                         // Path-based: ids may have been reassigned by a rescan
@@ -800,9 +813,19 @@ impl ServerState {
                         (true, ActionKind::Delete | ActionKind::Move) => {
                             state.remove_path(&done.src);
                         }
-                        // Undo the eager tombstone: the file never left.
                         (false, ActionKind::Delete | ActionKind::Move) => {
-                            state.restore_path(&done.src);
+                            if state.evict_if_unreadable(&done.src) {
+                                // The source is unreachable — for the user
+                                // it is gone, which is exactly what the op
+                                // asked for. Ack it cleanly instead of
+                                // resurrecting the tombstone and spamming
+                                // one "file no longer readable" per file.
+                                done.ok = true;
+                                done.error = None;
+                            } else {
+                                // Undo the eager tombstone: the file never left.
+                                state.restore_path(&done.src);
+                            }
                         }
                         (true, ActionKind::Crop | ActionKind::Resave) => {
                             if let Some(new_path) = &done.new_path {
@@ -812,7 +835,12 @@ impl ServerState {
                                 state.upsert_files(vec![(new_path.clone(), None)]);
                             }
                         }
-                        (false, _) => {}
+                        (false, _) => {
+                            // A failed transform still evicts a dead
+                            // source — the error ack stays (the op truly
+                            // failed), but the tile must not linger.
+                            state.evict_if_unreadable(&done.src);
+                        }
                     }
                     // Stale signature: our manifest entry predates a disk
                     // change (or the mount reports a different mtime than at

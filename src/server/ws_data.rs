@@ -608,14 +608,23 @@ async fn handle(socket: WebSocket, state: Arc<ServerState>) {
                         }
                         // Gone/tombstoned — still ack, otherwise the
                         // client's pending-action counter never clears.
+                        // A delete on an already-gone item is fulfilled,
+                        // not an error: ack it quietly instead of
+                        // spamming "failed: item no longer in manifest".
                         None => {
+                            let gone_delete =
+                                matches!(kind, super::actions::ActionKind::Delete);
                             if let Ok(json) = serde_json::to_string(&serde_json::json!({
                                 "ev": "action-done",
                                 "tag": env.tag,
-                                "ok": false,
+                                "ok": gone_delete,
                                 "id": id,
                                 "kind": kind,
-                                "error": "item no longer in manifest",
+                                "error": if gone_delete {
+                                    serde_json::Value::Null
+                                } else {
+                                    "item no longer in manifest".into()
+                                },
                             })) {
                                 let _ =
                                     ev_tx.send(Frame::new(EV_EVENT, 0, json.into_bytes())).await;

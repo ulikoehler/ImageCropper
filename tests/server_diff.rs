@@ -289,6 +289,83 @@ fn restore_path_revives_a_failed_delete() {
     }
 }
 
+/// A delete/move that fails because the source can't even be stat'ed
+/// must not resurrect the tombstone: for the user the file is gone, so
+/// the manifest evicts it permanently rather than restoring a dead tile.
+#[test]
+fn failed_delete_on_vanished_file_evicts_instead_of_restoring() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write_image(root.join("a.png"), &solid_image(10, 10, [4, 5, 6, 255]));
+    let path_a = root.join("a.png");
+
+    let state = ServerState::new(
+        vec![path_a.clone()],
+        vec![root.to_path_buf()],
+        ServeMode::Album,
+        imagecropper::cli::MouseSelectMode::Sequence,
+        1,
+        None,
+        4096,
+        None,
+        false,
+    );
+    let _rx = state.events.subscribe();
+
+    // Eager tombstone, exactly as the /data dispatch does — then the
+    // file vanishes before the worker gets to it.
+    state.remove_path(&path_a);
+    std::fs::remove_file(&path_a).unwrap();
+    {
+        let m = state.manifest.read().unwrap();
+        assert!(m.items[0].removed);
+    }
+
+    assert!(
+        state.evict_if_unreadable(&path_a),
+        "unstat'able source must evict"
+    );
+    {
+        let m = state.manifest.read().unwrap();
+        assert!(m.items[0].removed, "eviction keeps the tombstone");
+        assert!(m.path_of(0).is_none());
+    }
+    // A rescan while the file stays missing must not bring it back.
+    state.rebuild_manifest(vec![path_a.clone()], &[root.to_path_buf()]);
+    assert!(state.manifest.read().unwrap().items.is_empty());
+}
+
+/// The same failure on a file that is still perfectly readable must NOT
+/// evict — the restore path stays responsible for reviving the tile.
+#[test]
+fn evict_if_unreadable_leaves_live_files_alone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write_image(root.join("a.png"), &solid_image(10, 10, [4, 5, 6, 255]));
+    let path_a = root.join("a.png");
+
+    let state = ServerState::new(
+        vec![path_a.clone()],
+        vec![root.to_path_buf()],
+        ServeMode::Album,
+        imagecropper::cli::MouseSelectMode::Sequence,
+        1,
+        None,
+        4096,
+        None,
+        false,
+    );
+    state.remove_path(&path_a);
+    assert!(
+        !state.evict_if_unreadable(&path_a),
+        "readable source must not evict"
+    );
+    state.restore_path(&path_a);
+    let m = state.manifest.read().unwrap();
+    assert!(!m.items[0].removed, "restore revives the live tile");
+    assert_eq!(m.path_of(0).unwrap(), path_a);
+}
+
 #[test]
 fn finish_scan_broadcasts_resync_patch() {
     let tmp = tempfile::tempdir().unwrap();

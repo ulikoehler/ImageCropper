@@ -868,7 +868,7 @@ addEventListener("keydown",e=>{
     if(e.key==="ArrowUp")nf=Math.max(0,focus-cols());
     if(e.ctrlKey){focus=nf}
     else if(e.shiftKey){const[a,b]=[Math.min(anchor,nf),Math.max(anchor,nf)];
-      for(let i=a;i<=b;i++)selected.add(i);focus=nf}
+      for(let i=a;i<=b;i++)if(items[i]&&!items[i].removed)selected.add(i);focus=nf}
     else{focus=nf;anchor=nf;selected=new Set([nf])}
     scheduleDraw();
   }
@@ -902,7 +902,7 @@ addEventListener("keydown",e=>{
     e.preventDefault();
   }
   else if(e.key===" "){selected.has(focus)?selected.delete(focus):selected.add(focus);scheduleDraw();e.preventDefault()}
-  else if(e.key==="a"&&e.ctrlKey){for(let i=0;i<items.length;i++)selected.add(i);scheduleDraw();e.preventDefault()}
+  else if(e.key==="a"&&e.ctrlKey){for(let i=0;i<items.length;i++)if(items[i]&&!items[i].removed)selected.add(i);scheduleDraw();e.preventDefault()}
 });
 canvas.addEventListener("mousedown",e=>{
   if(fsMode||e.button!==0)return;
@@ -935,7 +935,7 @@ addEventListener("mousemove",e=>{
     if(drag.anchor<0)drag.anchor=cur;
     if(drag.anchor>=0&&cur>=0)
       for(let i=Math.min(drag.anchor,cur);i<=Math.max(drag.anchor,cur);i++)
-        hits.add(i);
+        if(items[i]&&!items[i].removed)hits.add(i);
   }
   const b=drag.base;
   selected=drag.mode===1?new Set([...b,...hits])
@@ -958,7 +958,7 @@ canvas.addEventListener("click",e=>{
   for(const t of tileRects()){
     if(mx>=t.x&&mx<t.x+t.w&&my>=t.y&&my<t.y+t.h){
       if(e.shiftKey){const[a,b]=[Math.min(anchor,t.i),Math.max(anchor,t.i)];
-        for(let i=a;i<=b;i++)selected.add(i)}
+        for(let i=a;i<=b;i++)if(items[i]&&!items[i].removed)selected.add(i)}
       else if(e.ctrlKey||e.metaKey){selected.has(t.i)?selected.delete(t.i):selected.add(t.i);anchor=t.i}
       else{selected=new Set([t.i]);anchor=t.i}
       focus=t.i;scheduleDraw();break;
