@@ -187,7 +187,7 @@ fn produce_full(
         FMT_ORIGINAL => {
             let bytes = std::fs::read(path)
                 .map_err(|e| PreviewFail::source_io(0, &e))?;
-            let (w, h) = image::image_dimensions(path).unwrap_or((0, 0));
+            let (w, h) = crate::image_utils::display_dims(path).unwrap_or((0, 0));
             Ok((bytes, w, h))
         }
         _ => {

@@ -102,7 +102,7 @@ impl Manifest {
         version: u32,
     ) -> Self {
         Self::build_with(files, roots, mode, mouse_select, version, |path| {
-            let (w, h) = image::image_dimensions(path).unwrap_or((0, 0));
+            let (w, h) = crate::image_utils::display_dims(path).unwrap_or((0, 0));
             let bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
             let sig = preview_sig_u64(path).unwrap_or(0);
             (w, h, bytes, sig)

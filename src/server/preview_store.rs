@@ -355,7 +355,7 @@ impl PreviewStore {
                             // dims resolve from the manifest hint or one
                             // header read (same as produce_preview_bytes).
                             let dims = hint
-                                .or_else(|| image::image_dimensions(path).ok())
+                                .or_else(|| crate::image_utils::display_dims(path))
                                 .unwrap_or((0, 0));
                             ReadStage::Done(Ok(Preview {
                                 jpeg: Arc::new(jpeg),

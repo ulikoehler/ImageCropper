@@ -137,6 +137,45 @@ fn decode_tagged(
     }
 }
 
+/// Natural dimensions of `path` *as displayed* — EXIF orientation
+/// applied. `image::image_dimensions` reports raw stored pixels, but
+/// every decode path rotates for EXIF (CPU via
+/// [`apply_exif_orientation`], GPU in the upsample shader), so dims that
+/// size tiles/manifests must match the produced preview: a portrait
+/// shot stored as 6000x4000 (Orientation=6) displays — and thumbnails —
+/// as 4000x6000. Reporting the raw aspect would stretch the tile.
+///
+/// One open serves both sniffs: EXIF scans marker segments until the
+/// TIFF header (or fails fast on non-EXIF formats), the dims read only
+/// touches the image header — no full-file I/O.
+pub fn display_dims(path: &std::path::Path) -> Option<(u32, u32)> {
+    use std::io::{BufReader, Seek, SeekFrom};
+
+    let file = std::fs::File::open(path).ok()?;
+    let mut reader = BufReader::new(file);
+    // Same reader the decode path applies — when it can't parse EXIF the
+    // thumbnail stays unrotated too, so reporting raw dims stays correct.
+    let orient = exif::Reader::new()
+        .read_from_container(&mut reader)
+        .ok()
+        .and_then(|e| {
+            e.get_field(exif::Tag::Orientation, exif::In::PRIMARY)
+                .and_then(|f| f.value.get_uint(0))
+                .map(|v| v as u8)
+        });
+    reader.seek(SeekFrom::Start(0)).ok()?;
+    let (mut w, mut h) = image::ImageReader::new(reader)
+        .with_guessed_format()
+        .ok()?
+        .into_dimensions()
+        .ok()?;
+    // Orientations 5–8 transpose the image — display dims swap axes.
+    if matches!(orient, Some(5..=8)) {
+        std::mem::swap(&mut w, &mut h);
+    }
+    Some((w, h))
+}
+
 /// Apply the EXIF orientation tag (matching the GPU JPEG path, which
 /// orients in the upsample shader). No-op without a valid tag.
 fn apply_exif_orientation(img: &mut DynamicImage, bytes: &[u8]) {

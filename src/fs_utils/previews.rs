@@ -791,7 +791,7 @@ pub fn produce_preview_bytes(
     match preview_read(path, sig_hint)? {
         ReadJob::Cached { jpeg } => {
             let dims = dims_hint
-                .or_else(|| image::image_dimensions(path).ok())
+                .or_else(|| crate::image_utils::display_dims(path))
                 .unwrap_or((0, 0));
             Ok((jpeg, dims.0, dims.1))
         }

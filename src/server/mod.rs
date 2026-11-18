@@ -315,7 +315,7 @@ impl ServerState {
                 }
             }
             // Only the header read remains — sig+bytes need no stat.
-            let (w, h) = image::image_dimensions(&path).unwrap_or((0, 0));
+            let (w, h) = crate::image_utils::display_dims(&path).unwrap_or((0, 0));
             return (path, w, h, bytes, sig);
         }
         // Nothing known: stat for the signature, reuse dims on match,
@@ -330,7 +330,7 @@ impl ServerState {
                 }
             }
         }
-        let (w, h) = image::image_dimensions(&path).unwrap_or((0, 0));
+        let (w, h) = crate::image_utils::display_dims(&path).unwrap_or((0, 0));
         let bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
         (path, w, h, bytes, sig)
     }
@@ -1158,7 +1158,7 @@ fn sniff_path(
             return (path.to_path_buf(), w, h, bytes, sig);
         }
     }
-    let (w, h) = image::image_dimensions(path).unwrap_or((0, 0));
+    let (w, h) = crate::image_utils::display_dims(path).unwrap_or((0, 0));
     (path.to_path_buf(), w, h, len, sig)
 }
 
@@ -1185,7 +1185,7 @@ fn sniff_item(
                 }
             }
             // Only the header read remains — sig+bytes need no stat.
-            let (w, h) = image::image_dimensions(path).unwrap_or((0, 0));
+            let (w, h) = crate::image_utils::display_dims(path).unwrap_or((0, 0));
             return (path.to_path_buf(), w, h, bytes, sig);
         }
     }

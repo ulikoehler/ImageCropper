@@ -16,7 +16,11 @@ use std::{
 // *subdirectory* change, so pruning a non-leaf dir would hide nested
 // updates. Records also store the folded signature directly — saving
 // needs no per-file stat (the manifest already has it).
-const MAGIC: u32 = 0x54_46_43_49;
+//
+// "ICF4" — v4: w/h are display dims (EXIF orientation applied) to match
+// the oriented previews. v3 stored raw pixels, which transposes
+// EXIF-rotated images — stale caches must be re-sniffed.
+const MAGIC: u32 = 0x34_46_43_49;
 const PACK_FILE: &str = "files.pack";
 
 #[derive(Debug, Clone)]
