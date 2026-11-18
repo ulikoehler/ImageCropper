@@ -142,6 +142,7 @@ imagecropper crop  --serve=127.0.0.1:8737 test-images # web crop session
 imagecropper album --serve=127.0.0.1:8737 -G /photos  # serve, no browser auto-open
 imagecropper album -G /photos                          # headless: pregenerate previews
 imagecropper crop  -G --resave /photos                 # headless: batch resave
+imagecropper generate-previews -r /photos              # headless, no server: thumbs.pack only
 ```
 
 *   `/data` carries controls, events and pushed thumbnails; `/bulk` carries the manifest and full/screen-size images. Multiple clients can connect simultaneously — found/changed/deleted files arrive as differential `manifest-patch` updates with stable positional ids (no reloads).

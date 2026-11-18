@@ -56,6 +56,11 @@ pub enum Commands {
     Crop(CropArgs),
     /// Browse images as a space-filling album grid of previews
     Album(AlbumArgs),
+    /// Generate thumbs.pack preview thumbnails for a directory tree —
+    /// headless, no server. A later `album` run on the same paths reads
+    /// the persisted previews instead of recomputing them.
+    #[command(name = "generate-previews")]
+    GeneratePreviews(ScanArgs),
     /// Probe which image ops run on the GPU and which fall back to CPU
     #[command(name = "gpucheck")]
     GpuCheck,

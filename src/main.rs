@@ -19,6 +19,7 @@ fn main() -> Result<()> {
     match cli.command {
         Commands::Crop(args) => run_crop(args),
         Commands::Album(args) => run_album(args),
+        Commands::GeneratePreviews(args) => run_generate_previews(args),
         Commands::GpuCheck => run_gpucheck(),
     }
 }
@@ -233,6 +234,20 @@ fn serve(
 /// `album -G`: pregenerate every preview as scan results stream in.
 fn headless_album(args: &AlbumArgs, stream: ScanStream) -> Result<()> {
     pregenerate_stream(stream, args.scan.parallel);
+    Ok(())
+}
+
+/// `generate-previews`: the same streaming thumbnail pass `album -G`
+/// runs, exposed as its own command — no GUI, no server. Previews land
+/// in the per-directory `thumbs.pack`, which a later `album` (or
+/// `--serve`) run on the same paths reads instead of recomputing them.
+fn run_generate_previews(args: imagecropper::cli::ScanArgs) -> Result<()> {
+    imagecropper::fs_utils::set_verbose(args.verbose);
+    if args.no_gpu {
+        imagecropper::gpujpeg::disable();
+    }
+    let stream = spawn_scan_stream(&args)?;
+    pregenerate_stream(stream, args.parallel);
     Ok(())
 }
 
