@@ -505,62 +505,175 @@ pub fn move_with_unique_name(source: &Path, target_dir: &Path) -> Result<PathBuf
     let file_name = source
         .file_name()
         .ok_or_else(|| anyhow!("{} has no file name", source.display()))?;
-    let destination = unique_destination(target_dir, file_name);
-    match fs::rename(source, &destination) {
-        Ok(()) => Ok(destination),
-        Err(e) if e.kind() == std::io::ErrorKind::CrossesDevices => {
-            // rename(2) can't span filesystems (e.g. the /nastmp CIFS
-            // mount → local disk): copy the bytes, keep the mtime like
-            // mv does, then remove the source.
-            let mtime = fs::metadata(source).and_then(|m| m.modified()).ok();
-            if let Err(e) = fs::copy(source, &destination) {
-                let _ = fs::remove_file(&destination); // no truncated leftovers
+    // The plain name first, then .1, .2, … Each attempt is an atomic
+    // no-clobber move, so concurrent movers can never claim the same
+    // free name and overwrite each other.
+    for idx in 0usize.. {
+        let destination = candidate_destination(target_dir, file_name, idx);
+        match move_no_clobber(source, &destination) {
+            Ok(true) => return Ok(destination),
+            Ok(false) => continue,
+            Err(e) => {
                 return Err(anyhow!(e).context(format!(
-                    "Unable to copy {} to {}",
+                    "Unable to move {} to {}",
                     source.display(),
                     destination.display()
-                )));
+                )))
             }
-            if let Some(t) = mtime {
-                if let Ok(f) = fs::File::options().write(true).open(&destination) {
-                    let _ = f.set_modified(t);
-                }
-            }
-            fs::remove_file(source).with_context(|| {
-                format!(
-                    "Copied {} to {} but unable to remove the source",
-                    source.display(),
-                    destination.display()
-                )
-            })?;
-            Ok(destination)
         }
-        Err(e) => Err(anyhow!(e).context(format!(
-            "Unable to move {} to {}",
-            source.display(),
-            destination.display()
-        ))),
+    }
+    unreachable!()
+}
+
+/// Destination candidate for move attempt `idx`: `0` is the plain file
+/// name, higher indexes insert `.N` before the extension
+/// (`photo.1.jpg`, `photo.2.jpg`, …).
+fn candidate_destination(dir: &Path, file_name: &OsStr, idx: usize) -> PathBuf {
+    if idx == 0 {
+        return dir.join(file_name);
+    }
+    let (stem, ext) = split_name(file_name);
+    let name = match ext {
+        Some(ext) => format!("{stem}.{idx}.{ext}"),
+        None => format!("{stem}.{idx}"),
+    };
+    dir.join(name)
+}
+
+/// Move `source` to `dest` without ever overwriting an existing file:
+/// `Ok(false)` means `dest` was taken and the caller should try the
+/// next candidate name.
+fn move_no_clobber(source: &Path, dest: &Path) -> std::io::Result<bool> {
+    match rename_no_clobber(source, dest) {
+        Ok(moved) => Ok(moved),
+        Err(e) if e.kind() == std::io::ErrorKind::CrossesDevices => {
+            // rename(2)/renameat2 can't span filesystems (e.g. the /nastmp
+            // CIFS mount → local disk): copy the bytes, keep the mtime
+            // like mv does, then remove the source. create_new claims the
+            // destination atomically so concurrent movers can't collide.
+            if !copy_no_clobber(source, dest)? {
+                return Ok(false);
+            }
+            fs::remove_file(source)?;
+            Ok(true)
+        }
+        Err(e) => Err(e),
     }
 }
 
-pub fn unique_destination(dir: &Path, file_name: &OsStr) -> PathBuf {
-    let mut candidate = dir.join(file_name);
-    if !candidate.exists() {
-        return candidate;
+/// `fs::copy` variant that fails instead of overwriting `dest`:
+/// `Ok(false)` when `dest` already exists.
+fn copy_no_clobber(source: &Path, dest: &Path) -> std::io::Result<bool> {
+    let mut input = fs::File::open(source)?;
+    let mut output = match fs::OpenOptions::new().write(true).create_new(true).open(dest) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    let result = std::io::copy(&mut input, &mut output).and_then(|_| {
+        let meta = fs::metadata(source)?;
+        output.set_permissions(meta.permissions())?;
+        if let Ok(mtime) = meta.modified() {
+            output.set_modified(mtime)?;
+        }
+        Ok(())
+    });
+    if let Err(e) = result {
+        drop(output);
+        let _ = fs::remove_file(dest); // no truncated leftovers
+        return Err(e);
     }
-    let (stem, ext) = split_name(file_name);
-    for idx in 1.. {
-        let new_name = if let Some(ext) = &ext {
-            format!("{stem}-{idx}.{ext}")
-        } else {
-            format!("{stem}-{idx}")
-        };
-        candidate = dir.join(new_name);
-        if !candidate.exists() {
-            break;
+    Ok(true)
+}
+
+/// `rename(2)` that refuses to overwrite: `Ok(false)` when `dest`
+/// already exists.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn rename_no_clobber(source: &Path, dest: &Path) -> std::io::Result<bool> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let src = std::ffi::CString::new(source.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "path contains NUL"))?;
+    let dst = std::ffi::CString::new(dest.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "path contains NUL"))?;
+    // SAFETY: both arguments are valid NUL-terminated paths for the call.
+    let rc = unsafe {
+        libc::renameat2(
+            libc::AT_FDCWD,
+            src.as_ptr(),
+            libc::AT_FDCWD,
+            dst.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    rename_status(rc, source, dest)
+}
+
+/// macOS equivalent of [`rename_no_clobber`] via `renamex_np`.
+#[cfg(target_os = "macos")]
+fn rename_no_clobber(source: &Path, dest: &Path) -> std::io::Result<bool> {
+    use std::os::unix::ffi::OsStrExt;
+
+    const RENAME_EXCL: libc::c_uint = 0x0000_0004;
+
+    let src = std::ffi::CString::new(source.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "path contains NUL"))?;
+    let dst = std::ffi::CString::new(dest.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "path contains NUL"))?;
+    // SAFETY: both arguments are valid NUL-terminated paths for the call.
+    let rc = unsafe { libc::renamex_np(src.as_ptr(), dst.as_ptr(), RENAME_EXCL) };
+    rename_status(rc, source, dest)
+}
+
+/// Shared errno handling for the atomic rename calls above.
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+fn rename_status(rc: i32, source: &Path, dest: &Path) -> std::io::Result<bool> {
+    if rc == 0 {
+        return Ok(true);
+    }
+    let err = std::io::Error::last_os_error();
+    if err.raw_os_error() == Some(libc::ENOSYS) {
+        // Kernel/sandbox without renameat2 — degrade to check-then-
+        // rename (small race window, same as the pre-atomic behavior).
+        return rename_fallback(source, dest);
+    }
+    // EEXIST is the documented collision errno; a destination that
+    // exists as a different type (e.g. a directory) can surface as
+    // EISDIR/ENOTEMPTY — any existing name is a collision.
+    if err.raw_os_error() == Some(libc::EEXIST) || dest.symlink_metadata().is_ok() {
+        return Ok(false);
+    }
+    Err(err)
+}
+
+/// Platforms without an atomic no-clobber rename: check-then-rename,
+/// which leaves a small race window (two movers could pick the same
+/// name), matching the previous behavior.
+#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+fn rename_no_clobber(source: &Path, dest: &Path) -> std::io::Result<bool> {
+    rename_fallback(source, dest)
+}
+
+fn rename_fallback(source: &Path, dest: &Path) -> std::io::Result<bool> {
+    if dest.symlink_metadata().is_ok() {
+        return Ok(false);
+    }
+    fs::rename(source, dest)?;
+    Ok(true)
+}
+
+/// First free destination for `file_name` in `dir`
+/// (`name.ext`, `name.1.ext`, `name.2.ext`, …).
+pub fn unique_destination(dir: &Path, file_name: &OsStr) -> PathBuf {
+    for idx in 0usize.. {
+        let candidate = candidate_destination(dir, file_name, idx);
+        // symlink_metadata: a dangling symlink still occupies the name,
+        // matching what the no-clobber rename sees.
+        if candidate.symlink_metadata().is_err() {
+            return candidate;
         }
     }
-    candidate
+    unreachable!()
 }
 
 pub fn split_name(file_name: &OsStr) -> (String, Option<String>) {

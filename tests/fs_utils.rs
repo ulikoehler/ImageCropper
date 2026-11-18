@@ -119,11 +119,9 @@ fn move_with_unique_name_avoids_overwrites() {
         .collect();
     assert_eq!(moved_files.len(), 2);
     assert!(moved_files.iter().any(|p| p == &existing));
-    assert!(moved_files.iter().any(|p| p
-        .file_name()
-        .unwrap()
-        .to_string_lossy()
-        .starts_with("image-")));
+    assert!(moved_files
+        .iter()
+        .any(|p| p.file_name().unwrap() == "image.1.png"));
 }
 
 #[test]
@@ -181,13 +179,15 @@ fn split_name_handles_extensions_and_plain_names() {
 }
 
 #[test]
-fn unique_destination_adds_incrementing_suffix() {
+fn unique_destination_uses_first_free_number() {
     let tmp = tempdir().unwrap();
     let dir = tmp.path();
     fs::write(dir.join("image.png"), []).unwrap();
-    fs::write(dir.join("image-1.png"), []).unwrap();
+    fs::write(dir.join("image.1.png"), []).unwrap();
+    // .3 exists but .2 is free — the first free number wins.
+    fs::write(dir.join("image.3.png"), []).unwrap();
     let candidate = unique_destination(dir, OsStr::new("image.png"));
-    assert_eq!(candidate.file_name().unwrap(), "image-2.png");
+    assert_eq!(candidate.file_name().unwrap(), "image.2.png");
 }
 
 #[test]
