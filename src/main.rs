@@ -233,7 +233,7 @@ fn serve(
 
 /// `album -G`: pregenerate every preview as scan results stream in.
 fn headless_album(args: &AlbumArgs, stream: ScanStream) -> Result<()> {
-    pregenerate_stream(stream, args.scan.parallel);
+    pregenerate_stream(stream, args.scan.parallel, args.scan.recursive);
     Ok(())
 }
 
@@ -247,7 +247,7 @@ fn run_generate_previews(args: imagecropper::cli::ScanArgs) -> Result<()> {
         imagecropper::gpujpeg::disable();
     }
     let stream = spawn_scan_stream(&args)?;
-    pregenerate_stream(stream, args.parallel);
+    pregenerate_stream(stream, args.parallel, args.recursive);
     Ok(())
 }
 
@@ -255,8 +255,9 @@ fn run_generate_previews(args: imagecropper::cli::ScanArgs) -> Result<()> {
 /// reads and decode/encode all run as concurrent stages over bounded
 /// queues (see [`ThumbPipeline`]), so preview work starts while the
 /// directory listing is still being produced. The read stage self-tunes
-/// to the storage device; compute runs at the `-j` ceiling.
-fn pregenerate_stream(stream: ScanStream, parallel: usize) {
+/// to the storage device; compute runs at the `-j` ceiling. `recursive`
+/// only shapes the "nothing found" message (the scan already ran).
+fn pregenerate_stream(stream: ScanStream, parallel: usize, recursive: bool) {
     use imagecropper::fs_utils::{
         pipeline::{ReadStage, ThumbPipeline},
         previews::{preview_compute_bytes, preview_read, ReadJob},
@@ -321,6 +322,16 @@ fn pregenerate_stream(stream: ScanStream, parallel: usize) {
         eprintln!(
             "\rPregenerated previews {done}/{queued} ({} worker(s))",
             pool.workers()
+        );
+    } else {
+        // A silent exit reads as "worked" — say why nothing happened.
+        eprintln!(
+            "No images found{}",
+            if recursive {
+                ""
+            } else {
+                " — use -r to recurse into subdirectories"
+            }
         );
     }
 }
